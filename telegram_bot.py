@@ -6,6 +6,7 @@ Run via main.py with BOT_MODE=telegram or BOT_MODE=both.
 import asyncio
 import logging
 import os
+import re
 import time
 from pathlib import Path
 
@@ -86,16 +87,49 @@ async def _typing_loop(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, stop: async
 
 # ─── Reply helper ───────────────────────────────────────────────────────────────
 
+# Regex to find bare URLs not already inside markdown link syntax
+_URL_RE = re.compile(r'(?<!\()(https?://[^\s\)\]>]+)')
+# Regex to detect existing markdown links [text](url)
+_MD_LINK_RE = re.compile(r'\[([^\]]+)\]\((https?://[^\)]+)\)')
+
+
+def _protect_urls_for_markdown(text: str) -> str:
+    """Wrap bare URLs in markdown link format so Telegram renders them clickable.
+
+    Bare URLs containing underscores/special chars break Telegram's legacy Markdown
+    parser. Wrapping them as [url](url) ensures they display as clickable links.
+    """
+    # First, collect positions of existing markdown links to avoid double-wrapping
+    existing_link_spans = set()
+    for m in _MD_LINK_RE.finditer(text):
+        existing_link_spans.add((m.start(), m.end()))
+
+    def _replace_bare_url(match):
+        url = match.group(1)
+        start = match.start(1)
+        # Check if this URL is already inside a markdown link
+        for ls, le in existing_link_spans:
+            if ls <= start < le:
+                return match.group(0)
+        # Wrap bare URL as clickable markdown link
+        return f"[{url}]({url})"
+
+    return _URL_RE.sub(_replace_bare_url, text)
+
+
 async def _send(placeholder, update: Update, text: str):
     chunk = 4096
+    # Protect URLs so they remain clickable in Markdown mode
+    md_text = _protect_urls_for_markdown(text)
     try:
-        if len(text) <= chunk:
-            await placeholder.edit_text(text, parse_mode=ParseMode.MARKDOWN)
+        if len(md_text) <= chunk:
+            await placeholder.edit_text(md_text, parse_mode=ParseMode.MARKDOWN)
         else:
-            await placeholder.edit_text(text[:chunk], parse_mode=ParseMode.MARKDOWN)
-            for i in range(chunk, len(text), chunk):
-                await update.effective_message.reply_text(text[i:i+chunk], parse_mode=ParseMode.MARKDOWN)
+            await placeholder.edit_text(md_text[:chunk], parse_mode=ParseMode.MARKDOWN)
+            for i in range(chunk, len(md_text), chunk):
+                await update.effective_message.reply_text(md_text[i:i+chunk], parse_mode=ParseMode.MARKDOWN)
     except Exception:
+        # Fallback: plain text (Telegram auto-links bare URLs in plain text)
         if len(text) <= chunk:
             await placeholder.edit_text(text)
         else:
