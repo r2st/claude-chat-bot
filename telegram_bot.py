@@ -86,6 +86,25 @@ async def _typing_loop(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, stop: async
             continue
 
 
+# ─── Message deduplication (Telegram can retry sending the same update) ────────
+
+_processed_msgs: dict[int, float] = {}  # message_id → timestamp
+_DEDUP_TTL = 30  # seconds
+
+
+def _is_duplicate(msg_id: int) -> bool:
+    """Return True if this message was already processed recently."""
+    now = time.time()
+    # Clean old entries
+    stale = [k for k, v in _processed_msgs.items() if now - v > _DEDUP_TTL]
+    for k in stale:
+        del _processed_msgs[k]
+    if msg_id in _processed_msgs:
+        return True
+    _processed_msgs[msg_id] = now
+    return False
+
+
 # ─── Task manager for concurrent sessions ─────────────────────────────────────
 
 _task_counter = itertools.count(1)
@@ -1366,17 +1385,54 @@ async def _run_task(update: Update, ctx: ContextTypes.DEFAULT_TYPE, uid: int, us
         # Stop heartbeat before sending final response to avoid edit race
         await task.stop()
 
+        is_timeout = reply.startswith("[Timeout]")
+        is_error = reply.startswith("[Claude error]")
+
         if not reply or not reply.strip():
             reply = "(No response from Claude — the task may have completed without output.)"
             log.warning("Empty reply for uid=%s, task #%d", uid, task.task_id)
 
-        cc.save_turn(PLATFORM, str(uid), user_text, reply, session_name=sess.name)
+        # Don't save timeouts/errors to conversation history — they pollute context
+        if not is_timeout and not is_error:
+            cc.save_turn(PLATFORM, str(uid), user_text, reply, session_name=sess.name)
         cc.track_usage(PLATFORM, str(uid), stats.get("input_tokens", 0), stats.get("output_tokens", 0))
         cc.track_tool_usage(PLATFORM, str(uid), stats.get("tools_used", []))
         cc.track_cost(PLATFORM, str(uid), stats.get("input_tokens", 0), stats.get("output_tokens", 0), stats.get("cost_usd", 0))
 
         # Build header with completion stats
         v = _verbose(uid)
+        if is_timeout:
+            # Show timeout with retry button instead of success summary
+            retry_btn = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 Retry", callback_data=f"tg:retry:{task.task_id}")],
+            ])
+            _response_store[f"retry_{task.task_id}"] = {"prompt": user_text, "uid": uid}
+            # Include any partial results from streaming
+            partial = task._partial_text.strip() if task._partial_text else ""
+            timeout_msg = f"⏱ *Timed out* after {task._elapsed()}"
+            if task.tool_count:
+                timeout_msg += f" ({task.tool_count} tools used)"
+            if partial:
+                preview = partial[:1500]
+                if len(partial) > 1500:
+                    preview += "\n\n⏳ _(partial result — task timed out before finishing)_"
+                timeout_msg += f"\n\n{preview}"
+            try:
+                await placeholder.edit_text(
+                    timeout_msg, reply_markup=retry_btn, parse_mode=ParseMode.MARKDOWN,
+                )
+            except Exception:
+                try:
+                    await placeholder.edit_text(
+                        f"⏱ Timed out after {task._elapsed()}\n\n{partial[:1500] if partial else reply}",
+                        reply_markup=retry_btn,
+                    )
+                except Exception:
+                    await update.effective_message.reply_text(
+                        f"⏱ Timed out after {task._elapsed()}", reply_markup=retry_btn,
+                    )
+            return
+
         summary = task.finish_summary()
         if v >= 1 and stats.get("tools_used"):
             tools_str = ', '.join(stats['tools_used'][:5])
@@ -1405,7 +1461,7 @@ async def _run_task(update: Update, ctx: ContextTypes.DEFAULT_TYPE, uid: int, us
                 if len(raw_reply) > 200:
                     preview += "…"
                 await update.effective_message.reply_text(
-                    f"🔔 Task complete ({task._elapsed()})\n\n{preview}",
+                    f"🔔 Done ({task._elapsed()})\n\n{preview}",
                     disable_notification=False,
                 )
             except Exception:
@@ -1444,6 +1500,11 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _allowed(uid):
         await update.message.reply_text("You're not authorized.")
         return
+
+    # Deduplicate: Telegram can send the same message multiple times on retries
+    if _is_duplicate(update.message.message_id):
+        return
+
     if not cc.check_rate_limit(f"tg:{uid}"):
         await update.message.reply_text(
             f"Rate limit: max {cc.RATE_LIMIT_REQUESTS} messages per {cc.RATE_LIMIT_WINDOW}s."
