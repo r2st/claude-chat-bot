@@ -19,5 +19,6 @@ else
     PYTHON="python3"
 fi
 
-echo "Starting bot (mode: ${CLAUDE_MODE:-cli})..."
-exec "$PYTHON" "$PROJECT_DIR/bot.py"
+BOT_MODE="${BOT_MODE:-telegram}"
+echo "Starting bot (BOT_MODE=$BOT_MODE, CLAUDE_MODE=${CLAUDE_MODE:-cli})..."
+exec "$PYTHON" "$PROJECT_DIR/main.py"

@@ -1,2 +1,4 @@
-python-telegram-bot==21.6
+python-telegram-bot>=21.6
 anthropic>=0.99.0
+requests>=2.32.0
+python-dotenv>=1.0.0

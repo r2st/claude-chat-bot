@@ -1,9 +1,12 @@
-# Telegram Claude Bot
+# Claude Messenger Bot
 
-A Telegram bot that connects to Claude AI. Supports two modes:
+> **Claude AI on your phone** — personal, self-hosted, zero-infrastructure.  
+> Supports **WhatsApp** and **Telegram** simultaneously from a single process.
 
-- **CLI mode** — Uses the [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) (`claude -p`). No API key needed if you have a Claude subscription.
-- **API mode** — Uses the [Anthropic API](https://docs.anthropic.com/en/api) directly. Requires an API key. Works in Docker.
+A bot that connects to Claude AI via two modes:
+
+- **CLI mode** — Uses the Claude Code CLI (`claude`). No API key needed if you have a Claude subscription.
+- **API mode** — Uses the Anthropic API directly. Requires an API key. Works in Docker.
 
 ## Quick Start
 
@@ -22,41 +25,48 @@ nano .env
 ./scripts/start.sh
 ```
 
+## Platform comparison
+
+| | Telegram | WhatsApp |
+|--|----------|----------|
+| Bridge | Telegram Bot API (free) | [Green API](https://green-api.com) free tier |
+| Setup | Talk to @BotFather | Scan a QR code |
+| Photo / file support | Yes | Text only (currently) |
+| Inline buttons | Yes (`/model`, `/permissions`, …) | No |
+| Works without public URL | Yes (polling) | Yes (polling) |
+
+---
+
 ## Setup
 
-### 1. Create a Telegram Bot
+### 1 — Choose your platform
 
-1. Open Telegram and search for **@BotFather** (look for the verified blue checkmark)
-2. Start a chat and send `/newbot`
-3. **Choose a display name** — BotFather will ask: *"How are we going to call it?"*
-   Enter any name, e.g. `My Claude Bot`
-4. **Choose a username** — BotFather will ask: *"Now let's choose a username."*
-   It must end in `bot`, e.g. `my_claude_helper_bot`
-5. BotFather will reply with your **HTTP API token** — it looks like:
-   ```
-   123456789:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw
-   ```
-6. Copy this token — you'll need it for the `TELEGRAM_BOT_TOKEN` variable in `.env`
+Set `BOT_MODE` in `.env`:
+
+| Value | What starts |
+|-------|-------------|
+| `telegram` | Telegram only *(default)* |
+| `whatsapp` | WhatsApp only |
+| `both` | Both simultaneously (one process) |
+
+---
+
+### 2a — Telegram setup
+
+1. Open Telegram and search for **@BotFather** (verified blue checkmark).
+2. Send `/newbot` and follow the prompts.
+3. Copy the token → set `TELEGRAM_BOT_TOKEN` in `.env`.
 
 **Optional: customize your bot**
 
-After creation, you can send these commands to BotFather:
+| BotFather command | What it does |
+|-------------------|--------------|
+| `/setdescription` | Text users see before starting the bot |
+| `/setabouttext` | Bio shown on the bot's profile |
+| `/setuserpic` | Profile picture |
+| `/setcommands` | Register autocomplete hints |
 
-| Command | What it does |
-|---|---|
-| `/setdescription` | Set the text users see before starting the bot |
-| `/setabouttext` | Set the bio shown on the bot's profile |
-| `/setuserpic` | Upload a profile picture for the bot |
-| `/setcommands` | Register command hints (see below) |
-
-To register command hints so users see autocomplete in the chat:
-
-```
-/setcommands
-```
-
-Select your bot, then send:
-
+Register command hints:
 ```
 start - Welcome message
 reset - Clear conversation history
@@ -64,69 +74,66 @@ mode - Show current mode and model
 id - Show your Telegram user ID
 ```
 
-**Finding your user ID (for ALLOWED_USER_IDS)**
+**Finding your user ID (for `ALLOWED_USER_IDS`)**
 
 1. Start your bot and send `/id`
-2. It will reply with your numeric user ID
-3. Add it to `ALLOWED_USER_IDS` in `.env` to restrict access
+2. Copy the numeric ID → paste into `ALLOWED_USER_IDS` in `.env`
 
-### 2. Configure
+---
 
-Copy `.env.example` to `.env` and set your values:
+### 2b — WhatsApp setup (Green API — free, no Meta account needed)
 
-| Variable | Required | Description |
-|---|---|---|
-| `TELEGRAM_BOT_TOKEN` | Yes | Bot token from BotFather |
-| `CLAUDE_MODE` | No | `cli` (default) or `api` |
-| `ANTHROPIC_API_KEY` | API mode | API key from [console.anthropic.com](https://console.anthropic.com) |
-| `CLAUDE_MODEL` | No | Model name (default: `claude-sonnet-4-20250514`) |
-| `MAX_TOKENS` | No | Max response tokens (default: `4096`) |
-| `SYSTEM_PROMPT` | No | Custom system prompt |
-| `CLAUDE_CLI_WORK_DIR` | No | Working directory for CLI mode (default: `~`) |
-| `CLAUDE_CLI_ADD_DIRS` | No | Extra directories the CLI can access (comma-separated) |
-| `CLAUDE_CLI_PERMISSION_MODE` | No | Permission mode: `auto`, `acceptEdits`, or `bypassPermissions` |
-| `CLAUDE_CLI_MODEL` | No | Default CLI model: `haiku`, `sonnet` (default), or `opus` |
-| `CLAUDE_TIMEOUT` | No | CLI response timeout in seconds (default: `120`) |
-| `RATE_LIMIT_REQUESTS` | No | Max requests per window (default: `10`) |
-| `RATE_LIMIT_WINDOW` | No | Rate limit window in seconds (default: `60`) |
-| `DB_PATH` | No | SQLite database path (default: `bot.db` in project dir) |
-| `ALLOWED_USER_IDS` | No | Comma-separated user IDs to restrict access |
+1. Sign up at <https://console.green-api.com>
+2. Click **Create instance** → choose **Developer** plan (free — 1 500 msg/month)
+3. In the instance dashboard → **Scan QR** → scan with your WhatsApp phone
+4. Copy **Instance ID** and **API Token** → paste into `.env`:
 
-### 3. Choose a mode
+```env
+BOT_MODE=whatsapp
+GREEN_API_INSTANCE_ID=1234567890
+GREEN_API_TOKEN=your_token_here
+WHATSAPP_ALLOWED_NUMBERS=919876543210   # your number without the +
+```
 
-**CLI mode** (default) — requires Claude Code CLI installed and authenticated:
+> **Corporate network note:** Green API works over standard HTTPS polling — no
+> webhook or public URL needed. If Telegram is blocked on your network, use
+> `BOT_MODE=whatsapp` instead.
+
+---
+
+### 3 — Configure Claude
+
+All Claude settings apply to both platforms:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CLAUDE_MODE` | `cli` | `cli` or `api` |
+| `ANTHROPIC_API_KEY` | — | Required for API mode |
+| `CLAUDE_MODEL` | `claude-sonnet-4-20250514` | API mode model |
+| `SYSTEM_PROMPT` | _(generic)_ | Your personal instructions to Claude |
+| `CLAUDE_CLI_WORK_DIR` | `~` | Working directory for CLI |
+| `CLAUDE_CLI_ADD_DIRS` | — | Comma-separated extra dirs Claude can access |
+| `CLAUDE_CLI_PERMISSION_MODE` | — | `acceptEdits` / `auto` / `bypassPermissions` |
+| `CLAUDE_CLI_MODEL` | `sonnet` | CLI model: `haiku` / `sonnet` / `opus` |
+| `CLAUDE_TIMEOUT` | `180` | Seconds to wait for Claude |
+| `RATE_LIMIT_REQUESTS` | `20` | Max messages per window |
+| `RATE_LIMIT_WINDOW` | `60` | Rate limit window (seconds) |
+
+**CLI mode** — requires Claude Code CLI installed and authenticated:
 
 ```bash
 # Install Claude Code CLI: https://docs.anthropic.com/en/docs/claude-code
-# Then authenticate:
 claude auth login
 ```
 
-By default, the CLI runs from your home directory. To access other directories and skip permission prompts:
+**API mode:**
 
-```bash
-# In .env:
-CLAUDE_CLI_WORK_DIR=/Users/you
-CLAUDE_CLI_ADD_DIRS=/Users/you/projects,/Users/you/documents
-CLAUDE_CLI_PERMISSION_MODE=auto
-```
-
-Permission modes:
-
-| Mode | Behavior |
-|---|---|
-| *(empty)* | Default — prompts for each tool use (blocks in non-interactive `-p` mode) |
-| `acceptEdits` | Auto-approves file reads/writes, prompts for shell commands |
-| `auto` | Auto-approves most actions |
-| `bypassPermissions` | Approves everything (use with caution) |
-
-**API mode** — requires an Anthropic API key:
-
-```bash
-# In .env:
+```env
 CLAUDE_MODE=api
 ANTHROPIC_API_KEY=sk-ant-...
 ```
+
+---
 
 ## Running
 
@@ -155,37 +162,97 @@ docker compose up -d
 docker logs -f claude-telegram-bot
 ```
 
-## Bot Commands
+---
+
+## Telegram commands
 
 | Command | Description |
-|---|---|
+|---------|-------------|
 | `/start` | Welcome message |
 | `/reset` | Clear conversation history |
 | `/mode` | Show current mode and model |
-| `/model` | Switch CLI model (haiku/sonnet/opus) |
-| `/verbose` | Set output verbosity (0=quiet, 1=normal, 2=detailed) |
+| `/model` | Switch model (haiku / sonnet / opus) |
+| `/verbose` | Set output verbosity: 0 quiet · 1 normal · 2 detailed |
 | `/permissions` | Change CLI permission mode |
 | `/usage` | Show usage statistics |
 | `/id` | Show your Telegram user ID |
 
+---
+
+## WhatsApp usage
+
+Just send a message. There are no slash commands — WhatsApp is intentionally
+kept simple.
+
+---
+
+## Project structure
+
+```
+├── main.py            Entry point — reads BOT_MODE, starts adapters
+├── claude_core.py     Shared: Claude CLI/API, SQLite history, rate limiting
+├── telegram_bot.py    Telegram adapter
+├── whatsapp_bot.py    WhatsApp adapter (Green API polling)
+├── bot.py             Backward-compat shim (runs Telegram, same as before)
+├── scripts/
+│   ├── install.sh
+│   ├── start.sh
+│   └── service.sh
+├── Dockerfile         (API mode only)
+├── docker-compose.yml
+├── requirements.txt
+└── .env.example
+```
+
+---
+
 ## Features
 
-- **Dual mode** — CLI (free with Claude subscription) or API (needs key, works in Docker)
-- **Typing indicator** — shows "typing..." while Claude processes your request
-- **Image analysis** — send photos for Claude to analyze
-- **File uploads** — send documents (code, text, etc.) for review
-- **Model switching** — switch between haiku/sonnet/opus from Telegram
-- **Verbose mode** — see what tools Claude is using in real-time
-- **Rate limiting** — configurable per-user request throttling
-- **Persistent history** — conversations survive bot restarts (SQLite)
+- **Dual platform** — Telegram and WhatsApp from one process (`BOT_MODE=both`)
+- **Dual Claude mode** — CLI (free with Claude subscription) or API
+- **Typing indicator** — shows "typing…" while Claude processes
+- **Image & file analysis** — Telegram only (photos + documents)
+- **Model switching** — haiku / sonnet / opus from Telegram inline buttons
+- **Verbose mode** — see what tools Claude is using
+- **Rate limiting** — configurable per-user throttling
+- **Persistent history** — SQLite, keyed per platform+user; survives restarts
 - **Usage tracking** — per-user message and token statistics
 - **Markdown rendering** — formatted responses with plain-text fallback
 
+---
+
+## Per-developer sharing
+
+Each developer runs their **own instance** on their own machine:
+
+1. Clone this repo
+2. `./scripts/install.sh`
+3. Set their own credentials + `SYSTEM_PROMPT` in `.env`
+4. `./scripts/start.sh`
+
+No shared server. No shared credentials. Fully private.
+
+---
+
 ## Security
 
-- Set `ALLOWED_USER_IDS` to restrict who can use the bot
-- Never commit `.env` — it's in `.gitignore`
-- In CLI mode, the bot inherits your Claude auth — don't run on untrusted machines
+- Set `ALLOWED_USER_IDS` (Telegram) or `WHATSAPP_ALLOWED_NUMBERS` to restrict who can use your bot
+- Never commit `.env` — it is in `.gitignore`
+- In CLI mode the bot inherits your Claude auth — don't run on untrusted machines
+
+---
+
+## Troubleshooting
+
+| Symptom | Fix |
+|---------|-----|
+| WhatsApp: no replies | Check instance status in Green API console — must be `authorized` |
+| Telegram: SSL/handshake error | Telegram may be blocked on your network; use `BOT_MODE=whatsapp` |
+| `claude: command not found` | Install Claude Code CLI and ensure it's in PATH |
+| Response cut off | Bot auto-chunks at 4 000 chars per message — expected |
+| Bot stops after reboot | Use `./scripts/service.sh install` for a proper system service |
+
+---
 
 ## License
 
