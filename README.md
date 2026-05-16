@@ -26,9 +26,49 @@ nano .env
 
 ### 1. Create a Telegram Bot
 
-1. Message [@BotFather](https://t.me/BotFather) on Telegram
-2. Send `/newbot`, follow the prompts
-3. Copy the bot token
+1. Open Telegram and search for **@BotFather** (look for the verified blue checkmark)
+2. Start a chat and send `/newbot`
+3. **Choose a display name** — BotFather will ask: *"How are we going to call it?"*
+   Enter any name, e.g. `My Claude Bot`
+4. **Choose a username** — BotFather will ask: *"Now let's choose a username."*
+   It must end in `bot`, e.g. `my_claude_helper_bot`
+5. BotFather will reply with your **HTTP API token** — it looks like:
+   ```
+   123456789:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw
+   ```
+6. Copy this token — you'll need it for the `TELEGRAM_BOT_TOKEN` variable in `.env`
+
+**Optional: customize your bot**
+
+After creation, you can send these commands to BotFather:
+
+| Command | What it does |
+|---|---|
+| `/setdescription` | Set the text users see before starting the bot |
+| `/setabouttext` | Set the bio shown on the bot's profile |
+| `/setuserpic` | Upload a profile picture for the bot |
+| `/setcommands` | Register command hints (see below) |
+
+To register command hints so users see autocomplete in the chat:
+
+```
+/setcommands
+```
+
+Select your bot, then send:
+
+```
+start - Welcome message
+reset - Clear conversation history
+mode - Show current mode and model
+id - Show your Telegram user ID
+```
+
+**Finding your user ID (for ALLOWED_USER_IDS)**
+
+1. Start your bot and send `/id`
+2. It will reply with your numeric user ID
+3. Add it to `ALLOWED_USER_IDS` in `.env` to restrict access
 
 ### 2. Configure
 
