@@ -10,6 +10,7 @@ import logging
 import os
 import sqlite3
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Optional
@@ -37,6 +38,92 @@ RATE_LIMIT_WINDOW   = int(os.getenv("RATE_LIMIT_WINDOW", "60"))
 
 DB_PATH = os.getenv("DB_PATH", str(Path(__file__).parent / "bot.db"))
 
+# ─── Connection pool (thread-local SQLite) ──────────────────────────────────────
+
+_local = threading.local()
+
+
+def _get_conn() -> sqlite3.Connection:
+    """Get a thread-local SQLite connection (reused across calls)."""
+    if not hasattr(_local, "conn") or _local.conn is None:
+        _local.conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        _local.conn.execute("PRAGMA journal_mode=WAL")
+        _local.conn.execute("PRAGMA synchronous=NORMAL")
+        _local.conn.execute("PRAGMA cache_size=-8000")  # 8MB cache
+    return _local.conn
+
+
+# ─── Async write queue (non-blocking DB writes) ────────────────────────────────
+
+_write_queue: asyncio.Queue | None = None
+_write_task: asyncio.Task | None = None
+
+
+async def _db_writer():
+    """Background task that drains the write queue and batches DB writes."""
+    while True:
+        ops = []
+        # Wait for first item
+        op = await _write_queue.get()
+        ops.append(op)
+        # Drain any queued items (batch)
+        while not _write_queue.empty():
+            try:
+                ops.append(_write_queue.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+
+        # Execute batch
+        try:
+            conn = _get_conn()
+            for sql, params in ops:
+                conn.execute(sql, params)
+            conn.commit()
+        except Exception as e:
+            log.error("db_writer batch error: %s", e)
+
+
+def _ensure_writer():
+    """Start the async DB writer if not already running."""
+    global _write_queue, _write_task
+    if _write_queue is None:
+        _write_queue = asyncio.Queue(maxsize=1000)
+    if _write_task is None or _write_task.done():
+        try:
+            loop = asyncio.get_running_loop()
+            _write_task = loop.create_task(_db_writer())
+        except RuntimeError:
+            pass
+
+
+def _enqueue_write(sql: str, params: tuple):
+    """Enqueue a non-blocking DB write. Falls back to sync if no loop."""
+    if _write_queue is not None:
+        try:
+            _write_queue.put_nowait((sql, params))
+            return
+        except (asyncio.QueueFull, Exception):
+            pass
+    # Fallback: sync write
+    conn = _get_conn()
+    conn.execute(sql, params)
+    conn.commit()
+
+
+# ─── History cache (avoid repeated DB reads for same user) ──────────────────────
+
+_history_cache: dict[str, tuple[float, list[dict]]] = {}
+_HISTORY_TTL = 5.0  # seconds
+
+
+def _cache_key(platform: str, user_id: str) -> str:
+    return f"{platform}:{user_id}"
+
+
+def _invalidate_history(platform: str, user_id: str):
+    _history_cache.pop(_cache_key(platform, user_id), None)
+
+
 # ─── Rate limiting ──────────────────────────────────────────────────────────────
 
 _rate_state: dict[str, list[float]] = {}
@@ -56,10 +143,8 @@ def check_rate_limit(key: str) -> bool:
 # ─── SQLite conversation store ──────────────────────────────────────────────────
 
 def init_db() -> None:
-    conn = sqlite3.connect(DB_PATH)
-
-    # Enable WAL mode for better concurrent access
-    conn.execute("PRAGMA journal_mode=WAL")
+    _ensure_writer()
+    conn = _get_conn()
 
     # Migrate from old schema (no platform column) if needed
     cols = {row[1] for row in conn.execute("PRAGMA table_info(conversations)").fetchall()}
@@ -142,24 +227,30 @@ def init_db() -> None:
             num_turns INTEGER DEFAULT 0)
     """)
     conn.commit()
-    conn.close()
 
 
 def load_history(platform: str, user_id: str, limit: int = 20) -> list[dict]:
-    conn = sqlite3.connect(DB_PATH)
+    # Check cache first
+    key = _cache_key(platform, user_id)
+    cached = _history_cache.get(key)
+    if cached and (time.time() - cached[0]) < _HISTORY_TTL:
+        return cached[1]
+
+    conn = _get_conn()
     rows = conn.execute(
         """SELECT role, content FROM conversations
            WHERE platform=? AND user_id=?
            ORDER BY ts DESC LIMIT ?""",
         (platform, user_id, limit),
     ).fetchall()
-    conn.close()
-    return [{"role": r[0], "content": r[1]} for r in reversed(rows)]
+    result = [{"role": r[0], "content": r[1]} for r in reversed(rows)]
+    _history_cache[key] = (time.time(), result)
+    return result
 
 
 def save_turn(platform: str, user_id: str, user_text: str, reply: str) -> None:
-    conn = sqlite3.connect(DB_PATH)
     now = time.time()
+    conn = _get_conn()
     conn.execute(
         "INSERT OR IGNORE INTO conversations (platform,user_id,role,content,ts) VALUES (?,?,?,?,?)",
         (platform, user_id, "user", user_text, now),
@@ -181,22 +272,21 @@ def save_turn(platform: str, user_id: str, user_text: str, reply: str) -> None:
             (platform, user_id, platform, user_id, count - 20),
         )
     conn.commit()
-    conn.close()
+    _invalidate_history(platform, user_id)
 
 
 def clear_history(platform: str, user_id: str) -> None:
-    conn = sqlite3.connect(DB_PATH)
+    conn = _get_conn()
     conn.execute(
         "DELETE FROM conversations WHERE platform=? AND user_id=?",
         (platform, user_id),
     )
     conn.commit()
-    conn.close()
+    _invalidate_history(platform, user_id)
 
 
 def track_usage(platform: str, user_id: str, in_tok: int = 0, out_tok: int = 0) -> None:
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute(
+    _enqueue_write(
         """INSERT INTO usage (platform, user_id, message_count, input_tokens, output_tokens)
            VALUES (?,?,1,?,?)
            ON CONFLICT(platform,user_id) DO UPDATE SET
@@ -205,41 +295,34 @@ def track_usage(platform: str, user_id: str, in_tok: int = 0, out_tok: int = 0) 
                output_tokens = output_tokens + excluded.output_tokens""",
         (platform, user_id, in_tok, out_tok),
     )
-    conn.commit()
-    conn.close()
 
 
 def get_usage(platform: str, user_id: str) -> dict:
-    conn = sqlite3.connect(DB_PATH)
+    conn = _get_conn()
     row = conn.execute(
         "SELECT message_count, input_tokens, output_tokens FROM usage WHERE platform=? AND user_id=?",
         (platform, user_id),
     ).fetchone()
-    conn.close()
     return {"messages": row[0], "input": row[1], "output": row[2]} if row else {"messages": 0, "input": 0, "output": 0}
 
 
 def track_tool_usage(platform: str, user_id: str, tools: list[str]) -> None:
-    """Record tool usage for analytics."""
+    """Record tool usage for analytics (non-blocking)."""
     if not tools:
         return
-    conn = sqlite3.connect(DB_PATH)
     now = time.time()
     for tool in tools:
-        conn.execute(
+        _enqueue_write(
             "INSERT INTO tool_usage (platform, user_id, tool_name, ts) VALUES (?,?,?,?)",
             (platform, user_id, tool, now),
         )
-    conn.commit()
-    conn.close()
 
 
 def track_cost(platform: str, user_id: str, in_tok: int, out_tok: int, cost_usd: float) -> None:
-    """Track daily cost for analytics."""
+    """Track daily cost for analytics (non-blocking)."""
     from datetime import date
     today = date.today().isoformat()
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute(
+    _enqueue_write(
         """INSERT INTO cost_tracking (platform, user_id, date, requests, input_tokens, output_tokens, cost_usd)
            VALUES (?,?,?,1,?,?,?)
            ON CONFLICT(platform, user_id, date) DO UPDATE SET
@@ -249,8 +332,36 @@ def track_cost(platform: str, user_id: str, in_tok: int, out_tok: int, cost_usd:
                cost_usd = cost_usd + excluded.cost_usd""",
         (platform, user_id, today, in_tok, out_tok, cost_usd),
     )
-    conn.commit()
-    conn.close()
+
+
+# ─── Session reuse (skip project re-indexing) ──────────────────────────────────
+
+_session_map: dict[str, str] = {}  # "platform:user_id" → last session_id
+_SESSION_TTL = 600  # 10 min — after this, start fresh session
+_session_ts: dict[str, float] = {}
+
+
+def get_session_id(platform: str, user_id: str) -> str | None:
+    """Get cached session ID for resuming (if recent enough)."""
+    key = f"{platform}:{user_id}"
+    sid = _session_map.get(key)
+    if sid and (time.time() - _session_ts.get(key, 0)) < _SESSION_TTL:
+        return sid
+    return None
+
+
+def set_session_id(platform: str, user_id: str, session_id: str):
+    """Cache session ID from a completed request."""
+    key = f"{platform}:{user_id}"
+    _session_map[key] = session_id
+    _session_ts[key] = time.time()
+
+
+def clear_session(platform: str, user_id: str):
+    """Clear cached session (e.g. on /reset)."""
+    key = f"{platform}:{user_id}"
+    _session_map.pop(key, None)
+    _session_ts.pop(key, None)
 
 
 # ─── Claude CLI (sync — for WhatsApp threading model) ──────────────────────────
@@ -308,22 +419,40 @@ async def ask_claude_async(
     on_progress: Optional[callable] = None,
     on_text: Optional[callable] = None,
     is_cancelled: Optional[callable] = None,
+    platform: str = "",
+    user_id: str = "",
 ) -> tuple[str, dict]:
     """Async Claude CLI call with streaming progress. Returns (reply_text, stats_dict).
 
     on_progress(tool_name: str) is called whenever Claude starts using a tool.
     on_text(partial_text: str) is called when text content is received.
     """
-    full_prompt = _build_prompt(user_text, history)
+    # Try to resume existing session (skips project re-indexing)
+    session_id = get_session_id(platform, user_id) if platform else None
 
-    cmd = [
-        "claude",
-        "--model", model,
-        "-p", full_prompt,
-        "--output-format", "stream-json",
-        "--verbose",
-        "--dangerously-skip-permissions",
-    ]
+    if session_id:
+        # Resume session — just send new message, no history needed
+        cmd = [
+            "claude",
+            "--model", model,
+            "-p", user_text,
+            "--resume", session_id,
+            "--output-format", "stream-json",
+            "--verbose",
+            "--dangerously-skip-permissions",
+        ]
+    else:
+        # New session — include full history
+        full_prompt = _build_prompt(user_text, history)
+        cmd = [
+            "claude",
+            "--model", model,
+            "-p", full_prompt,
+            "--output-format", "stream-json",
+            "--verbose",
+            "--dangerously-skip-permissions",
+        ]
+
     for d in [x.strip() for x in add_dirs.split(",") if x.strip()]:
         cmd += ["--add-dir", d]
 
@@ -591,6 +720,7 @@ def _parse_cli_output(stdout: str, stderr: str, returncode: int, timeout: int) -
                 "input_tokens": usage.get("input_tokens", 0) + usage.get("cache_read_input_tokens", 0),
                 "output_tokens": usage.get("output_tokens", 0),
                 "cost_usd": event.get("total_cost_usd", 0),
+                "session_id": event.get("session_id", ""),
             }
         elif etype == "assistant":
             msg = event.get("message", {})

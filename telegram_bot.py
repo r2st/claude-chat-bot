@@ -494,7 +494,7 @@ async def _ask(uid: int, text: str, tracker: TaskSession | None = None) -> tuple
         return tracker.cancelled if tracker else False
 
     if engine == "sdk":
-        return await cc.ask_claude_sdk(
+        result = await cc.ask_claude_sdk(
             text, history,
             model=_model(uid),
             system=cc.CLAUDE_SYSTEM,
@@ -504,9 +504,13 @@ async def _ask(uid: int, text: str, tracker: TaskSession | None = None) -> tuple
             on_text=_on_text,
             is_cancelled=_is_cancelled,
         )
+        # Cache session ID for reuse
+        if result[1].get("session_id"):
+            cc.set_session_id(PLATFORM, str(uid), result[1]["session_id"])
+        return result
 
     # Default: CLI mode
-    return await cc.ask_claude_async(
+    result = await cc.ask_claude_async(
         text, history,
         model=_model(uid),
         system=cc.CLAUDE_SYSTEM,
@@ -516,7 +520,13 @@ async def _ask(uid: int, text: str, tracker: TaskSession | None = None) -> tuple
         on_progress=_on_progress,
         on_text=_on_text,
         is_cancelled=_is_cancelled,
+        platform=PLATFORM,
+        user_id=str(uid),
     )
+    # Cache session ID for reuse
+    if result[1].get("session_id"):
+        cc.set_session_id(PLATFORM, str(uid), result[1]["session_id"])
+    return result
 
 
 # ─── Commands ───────────────────────────────────────────────────────────────────
@@ -545,7 +555,9 @@ async def cmd_id(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    cc.clear_history(PLATFORM, str(update.effective_user.id))
+    uid = str(update.effective_user.id)
+    cc.clear_history(PLATFORM, uid)
+    cc.clear_session(PLATFORM, uid)
     await update.message.reply_text("Conversation history cleared.")
 
 
