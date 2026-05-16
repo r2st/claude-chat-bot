@@ -233,7 +233,7 @@ async def call_claude_cli(prompt: str, history: list[dict], user_id: int, files:
         full_prompt += "\n\n[Attached files: " + ", ".join(files) + "]"
 
     model = get_cli_model(user_id)
-    cmd = ["claude", "-p", full_prompt, "--bare", "--model", model, "--output-format", "stream-json"]
+    cmd = ["claude", "-p", full_prompt, "--model", model, "--verbose", "--output-format", "stream-json"]
     perm = get_permission_mode(user_id)
     if perm:
         cmd.extend(["--permission-mode", perm])
@@ -256,12 +256,11 @@ async def call_claude_cli(prompt: str, history: list[dict], user_id: int, files:
         await proc.wait()
         raise RuntimeError(f"Claude timed out after {CLAUDE_TIMEOUT}s")
 
+    output = stdout.decode().strip()
     if proc.returncode != 0:
-        error = stderr.decode().strip()
+        error = stderr.decode().strip() or output
         logger.error(f"Claude CLI error (exit {proc.returncode}): {error}")
         raise RuntimeError(f"CLI error: {error}")
-
-    output = stdout.decode().strip()
     result_text = ""
     tools_used = []
     stats = {}
@@ -277,28 +276,26 @@ async def call_claude_cli(prompt: str, history: list[dict], user_id: int, files:
             continue
 
         etype = event.get("type", "")
-        if etype == "assistant" and "message" in event:
+        if etype == "result":
+            result_text = event.get("result", result_text)
+            usage = event.get("usage", {})
+            stats = {
+                "input_tokens": usage.get("input_tokens", 0) + usage.get("cache_read_input_tokens", 0),
+                "output_tokens": usage.get("output_tokens", 0),
+                "cost_usd": event.get("total_cost_usd", 0),
+            }
+        elif etype == "assistant" and "message" in event:
             msg = event["message"]
             if isinstance(msg, dict):
                 for block in msg.get("content", []):
                     if block.get("type") == "text":
-                        result_text += block.get("text", "")
-        elif etype == "content_block_delta":
-            delta = event.get("delta", {})
-            if delta.get("type") == "text_delta":
-                result_text += delta.get("text", "")
-        elif etype == "result":
-            result_text = event.get("result", result_text)
-            stats = {
-                "input_tokens": event.get("input_tokens", 0),
-                "output_tokens": event.get("output_tokens", 0),
-            }
-            if event.get("subagent_results"):
-                for sub in event["subagent_results"]:
-                    tools_used.append(sub.get("tool_name", "subagent"))
-        elif etype == "tool_use" or (etype == "content_block_start" and event.get("content_block", {}).get("type") == "tool_use"):
-            tool_name = event.get("name") or event.get("content_block", {}).get("name", "tool")
-            tools_used.append(tool_name)
+                        result_text = block.get("text", "")
+                    elif block.get("type") == "tool_use":
+                        tools_used.append(block.get("name", "tool"))
+        elif etype == "content_block_start":
+            cb = event.get("content_block", {})
+            if cb.get("type") == "tool_use":
+                tools_used.append(cb.get("name", "tool"))
 
     if not result_text:
         result_text = output
