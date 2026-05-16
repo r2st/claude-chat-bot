@@ -229,9 +229,12 @@ def init_db() -> None:
     conn.commit()
 
 
-def load_history(platform: str, user_id: str, limit: int = 20) -> list[dict]:
+def load_history(platform: str, user_id: str, limit: int = 20, session_name: str = "") -> list[dict]:
+    # Use session-qualified user_id for isolation
+    effective_uid = f"{user_id}:{session_name}" if session_name else user_id
+
     # Check cache first
-    key = _cache_key(platform, user_id)
+    key = _cache_key(platform, effective_uid)
     cached = _history_cache.get(key)
     if cached and (time.time() - cached[0]) < _HISTORY_TTL:
         return cached[1]
@@ -241,48 +244,50 @@ def load_history(platform: str, user_id: str, limit: int = 20) -> list[dict]:
         """SELECT role, content FROM conversations
            WHERE platform=? AND user_id=?
            ORDER BY ts DESC LIMIT ?""",
-        (platform, user_id, limit),
+        (platform, effective_uid, limit),
     ).fetchall()
     result = [{"role": r[0], "content": r[1]} for r in reversed(rows)]
     _history_cache[key] = (time.time(), result)
     return result
 
 
-def save_turn(platform: str, user_id: str, user_text: str, reply: str) -> None:
+def save_turn(platform: str, user_id: str, user_text: str, reply: str, session_name: str = "") -> None:
+    effective_uid = f"{user_id}:{session_name}" if session_name else user_id
     now = time.time()
     conn = _get_conn()
     conn.execute(
         "INSERT OR IGNORE INTO conversations (platform,user_id,role,content,ts) VALUES (?,?,?,?,?)",
-        (platform, user_id, "user", user_text, now),
+        (platform, effective_uid, "user", user_text, now),
     )
     conn.execute(
         "INSERT OR IGNORE INTO conversations (platform,user_id,role,content,ts) VALUES (?,?,?,?,?)",
-        (platform, user_id, "assistant", reply, now + 0.001),
+        (platform, effective_uid, "assistant", reply, now + 0.001),
     )
     # Keep last 20 messages per user per platform
     count = conn.execute(
         "SELECT COUNT(*) FROM conversations WHERE platform=? AND user_id=?",
-        (platform, user_id),
+        (platform, effective_uid),
     ).fetchone()[0]
     if count > 20:
         conn.execute(
             """DELETE FROM conversations WHERE platform=? AND user_id=? AND ts IN (
                SELECT ts FROM conversations WHERE platform=? AND user_id=?
                ORDER BY ts LIMIT ?)""",
-            (platform, user_id, platform, user_id, count - 20),
+            (platform, effective_uid, platform, effective_uid, count - 20),
         )
     conn.commit()
-    _invalidate_history(platform, user_id)
+    _invalidate_history(platform, effective_uid)
 
 
-def clear_history(platform: str, user_id: str) -> None:
+def clear_history(platform: str, user_id: str, session_name: str = "") -> None:
+    effective_uid = f"{user_id}:{session_name}" if session_name else user_id
     conn = _get_conn()
     conn.execute(
         "DELETE FROM conversations WHERE platform=? AND user_id=?",
-        (platform, user_id),
+        (platform, effective_uid),
     )
     conn.commit()
-    _invalidate_history(platform, user_id)
+    _invalidate_history(platform, effective_uid)
 
 
 def track_usage(platform: str, user_id: str, in_tok: int = 0, out_tok: int = 0) -> None:
@@ -334,34 +339,152 @@ def track_cost(platform: str, user_id: str, in_tok: int, out_tok: int, cost_usd:
     )
 
 
-# ─── Session reuse (skip project re-indexing) ──────────────────────────────────
+# ─── Multi-session management ──────────────────────────────────────────────────
 
-_session_map: dict[str, str] = {}  # "platform:user_id" → last session_id
-_SESSION_TTL = 600  # 10 min — after this, start fresh session
-_session_ts: dict[str, float] = {}
+_SESSION_TTL = 3600  # 1 hour — CLI sessions stay valid for a while; short TTL caused loss during long tasks
 
 
+class UserSession:
+    """A named conversation session with its own history and Claude session ID."""
+
+    def __init__(self, name: str, platform: str, user_id: str):
+        self.name = name
+        self.platform = platform
+        self.user_id = user_id
+        self.claude_session_id: str | None = None
+        self.last_active = time.time()
+        self.created_at = time.time()
+        self.message_count = 0
+        self.is_busy = False  # True while a task is running
+
+    @property
+    def cli_session_valid(self) -> bool:
+        if self.claude_session_id is None:
+            return False
+        if self.is_busy:
+            return True
+        return (time.time() - self.last_active) < _SESSION_TTL
+
+    def touch(self):
+        self.last_active = time.time()
+        self.message_count += 1
+
+    def age_str(self) -> str:
+        secs = int(time.time() - self.last_active)
+        if secs < 60:
+            return "just now"
+        if secs < 3600:
+            return f"{secs // 60}m ago"
+        return f"{secs // 3600}h ago"
+
+    def status_emoji(self) -> str:
+        if self.is_busy:
+            return "⚙️"
+        if self.cli_session_valid:
+            return "🟢"
+        return "💤"
+
+
+class SessionManager:
+    """Manages multiple named sessions per user."""
+
+    def __init__(self):
+        self._sessions: dict[str, list[UserSession]] = {}  # key → sessions
+        self._active: dict[str, int] = {}  # key → active index
+
+    def _key(self, platform: str, user_id: str) -> str:
+        return f"{platform}:{user_id}"
+
+    def get_or_create_active(self, platform: str, user_id: str) -> UserSession:
+        """Get the active session, or create a default one."""
+        key = self._key(platform, user_id)
+        sessions = self._sessions.setdefault(key, [])
+        if not sessions:
+            sessions.append(UserSession("default", platform, user_id))
+            self._active[key] = 0
+        idx = self._active.get(key, 0)
+        return sessions[idx]
+
+    def get_all(self, platform: str, user_id: str) -> list[UserSession]:
+        key = self._key(platform, user_id)
+        return self._sessions.get(key, [])
+
+    def get_active_index(self, platform: str, user_id: str) -> int:
+        key = self._key(platform, user_id)
+        return self._active.get(key, 0)
+
+    def create(self, platform: str, user_id: str, name: str) -> UserSession:
+        """Create a new session and switch to it."""
+        key = self._key(platform, user_id)
+        sessions = self._sessions.setdefault(key, [])
+        # Limit to 10 sessions per user
+        if len(sessions) >= 10:
+            # Remove oldest inactive
+            oldest = min(
+                (s for s in sessions if not s.is_busy),
+                key=lambda s: s.last_active,
+                default=None,
+            )
+            if oldest:
+                sessions.remove(oldest)
+        sess = UserSession(name, platform, user_id)
+        sessions.append(sess)
+        self._active[key] = len(sessions) - 1
+        return sess
+
+    def switch_to(self, platform: str, user_id: str, index: int) -> UserSession | None:
+        key = self._key(platform, user_id)
+        sessions = self._sessions.get(key, [])
+        if 0 <= index < len(sessions):
+            self._active[key] = index
+            return sessions[index]
+        return None
+
+    def delete(self, platform: str, user_id: str, index: int) -> bool:
+        key = self._key(platform, user_id)
+        sessions = self._sessions.get(key, [])
+        if not sessions or index < 0 or index >= len(sessions):
+            return False
+        if sessions[index].is_busy:
+            return False
+        sessions.pop(index)
+        # Adjust active index
+        active = self._active.get(key, 0)
+        if active >= len(sessions):
+            self._active[key] = max(0, len(sessions) - 1)
+        elif active > index:
+            self._active[key] = active - 1
+        # Ensure at least one session exists
+        if not sessions:
+            sessions.append(UserSession("default", platform, user_id))
+            self._active[key] = 0
+        return True
+
+    def clear_active(self, platform: str, user_id: str):
+        """Clear the active session's history and CLI session."""
+        sess = self.get_or_create_active(platform, user_id)
+        sess.claude_session_id = None
+        sess.message_count = 0
+
+
+_session_mgr = SessionManager()
+
+
+# Legacy API compatibility
 def get_session_id(platform: str, user_id: str) -> str | None:
-    """Get cached session ID for resuming (if recent enough)."""
-    key = f"{platform}:{user_id}"
-    sid = _session_map.get(key)
-    if sid and (time.time() - _session_ts.get(key, 0)) < _SESSION_TTL:
-        return sid
-    return None
+    sess = _session_mgr.get_or_create_active(platform, user_id)
+    return sess.claude_session_id if sess.cli_session_valid else None
 
 
 def set_session_id(platform: str, user_id: str, session_id: str):
-    """Cache session ID from a completed request."""
-    key = f"{platform}:{user_id}"
-    _session_map[key] = session_id
-    _session_ts[key] = time.time()
+    sess = _session_mgr.get_or_create_active(platform, user_id)
+    sess.claude_session_id = session_id
+    sess.touch()
 
 
 def clear_session(platform: str, user_id: str):
-    """Clear cached session (e.g. on /reset)."""
-    key = f"{platform}:{user_id}"
-    _session_map.pop(key, None)
-    _session_ts.pop(key, None)
+    _session_mgr.clear_active(platform, user_id)
+    _invalidate_history(platform, user_id)
 
 
 # ─── Claude CLI (sync — for WhatsApp threading model) ──────────────────────────
@@ -421,6 +544,7 @@ async def ask_claude_async(
     is_cancelled: Optional[callable] = None,
     platform: str = "",
     user_id: str = "",
+    resume_session_id: str = "",
 ) -> tuple[str, dict]:
     """Async Claude CLI call with streaming progress. Returns (reply_text, stats_dict).
 
@@ -428,10 +552,12 @@ async def ask_claude_async(
     on_text(partial_text: str) is called when text content is received.
     """
     # Try to resume existing session (skips project re-indexing)
-    session_id = get_session_id(platform, user_id) if platform else None
+    session_id = resume_session_id or (get_session_id(platform, user_id) if platform else None)
+
+    full_prompt = _build_prompt(user_text, history) if history else user_text
 
     if session_id:
-        # Resume session — just send new message, no history needed
+        # Resume: send only new message (CLI has full conversation context)
         cmd = [
             "claude",
             "--model", model,
@@ -442,8 +568,7 @@ async def ask_claude_async(
             "--dangerously-skip-permissions",
         ]
     else:
-        # New session — include full history
-        full_prompt = _build_prompt(user_text, history)
+        # New session: include conversation history in prompt
         cmd = [
             "claude",
             "--model", model,
@@ -525,9 +650,73 @@ async def ask_claude_async(
         return f"[Timeout] Claude took more than {timeout}s.", {}
 
     stdout_text = "\n".join(stdout_lines)
-    return _parse_cli_output(
+    result = _parse_cli_output(
         stdout_text, stderr_data.decode(), proc.returncode, timeout
     )
+
+    # If resume failed (error or empty), retry with full history as a new session
+    if session_id and (proc.returncode != 0 or not result[0] or result[0].startswith("[Claude error]")):
+        log.warning("Session resume failed (rc=%d), retrying with full history", proc.returncode)
+        # Invalidate the stale session
+        if platform:
+            active_sess = _session_mgr.get_or_create_active(platform, user_id)
+            active_sess.claude_session_id = None
+
+        retry_cmd = [
+            "claude",
+            "--model", model,
+            "-p", full_prompt,
+            "--output-format", "stream-json",
+            "--verbose",
+            "--dangerously-skip-permissions",
+        ]
+        for d in [x.strip() for x in add_dirs.split(",") if x.strip()]:
+            retry_cmd += ["--add-dir", d]
+
+        proc2 = await asyncio.create_subprocess_exec(
+            *retry_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=CLAUDE_WORK_DIR,
+            limit=10 * 1024 * 1024,
+        )
+        retry_lines: list[str] = []
+        try:
+            async def _read_retry():
+                while True:
+                    if is_cancelled and is_cancelled():
+                        proc2.kill()
+                        return
+                    line = await proc2.stdout.readline()
+                    if not line:
+                        break
+                    decoded = line.decode().strip()
+                    if decoded:
+                        retry_lines.append(decoded)
+                        if on_progress or on_text:
+                            try:
+                                event = json.loads(decoded)
+                                etype = event.get("type", "")
+                                if etype == "content_block_delta" and on_text:
+                                    delta = event.get("delta", {})
+                                    if delta.get("type") == "text_delta":
+                                        await on_text(delta.get("text", ""))
+                            except Exception:
+                                pass
+
+            await asyncio.wait_for(_read_retry(), timeout=timeout)
+            await proc2.wait()
+            stderr2 = await proc2.stderr.read()
+        except asyncio.TimeoutError:
+            proc2.kill()
+            await proc2.wait()
+            return f"[Timeout] Claude took more than {timeout}s.", {}
+
+        result = _parse_cli_output(
+            "\n".join(retry_lines), stderr2.decode(), proc2.returncode, timeout
+        )
+
+    return result
 
 
 # ─── Claude API (sync — usable from both adapters) ─────────────────────────────
