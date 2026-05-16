@@ -10,6 +10,7 @@ import logging
 import os
 import sqlite3
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Optional
@@ -37,6 +38,92 @@ RATE_LIMIT_WINDOW   = int(os.getenv("RATE_LIMIT_WINDOW", "60"))
 
 DB_PATH = os.getenv("DB_PATH", str(Path(__file__).parent / "bot.db"))
 
+# ─── Connection pool (thread-local SQLite) ──────────────────────────────────────
+
+_local = threading.local()
+
+
+def _get_conn() -> sqlite3.Connection:
+    """Get a thread-local SQLite connection (reused across calls)."""
+    if not hasattr(_local, "conn") or _local.conn is None:
+        _local.conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        _local.conn.execute("PRAGMA journal_mode=WAL")
+        _local.conn.execute("PRAGMA synchronous=NORMAL")
+        _local.conn.execute("PRAGMA cache_size=-8000")  # 8MB cache
+    return _local.conn
+
+
+# ─── Async write queue (non-blocking DB writes) ────────────────────────────────
+
+_write_queue: asyncio.Queue | None = None
+_write_task: asyncio.Task | None = None
+
+
+async def _db_writer():
+    """Background task that drains the write queue and batches DB writes."""
+    while True:
+        ops = []
+        # Wait for first item
+        op = await _write_queue.get()
+        ops.append(op)
+        # Drain any queued items (batch)
+        while not _write_queue.empty():
+            try:
+                ops.append(_write_queue.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+
+        # Execute batch
+        try:
+            conn = _get_conn()
+            for sql, params in ops:
+                conn.execute(sql, params)
+            conn.commit()
+        except Exception as e:
+            log.error("db_writer batch error: %s", e)
+
+
+def _ensure_writer():
+    """Start the async DB writer if not already running."""
+    global _write_queue, _write_task
+    if _write_queue is None:
+        _write_queue = asyncio.Queue(maxsize=1000)
+    if _write_task is None or _write_task.done():
+        try:
+            loop = asyncio.get_running_loop()
+            _write_task = loop.create_task(_db_writer())
+        except RuntimeError:
+            pass
+
+
+def _enqueue_write(sql: str, params: tuple):
+    """Enqueue a non-blocking DB write. Falls back to sync if no loop."""
+    if _write_queue is not None:
+        try:
+            _write_queue.put_nowait((sql, params))
+            return
+        except (asyncio.QueueFull, Exception):
+            pass
+    # Fallback: sync write
+    conn = _get_conn()
+    conn.execute(sql, params)
+    conn.commit()
+
+
+# ─── History cache (avoid repeated DB reads for same user) ──────────────────────
+
+_history_cache: dict[str, tuple[float, list[dict]]] = {}
+_HISTORY_TTL = 5.0  # seconds
+
+
+def _cache_key(platform: str, user_id: str) -> str:
+    return f"{platform}:{user_id}"
+
+
+def _invalidate_history(platform: str, user_id: str):
+    _history_cache.pop(_cache_key(platform, user_id), None)
+
+
 # ─── Rate limiting ──────────────────────────────────────────────────────────────
 
 _rate_state: dict[str, list[float]] = {}
@@ -56,10 +143,8 @@ def check_rate_limit(key: str) -> bool:
 # ─── SQLite conversation store ──────────────────────────────────────────────────
 
 def init_db() -> None:
-    conn = sqlite3.connect(DB_PATH)
-
-    # Enable WAL mode for better concurrent access
-    conn.execute("PRAGMA journal_mode=WAL")
+    _ensure_writer()
+    conn = _get_conn()
 
     # Migrate from old schema (no platform column) if needed
     cols = {row[1] for row in conn.execute("PRAGMA table_info(conversations)").fetchall()}
@@ -142,61 +227,71 @@ def init_db() -> None:
             num_turns INTEGER DEFAULT 0)
     """)
     conn.commit()
-    conn.close()
 
 
-def load_history(platform: str, user_id: str, limit: int = 20) -> list[dict]:
-    conn = sqlite3.connect(DB_PATH)
+def load_history(platform: str, user_id: str, limit: int = 20, session_name: str = "") -> list[dict]:
+    # Use session-qualified user_id for isolation
+    effective_uid = f"{user_id}:{session_name}" if session_name else user_id
+
+    # Check cache first
+    key = _cache_key(platform, effective_uid)
+    cached = _history_cache.get(key)
+    if cached and (time.time() - cached[0]) < _HISTORY_TTL:
+        return cached[1]
+
+    conn = _get_conn()
     rows = conn.execute(
         """SELECT role, content FROM conversations
            WHERE platform=? AND user_id=?
            ORDER BY ts DESC LIMIT ?""",
-        (platform, user_id, limit),
+        (platform, effective_uid, limit),
     ).fetchall()
-    conn.close()
-    return [{"role": r[0], "content": r[1]} for r in reversed(rows)]
+    result = [{"role": r[0], "content": r[1]} for r in reversed(rows)]
+    _history_cache[key] = (time.time(), result)
+    return result
 
 
-def save_turn(platform: str, user_id: str, user_text: str, reply: str) -> None:
-    conn = sqlite3.connect(DB_PATH)
+def save_turn(platform: str, user_id: str, user_text: str, reply: str, session_name: str = "") -> None:
+    effective_uid = f"{user_id}:{session_name}" if session_name else user_id
     now = time.time()
+    conn = _get_conn()
     conn.execute(
         "INSERT OR IGNORE INTO conversations (platform,user_id,role,content,ts) VALUES (?,?,?,?,?)",
-        (platform, user_id, "user", user_text, now),
+        (platform, effective_uid, "user", user_text, now),
     )
     conn.execute(
         "INSERT OR IGNORE INTO conversations (platform,user_id,role,content,ts) VALUES (?,?,?,?,?)",
-        (platform, user_id, "assistant", reply, now + 0.001),
+        (platform, effective_uid, "assistant", reply, now + 0.001),
     )
     # Keep last 20 messages per user per platform
     count = conn.execute(
         "SELECT COUNT(*) FROM conversations WHERE platform=? AND user_id=?",
-        (platform, user_id),
+        (platform, effective_uid),
     ).fetchone()[0]
     if count > 20:
         conn.execute(
             """DELETE FROM conversations WHERE platform=? AND user_id=? AND ts IN (
                SELECT ts FROM conversations WHERE platform=? AND user_id=?
                ORDER BY ts LIMIT ?)""",
-            (platform, user_id, platform, user_id, count - 20),
+            (platform, effective_uid, platform, effective_uid, count - 20),
         )
     conn.commit()
-    conn.close()
+    _invalidate_history(platform, effective_uid)
 
 
-def clear_history(platform: str, user_id: str) -> None:
-    conn = sqlite3.connect(DB_PATH)
+def clear_history(platform: str, user_id: str, session_name: str = "") -> None:
+    effective_uid = f"{user_id}:{session_name}" if session_name else user_id
+    conn = _get_conn()
     conn.execute(
         "DELETE FROM conversations WHERE platform=? AND user_id=?",
-        (platform, user_id),
+        (platform, effective_uid),
     )
     conn.commit()
-    conn.close()
+    _invalidate_history(platform, effective_uid)
 
 
 def track_usage(platform: str, user_id: str, in_tok: int = 0, out_tok: int = 0) -> None:
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute(
+    _enqueue_write(
         """INSERT INTO usage (platform, user_id, message_count, input_tokens, output_tokens)
            VALUES (?,?,1,?,?)
            ON CONFLICT(platform,user_id) DO UPDATE SET
@@ -205,41 +300,34 @@ def track_usage(platform: str, user_id: str, in_tok: int = 0, out_tok: int = 0) 
                output_tokens = output_tokens + excluded.output_tokens""",
         (platform, user_id, in_tok, out_tok),
     )
-    conn.commit()
-    conn.close()
 
 
 def get_usage(platform: str, user_id: str) -> dict:
-    conn = sqlite3.connect(DB_PATH)
+    conn = _get_conn()
     row = conn.execute(
         "SELECT message_count, input_tokens, output_tokens FROM usage WHERE platform=? AND user_id=?",
         (platform, user_id),
     ).fetchone()
-    conn.close()
     return {"messages": row[0], "input": row[1], "output": row[2]} if row else {"messages": 0, "input": 0, "output": 0}
 
 
 def track_tool_usage(platform: str, user_id: str, tools: list[str]) -> None:
-    """Record tool usage for analytics."""
+    """Record tool usage for analytics (non-blocking)."""
     if not tools:
         return
-    conn = sqlite3.connect(DB_PATH)
     now = time.time()
     for tool in tools:
-        conn.execute(
+        _enqueue_write(
             "INSERT INTO tool_usage (platform, user_id, tool_name, ts) VALUES (?,?,?,?)",
             (platform, user_id, tool, now),
         )
-    conn.commit()
-    conn.close()
 
 
 def track_cost(platform: str, user_id: str, in_tok: int, out_tok: int, cost_usd: float) -> None:
-    """Track daily cost for analytics."""
+    """Track daily cost for analytics (non-blocking)."""
     from datetime import date
     today = date.today().isoformat()
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute(
+    _enqueue_write(
         """INSERT INTO cost_tracking (platform, user_id, date, requests, input_tokens, output_tokens, cost_usd)
            VALUES (?,?,?,1,?,?,?)
            ON CONFLICT(platform, user_id, date) DO UPDATE SET
@@ -249,8 +337,154 @@ def track_cost(platform: str, user_id: str, in_tok: int, out_tok: int, cost_usd:
                cost_usd = cost_usd + excluded.cost_usd""",
         (platform, user_id, today, in_tok, out_tok, cost_usd),
     )
-    conn.commit()
-    conn.close()
+
+
+# ─── Multi-session management ──────────────────────────────────────────────────
+
+_SESSION_TTL = 3600  # 1 hour — CLI sessions stay valid for a while; short TTL caused loss during long tasks
+
+
+class UserSession:
+    """A named conversation session with its own history and Claude session ID."""
+
+    def __init__(self, name: str, platform: str, user_id: str):
+        self.name = name
+        self.platform = platform
+        self.user_id = user_id
+        self.claude_session_id: str | None = None
+        self.last_active = time.time()
+        self.created_at = time.time()
+        self.message_count = 0
+        self.is_busy = False  # True while a task is running
+
+    @property
+    def cli_session_valid(self) -> bool:
+        if self.claude_session_id is None:
+            return False
+        if self.is_busy:
+            return True
+        return (time.time() - self.last_active) < _SESSION_TTL
+
+    def touch(self):
+        self.last_active = time.time()
+        self.message_count += 1
+
+    def age_str(self) -> str:
+        secs = int(time.time() - self.last_active)
+        if secs < 60:
+            return "just now"
+        if secs < 3600:
+            return f"{secs // 60}m ago"
+        return f"{secs // 3600}h ago"
+
+    def status_emoji(self) -> str:
+        if self.is_busy:
+            return "⚙️"
+        if self.cli_session_valid:
+            return "🟢"
+        return "💤"
+
+
+class SessionManager:
+    """Manages multiple named sessions per user."""
+
+    def __init__(self):
+        self._sessions: dict[str, list[UserSession]] = {}  # key → sessions
+        self._active: dict[str, int] = {}  # key → active index
+
+    def _key(self, platform: str, user_id: str) -> str:
+        return f"{platform}:{user_id}"
+
+    def get_or_create_active(self, platform: str, user_id: str) -> UserSession:
+        """Get the active session, or create a default one."""
+        key = self._key(platform, user_id)
+        sessions = self._sessions.setdefault(key, [])
+        if not sessions:
+            sessions.append(UserSession("default", platform, user_id))
+            self._active[key] = 0
+        idx = self._active.get(key, 0)
+        return sessions[idx]
+
+    def get_all(self, platform: str, user_id: str) -> list[UserSession]:
+        key = self._key(platform, user_id)
+        return self._sessions.get(key, [])
+
+    def get_active_index(self, platform: str, user_id: str) -> int:
+        key = self._key(platform, user_id)
+        return self._active.get(key, 0)
+
+    def create(self, platform: str, user_id: str, name: str) -> UserSession:
+        """Create a new session and switch to it."""
+        key = self._key(platform, user_id)
+        sessions = self._sessions.setdefault(key, [])
+        # Limit to 10 sessions per user
+        if len(sessions) >= 10:
+            # Remove oldest inactive
+            oldest = min(
+                (s for s in sessions if not s.is_busy),
+                key=lambda s: s.last_active,
+                default=None,
+            )
+            if oldest:
+                sessions.remove(oldest)
+        sess = UserSession(name, platform, user_id)
+        sessions.append(sess)
+        self._active[key] = len(sessions) - 1
+        return sess
+
+    def switch_to(self, platform: str, user_id: str, index: int) -> UserSession | None:
+        key = self._key(platform, user_id)
+        sessions = self._sessions.get(key, [])
+        if 0 <= index < len(sessions):
+            self._active[key] = index
+            return sessions[index]
+        return None
+
+    def delete(self, platform: str, user_id: str, index: int) -> bool:
+        key = self._key(platform, user_id)
+        sessions = self._sessions.get(key, [])
+        if not sessions or index < 0 or index >= len(sessions):
+            return False
+        if sessions[index].is_busy:
+            return False
+        sessions.pop(index)
+        # Adjust active index
+        active = self._active.get(key, 0)
+        if active >= len(sessions):
+            self._active[key] = max(0, len(sessions) - 1)
+        elif active > index:
+            self._active[key] = active - 1
+        # Ensure at least one session exists
+        if not sessions:
+            sessions.append(UserSession("default", platform, user_id))
+            self._active[key] = 0
+        return True
+
+    def clear_active(self, platform: str, user_id: str):
+        """Clear the active session's history and CLI session."""
+        sess = self.get_or_create_active(platform, user_id)
+        sess.claude_session_id = None
+        sess.message_count = 0
+
+
+_session_mgr = SessionManager()
+
+
+# Legacy API compatibility
+def get_session_id(platform: str, user_id: str) -> str | None:
+    sess = _session_mgr.get_or_create_active(platform, user_id)
+    return sess.claude_session_id if sess.cli_session_valid else None
+
+
+def set_session_id(platform: str, user_id: str, session_id: str):
+    sess = _session_mgr.get_or_create_active(platform, user_id)
+    sess.claude_session_id = session_id
+    sess.touch()
+
+
+def clear_session(platform: str, user_id: str):
+    _session_mgr.clear_active(platform, user_id)
+    _invalidate_history(platform, user_id)
 
 
 # ─── Claude CLI (sync — for WhatsApp threading model) ──────────────────────────
@@ -308,22 +542,41 @@ async def ask_claude_async(
     on_progress: Optional[callable] = None,
     on_text: Optional[callable] = None,
     is_cancelled: Optional[callable] = None,
+    platform: str = "",
+    user_id: str = "",
+    resume_session_id: str = "",
 ) -> tuple[str, dict]:
     """Async Claude CLI call with streaming progress. Returns (reply_text, stats_dict).
 
     on_progress(tool_name: str) is called whenever Claude starts using a tool.
     on_text(partial_text: str) is called when text content is received.
     """
-    full_prompt = _build_prompt(user_text, history)
+    # Try to resume existing session (skips project re-indexing)
+    session_id = resume_session_id or (get_session_id(platform, user_id) if platform else None)
 
-    cmd = [
-        "claude",
-        "--model", model,
-        "-p", full_prompt,
-        "--output-format", "stream-json",
-        "--verbose",
-        "--dangerously-skip-permissions",
-    ]
+    if session_id:
+        # Resume session — just send new message, no history needed
+        cmd = [
+            "claude",
+            "--model", model,
+            "-p", user_text,
+            "--resume", session_id,
+            "--output-format", "stream-json",
+            "--verbose",
+            "--dangerously-skip-permissions",
+        ]
+    else:
+        # New session — include full history
+        full_prompt = _build_prompt(user_text, history)
+        cmd = [
+            "claude",
+            "--model", model,
+            "-p", full_prompt,
+            "--output-format", "stream-json",
+            "--verbose",
+            "--dangerously-skip-permissions",
+        ]
+
     for d in [x.strip() for x in add_dirs.split(",") if x.strip()]:
         cmd += ["--add-dir", d]
 
@@ -366,7 +619,8 @@ async def ask_claude_async(
                             if isinstance(msg, dict):
                                 for block in msg.get("content", []):
                                     if block.get("type") == "tool_use" and on_progress:
-                                        await on_progress(block.get("name", "tool"))
+                                        detail = _extract_tool_detail(block)
+                                        await on_progress(block.get("name", "tool"), detail)
                                     elif block.get("type") == "text" and on_text:
                                         await on_text(block.get("text", ""))
 
@@ -374,7 +628,8 @@ async def ask_claude_async(
                         elif etype == "content_block_start":
                             cb = event.get("content_block", {})
                             if cb.get("type") == "tool_use" and on_progress:
-                                await on_progress(cb.get("name", "tool"))
+                                detail = _extract_tool_detail(cb)
+                                await on_progress(cb.get("name", "tool"), detail)
 
                         # Partial text in content_block_delta
                         elif etype == "content_block_delta" and on_text:
@@ -492,7 +747,9 @@ async def ask_claude_sdk(
                         tools_used.append(block.name)
                         if on_progress:
                             try:
-                                await on_progress(block.name)
+                                inp = getattr(block, "input", {}) or {}
+                                detail = _extract_tool_detail({"input": inp})
+                                await on_progress(block.name, detail)
                             except Exception:
                                 pass
                     elif isinstance(block, TextBlock):
@@ -527,6 +784,28 @@ async def ask_claude_sdk(
 
 
 # ─── Internal helpers ───────────────────────────────────────────────────────────
+
+def _extract_tool_detail(block: dict) -> str:
+    """Extract a short detail string from a tool_use block (e.g. file path, command)."""
+    inp = block.get("input", {})
+    if not isinstance(inp, dict):
+        return ""
+    # Read/Write/Edit → file_path
+    fp = inp.get("file_path", "")
+    if fp:
+        # Show just the filename or last 2 path components
+        parts = fp.rsplit("/", 2)
+        return "/".join(parts[-2:]) if len(parts) > 2 else fp
+    # Bash → command (truncated)
+    cmd = inp.get("command", "")
+    if cmd:
+        return cmd[:50]
+    # Grep → pattern
+    pattern = inp.get("pattern", "")
+    if pattern:
+        return f"/{pattern[:30]}/"
+    return ""
+
 
 def _build_prompt(user_text: str, history: list[dict]) -> str:
     parts = []
@@ -565,6 +844,7 @@ def _parse_cli_output(stdout: str, stderr: str, returncode: int, timeout: int) -
                 "input_tokens": usage.get("input_tokens", 0) + usage.get("cache_read_input_tokens", 0),
                 "output_tokens": usage.get("output_tokens", 0),
                 "cost_usd": event.get("total_cost_usd", 0),
+                "session_id": event.get("session_id", ""),
             }
         elif etype == "assistant":
             msg = event.get("message", {})

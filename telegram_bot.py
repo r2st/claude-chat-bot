@@ -476,8 +476,8 @@ def _active_session(uid: int) -> "cc.UserSession":
     return cc._session_mgr.get_or_create_active(PLATFORM, str(uid))
 
 
-async def _ask(uid: int, text: str, tracker: TaskSession | None = None) -> tuple[str, dict]:
-    sess = cc._session_mgr.get_or_create_active(PLATFORM, str(uid))
+async def _ask(uid: int, text: str, tracker: TaskSession | None = None, session: "cc.UserSession | None" = None) -> tuple[str, dict]:
+    sess = session or cc._session_mgr.get_or_create_active(PLATFORM, str(uid))
     history = cc.load_history(PLATFORM, str(uid), session_name=sess.name)
     engine = _engine(uid)
 
@@ -509,12 +509,13 @@ async def _ask(uid: int, text: str, tracker: TaskSession | None = None) -> tuple
             on_text=_on_text,
             is_cancelled=_is_cancelled,
         )
-        # Cache session ID for reuse
         if result[1].get("session_id"):
-            cc.set_session_id(PLATFORM, str(uid), result[1]["session_id"])
+            sess.claude_session_id = result[1]["session_id"]
+            sess.touch()
         return result
 
     # Default: CLI mode
+    cli_sid = sess.claude_session_id if sess.cli_session_valid else ""
     result = await cc.ask_claude_async(
         text, history,
         model=_model(uid),
@@ -527,10 +528,11 @@ async def _ask(uid: int, text: str, tracker: TaskSession | None = None) -> tuple
         is_cancelled=_is_cancelled,
         platform=PLATFORM,
         user_id=str(uid),
+        resume_session_id=cli_sid or "",
     )
-    # Cache session ID for reuse
     if result[1].get("session_id"):
-        cc.set_session_id(PLATFORM, str(uid), result[1]["session_id"])
+        sess.claude_session_id = result[1]["session_id"]
+        sess.touch()
     return result
 
 
@@ -1347,7 +1349,7 @@ async def _run_task(update: Update, ctx: ContextTypes.DEFAULT_TYPE, uid: int, us
     sess = _active_session(uid)
     sess.is_busy = True
     try:
-        reply, stats = await _ask(uid, user_text, tracker=task)
+        reply, stats = await _ask(uid, user_text, tracker=task, session=sess)
 
         if task.cancelled:
             await placeholder.edit_text(
