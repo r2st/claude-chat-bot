@@ -4,6 +4,7 @@ Run via main.py with BOT_MODE=telegram or BOT_MODE=both.
 """
 
 import asyncio
+import itertools
 import logging
 import os
 import re
@@ -85,16 +86,22 @@ async def _typing_loop(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, stop: async
             continue
 
 
-# ─── Progress tracker for long-running tasks ──────────────────────────────────
+# ─── Task manager for concurrent sessions ─────────────────────────────────────
 
-class ProgressTracker:
-    """Manages live progress updates for a running Claude task."""
+_task_counter = itertools.count(1)
 
-    CANCEL_CALLBACK = "tg:cancel"
+# Max concurrent tasks per user
+MAX_CONCURRENT_TASKS = int(os.getenv("MAX_CONCURRENT_TASKS", "5"))
 
-    def __init__(self, placeholder, uid: int):
+
+class TaskSession:
+    """Manages a single running Claude task with progress, cancel, and identity."""
+
+    def __init__(self, placeholder, uid: int, prompt_preview: str):
+        self.task_id = next(_task_counter)
         self.placeholder = placeholder
         self.uid = uid
+        self.prompt_preview = prompt_preview[:40]  # Short label
         self.start_time = time.time()
         self.tools: list[str] = []
         self.tool_count = 0
@@ -115,19 +122,22 @@ class ProgressTracker:
             return f"{secs}s"
         return f"{secs // 60}m {secs % 60}s"
 
-    def _progress_bar(self) -> str:
-        """Animated progress indicator based on elapsed time."""
+    def _spinner(self) -> str:
         secs = int(time.time() - self.start_time)
         frames = ["◐", "◓", "◑", "◒"]
         return frames[secs % 4]
 
     def _build_status(self) -> str:
         elapsed = self._elapsed()
-        spinner = self._progress_bar()
-        lines = [f"{spinner} *Working…* `{elapsed}`"]
+        spinner = self._spinner()
+
+        # Show task ID if user has multiple active tasks
+        user_tasks = _task_registry.get_user_tasks(self.uid)
+        task_label = f" `#{self.task_id}`" if len(user_tasks) > 1 else ""
+
+        lines = [f"{spinner} *Working…* `{elapsed}`{task_label}"]
 
         if self.tools:
-            # Show recent tool activity (last 5 unique tools)
             unique_recent = list(dict.fromkeys(self.tools[-8:]))[-5:]
             tool_lines = [_tool_label(t) for t in unique_recent]
             lines.append("")
@@ -147,14 +157,13 @@ class ProgressTracker:
     async def _update(self):
         """Update the placeholder message (rate-limited to avoid Telegram 429s)."""
         now = time.time()
-        # Rate limit updates to once per 2 seconds
         if now - self._last_update < 2.0:
             return
         self._last_update = now
 
         status = self._build_status()
         cancel_btn = InlineKeyboardMarkup([
-            [InlineKeyboardButton("⏹ Cancel", callback_data=f"{self.CANCEL_CALLBACK}:{self.uid}")]
+            [InlineKeyboardButton("⏹ Cancel", callback_data=f"tg:cancel:{self.task_id}")]
         ])
         try:
             await self.placeholder.edit_text(
@@ -166,11 +175,10 @@ class ProgressTracker:
             pass
 
     async def _heartbeat(self):
-        """Periodic updates even without tool activity — keeps user informed."""
-        await asyncio.sleep(5)  # First heartbeat after 5s
+        """Periodic updates even without tool activity."""
+        await asyncio.sleep(5)
         while not self._cancelled:
             await self._update()
-            # Increase interval as task runs longer
             elapsed = time.time() - self.start_time
             if elapsed < 30:
                 interval = 5
@@ -192,15 +200,43 @@ class ProgressTracker:
                 pass
 
     def finish_summary(self) -> str:
-        """Return a brief summary line showing work done."""
         elapsed = self._elapsed()
         if self.tool_count > 0:
             return f"⚡ _{self.tool_count} tools · {elapsed}_"
         return f"⚡ _{elapsed}_"
 
 
-# Active progress trackers by user (for cancel support)
-_active_tasks: dict[int, ProgressTracker] = {}
+class TaskRegistry:
+    """Thread-safe registry of active tasks across all users."""
+
+    def __init__(self):
+        self._tasks: dict[int, TaskSession] = {}  # task_id → TaskSession
+
+    def register(self, task: TaskSession) -> None:
+        self._tasks[task.task_id] = task
+
+    def unregister(self, task_id: int) -> None:
+        self._tasks.pop(task_id, None)
+
+    def get(self, task_id: int) -> TaskSession | None:
+        return self._tasks.get(task_id)
+
+    def get_user_tasks(self, uid: int) -> list[TaskSession]:
+        return [t for t in self._tasks.values() if t.uid == uid]
+
+    def user_task_count(self, uid: int) -> int:
+        return sum(1 for t in self._tasks.values() if t.uid == uid)
+
+    def cancel_all_user(self, uid: int) -> int:
+        """Cancel all tasks for a user. Returns count cancelled."""
+        count = 0
+        for t in self.get_user_tasks(uid):
+            t.cancel()
+            count += 1
+        return count
+
+
+_task_registry = TaskRegistry()
 
 
 # ─── Reply helper ───────────────────────────────────────────────────────────────
@@ -290,7 +326,7 @@ def _engine(uid: int) -> str:
     return _user_engine.get(uid, cc.CLAUDE_MODE)
 
 
-async def _ask(uid: int, text: str, tracker: ProgressTracker | None = None) -> tuple[str, dict]:
+async def _ask(uid: int, text: str, tracker: TaskSession | None = None) -> tuple[str, dict]:
     history = cc.load_history(PLATFORM, str(uid))
     engine = _engine(uid)
 
@@ -335,7 +371,10 @@ async def _ask(uid: int, text: str, tracker: ProgressTracker | None = None) -> t
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Hi! I'm Claude on Telegram.\n\n"
+        "Send me any message and I'll work on it. You can send multiple messages — they run as parallel tasks.\n\n"
         "Commands:\n"
+        "/tasks — show active running tasks\n"
+        "/cancel — cancel a task (or all)\n"
         "/reset — clear conversation history\n"
         "/model — switch Claude model\n"
         "/engine — switch engine (cli/sdk/api)\n"
@@ -381,6 +420,75 @@ async def cmd_engine(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"Current engine: *{cur}*\n\nSelect execution engine:",
         reply_markup=InlineKeyboardMarkup(btns),
         parse_mode="Markdown",
+    )
+
+
+async def cmd_tasks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Show active tasks for this user."""
+    uid = update.effective_user.id
+    tasks = _task_registry.get_user_tasks(uid)
+
+    if not tasks:
+        await update.message.reply_text("No active tasks.")
+        return
+
+    lines = [f"*Active tasks ({len(tasks)}):*\n"]
+    for t in tasks:
+        lines.append(f"  `#{t.task_id}` — {t.prompt_preview}… ({t._elapsed()})")
+
+    btns = []
+    for t in tasks:
+        btns.append([InlineKeyboardButton(
+            f"⏹ Cancel #{t.task_id}", callback_data=f"tg:cancel:{t.task_id}"
+        )])
+    btns.append([InlineKeyboardButton("⏹ Cancel All", callback_data=f"tg:cancelall:{uid}")])
+
+    await update.message.reply_text(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(btns),
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Cancel a specific task or all tasks. Usage: /cancel [task_id|all]"""
+    uid = update.effective_user.id
+    args = ctx.args
+
+    if args and args[0].lower() == "all":
+        count = _task_registry.cancel_all_user(uid)
+        await update.message.reply_text(f"⏹ Cancelled {count} task(s).")
+        return
+
+    if args:
+        try:
+            task_id = int(args[0].lstrip("#"))
+            task = _task_registry.get(task_id)
+            if task and task.uid == uid:
+                task.cancel()
+                await update.message.reply_text(f"⏹ Cancelling task `#{task_id}`.", parse_mode="Markdown")
+            else:
+                await update.message.reply_text(f"Task `#{task_id}` not found.", parse_mode="Markdown")
+        except ValueError:
+            await update.message.reply_text("Usage: `/cancel <task_id>` or `/cancel all`", parse_mode="Markdown")
+        return
+
+    # No args — show active tasks with cancel buttons
+    tasks = _task_registry.get_user_tasks(uid)
+    if not tasks:
+        await update.message.reply_text("No active tasks to cancel.")
+        return
+
+    btns = []
+    for t in tasks:
+        btns.append([InlineKeyboardButton(
+            f"⏹ #{t.task_id} — {t.prompt_preview[:20]}…", callback_data=f"tg:cancel:{t.task_id}"
+        )])
+    btns.append([InlineKeyboardButton("⏹ Cancel All", callback_data=f"tg:cancelall:{uid}")])
+    await update.message.reply_text(
+        f"*{len(tasks)} active task(s).* Which to cancel?",
+        reply_markup=InlineKeyboardMarkup(btns),
+        parse_mode=ParseMode.MARKDOWN,
     )
 
 
@@ -462,12 +570,19 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     _, kind, value = parts
 
-    # Handle cancel button
+    # Handle cancel button (value is task_id)
     if kind == "cancel":
-        target_uid = int(value)
-        if target_uid == uid and target_uid in _active_tasks:
-            _active_tasks[target_uid].cancel()
+        task_id = int(value)
+        task = _task_registry.get(task_id)
+        if task and task.uid == uid:
+            task.cancel()
             await q.edit_message_text("⏹ Cancelling…", reply_markup=None)
+        return
+
+    # Handle cancel all
+    if kind == "cancelall":
+        count = _task_registry.cancel_all_user(uid)
+        await q.edit_message_text(f"⏹ Cancelling {count} task(s)…", reply_markup=None)
         return
 
     if kind == "model":
@@ -525,6 +640,58 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ─── Message handler ─────────────────────────────────────────────────────────────
 
+async def _run_task(update: Update, ctx: ContextTypes.DEFAULT_TYPE, uid: int, user_text: str):
+    """Execute a single Claude task. Can run concurrently with other tasks."""
+    placeholder = await update.message.reply_text("⏳ Thinking…")
+    stop = asyncio.Event()
+    typing_task = asyncio.create_task(_typing_loop(update.effective_chat.id, ctx, stop))
+
+    # Create task session with progress tracking
+    task = TaskSession(placeholder, uid, user_text)
+    task.start_heartbeat()
+    _task_registry.register(task)
+
+    try:
+        reply, stats = await _ask(uid, user_text, tracker=task)
+
+        if task.cancelled:
+            await placeholder.edit_text(
+                f"⏹ Task cancelled. `#{task.task_id}`", reply_markup=None, parse_mode=ParseMode.MARKDOWN
+            )
+            return
+
+        cc.save_turn(PLATFORM, str(uid), user_text, reply)
+        cc.track_usage(PLATFORM, str(uid), stats.get("input_tokens", 0), stats.get("output_tokens", 0))
+        cc.track_tool_usage(PLATFORM, str(uid), stats.get("tools_used", []))
+        cc.track_cost(PLATFORM, str(uid), stats.get("input_tokens", 0), stats.get("output_tokens", 0), stats.get("cost_usd", 0))
+
+        v = _verbose(uid)
+        if v >= 1 and stats.get("tools_used"):
+            summary = task.finish_summary()
+            reply = f"{summary}\n🔧 _{', '.join(stats['tools_used'][:5])}_\n\n{reply}"
+        elif v >= 1 and task.tool_count == 0:
+            summary = task.finish_summary()
+            reply = f"{summary}\n\n{reply}"
+        if v >= 2 and stats.get("input_tokens"):
+            cost = stats.get("cost_usd", 0)
+            cost_str = f" · ${cost:.4f}" if cost else ""
+            reply += f"\n\n_({stats['input_tokens']}→{stats['output_tokens']} tokens{cost_str})_"
+
+        await _send(placeholder, update, reply)
+    except asyncio.CancelledError:
+        await placeholder.edit_text(
+            f"⏹ Task cancelled. `#{task.task_id}`", reply_markup=None, parse_mode=ParseMode.MARKDOWN
+        )
+    except Exception as exc:
+        log.exception("handle_message error (task #%d)", task.task_id)
+        await placeholder.edit_text(f"Error: {exc}", reply_markup=None)
+    finally:
+        await task.stop()
+        _task_registry.unregister(task.task_id)
+        stop.set()
+        await typing_task
+
+
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not _allowed(uid):
@@ -540,50 +707,23 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not user_text.strip():
         return
 
-    placeholder = await update.message.reply_text("⏳ Thinking…")
-    stop = asyncio.Event()
-    typing_task = asyncio.create_task(_typing_loop(update.effective_chat.id, ctx, stop))
+    # Check concurrent task limit
+    if _task_registry.user_task_count(uid) >= MAX_CONCURRENT_TASKS:
+        active = _task_registry.get_user_tasks(uid)
+        task_list = "\n".join(
+            f"  `#{t.task_id}` — {t.prompt_preview}… ({t._elapsed()})"
+            for t in active
+        )
+        await update.message.reply_text(
+            f"⚠️ You have {len(active)} tasks running (max {MAX_CONCURRENT_TASKS}).\n\n"
+            f"{task_list}\n\n"
+            f"Use /tasks to manage or /cancel to stop one.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
 
-    # Set up progress tracker with heartbeat and cancel support
-    tracker = ProgressTracker(placeholder, uid)
-    tracker.start_heartbeat()
-    _active_tasks[uid] = tracker
-
-    try:
-        reply, stats = await _ask(uid, user_text, tracker=tracker)
-
-        if tracker.cancelled:
-            await placeholder.edit_text("⏹ Task cancelled.", reply_markup=None)
-            return
-
-        cc.save_turn(PLATFORM, str(uid), user_text, reply)
-        cc.track_usage(PLATFORM, str(uid), stats.get("input_tokens", 0), stats.get("output_tokens", 0))
-        cc.track_tool_usage(PLATFORM, str(uid), stats.get("tools_used", []))
-        cc.track_cost(PLATFORM, str(uid), stats.get("input_tokens", 0), stats.get("output_tokens", 0), stats.get("cost_usd", 0))
-
-        v = _verbose(uid)
-        if v >= 1 and stats.get("tools_used"):
-            summary = tracker.finish_summary()
-            reply = f"{summary}\n🔧 _{', '.join(stats['tools_used'][:5])}_\n\n{reply}"
-        elif v >= 1 and tracker.tool_count == 0:
-            summary = tracker.finish_summary()
-            reply = f"{summary}\n\n{reply}"
-        if v >= 2 and stats.get("input_tokens"):
-            cost = stats.get("cost_usd", 0)
-            cost_str = f" · ${cost:.4f}" if cost else ""
-            reply += f"\n\n_({stats['input_tokens']}→{stats['output_tokens']} tokens{cost_str})_"
-
-        await _send(placeholder, update, reply)
-    except asyncio.CancelledError:
-        await placeholder.edit_text("⏹ Task cancelled.", reply_markup=None)
-    except Exception as exc:
-        log.exception("handle_message error")
-        await placeholder.edit_text(f"Error: {exc}", reply_markup=None)
-    finally:
-        await tracker.stop()
-        _active_tasks.pop(uid, None)
-        stop.set()
-        await typing_task
+    # Fire and forget — task runs concurrently
+    asyncio.create_task(_run_task(update, ctx, uid, user_text))
 
 
 # ─── Upload directory for persistent file storage ─────────────────────────────
@@ -614,22 +754,24 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     raw = bytes(await file.download_as_bytearray())
     caption = update.message.caption or "Analyze this image."
 
+    save_path = _upload_path(uid, ".jpg", "img_")
+    save_path.write_bytes(raw)
+    prompt = f"{caption}\n\n[Image saved at: {save_path}]"
+
     placeholder = await update.message.reply_text("🔍 Analyzing image…")
     stop = asyncio.Event()
     typing_task = asyncio.create_task(_typing_loop(update.effective_chat.id, ctx, stop))
-    tracker = ProgressTracker(placeholder, uid)
-    tracker.start_heartbeat()
-    _active_tasks[uid] = tracker
+    task = TaskSession(placeholder, uid, f"[Image] {caption}")
+    task.start_heartbeat()
+    _task_registry.register(task)
 
     try:
-        save_path = _upload_path(uid, ".jpg", "img_")
-        save_path.write_bytes(raw)
+        reply, stats = await _ask(uid, prompt, tracker=task)
 
-        prompt = f"{caption}\n\n[Image saved at: {save_path}]"
-        reply, stats = await _ask(uid, prompt, tracker=tracker)
-
-        if tracker.cancelled:
-            await placeholder.edit_text("⏹ Task cancelled.", reply_markup=None)
+        if task.cancelled:
+            await placeholder.edit_text(
+                f"⏹ Task cancelled. `#{task.task_id}`", reply_markup=None, parse_mode=ParseMode.MARKDOWN
+            )
             return
 
         cc.save_turn(PLATFORM, str(uid), f"[Image at {save_path}] {caption}", reply)
@@ -639,8 +781,8 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         log.exception("handle_photo error")
         await placeholder.edit_text(f"Error: {exc}", reply_markup=None)
     finally:
-        await tracker.stop()
-        _active_tasks.pop(uid, None)
+        await task.stop()
+        _task_registry.unregister(task.task_id)
         stop.set()
         await typing_task
 
@@ -665,23 +807,25 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     filename = doc.file_name or "file"
     caption = update.message.caption or f"Analyze this file: {filename}"
 
+    suffix = Path(filename).suffix or ".txt"
+    save_path = _upload_path(uid, suffix, "doc_")
+    save_path.write_bytes(raw)
+    prompt = f"{caption}\n\n[File '{filename}' saved at: {save_path}]"
+
     placeholder = await update.message.reply_text(f"📄 Processing {filename}…")
     stop = asyncio.Event()
     typing_task = asyncio.create_task(_typing_loop(update.effective_chat.id, ctx, stop))
-    tracker = ProgressTracker(placeholder, uid)
-    tracker.start_heartbeat()
-    _active_tasks[uid] = tracker
+    task = TaskSession(placeholder, uid, f"[File] {filename}")
+    task.start_heartbeat()
+    _task_registry.register(task)
 
     try:
-        suffix = Path(filename).suffix or ".txt"
-        save_path = _upload_path(uid, suffix, "doc_")
-        save_path.write_bytes(raw)
+        reply, stats = await _ask(uid, prompt, tracker=task)
 
-        prompt = f"{caption}\n\n[File '{filename}' saved at: {save_path}]"
-        reply, stats = await _ask(uid, prompt, tracker=tracker)
-
-        if tracker.cancelled:
-            await placeholder.edit_text("⏹ Task cancelled.", reply_markup=None)
+        if task.cancelled:
+            await placeholder.edit_text(
+                f"⏹ Task cancelled. `#{task.task_id}`", reply_markup=None, parse_mode=ParseMode.MARKDOWN
+            )
             return
 
         cc.save_turn(PLATFORM, str(uid), f"[File '{filename}' at {save_path}] {caption}", reply)
@@ -691,8 +835,8 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         log.exception("handle_document error")
         await placeholder.edit_text(f"Error: {exc}", reply_markup=None)
     finally:
-        await tracker.stop()
-        _active_tasks.pop(uid, None)
+        await task.stop()
+        _task_registry.unregister(task.task_id)
         stop.set()
         await typing_task
 
@@ -712,6 +856,8 @@ def build_app() -> Application:
     app = Application.builder().token(TOKEN).request(req).build()
 
     app.add_handler(CommandHandler("start",       cmd_start))
+    app.add_handler(CommandHandler("tasks",       cmd_tasks))
+    app.add_handler(CommandHandler("cancel",      cmd_cancel))
     app.add_handler(CommandHandler("reset",       cmd_reset))
     app.add_handler(CommandHandler("mode",        cmd_mode))
     app.add_handler(CommandHandler("model",       cmd_model))
