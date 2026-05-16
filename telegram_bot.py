@@ -104,12 +104,46 @@ async def _send(placeholder, update: Update, text: str):
                 await update.effective_message.reply_text(text[i:i+chunk])
 
 
+# ─── Tool name → friendly emoji/label ──────────────────────────────────────────
+
+_TOOL_LABELS = {
+    "Bash":      "🖥️ Running command…",
+    "Read":      "📖 Reading file…",
+    "Write":     "📝 Writing file…",
+    "Edit":      "✏️ Editing file…",
+    "Grep":      "🔍 Searching…",
+    "WebSearch": "🌐 Searching the web…",
+    "WebFetch":  "🌐 Fetching page…",
+    "Agent":     "🤖 Delegating to agent…",
+}
+
+
+def _tool_label(tool_name: str) -> str:
+    return _TOOL_LABELS.get(tool_name, f"🔧 Using {tool_name}…")
+
+
 # ─── Core ask ───────────────────────────────────────────────────────────────────
 
-async def _ask(uid: int, text: str) -> tuple[str, dict]:
+async def _ask(uid: int, text: str, placeholder=None) -> tuple[str, dict]:
     history = cc.load_history(PLATFORM, str(uid))
     if cc.CLAUDE_MODE == "api":
         return cc.ask_claude_api(text, history, system=cc.CLAUDE_SYSTEM)
+
+    # Progress callback: update the placeholder with tool activity
+    _seen_tools: list[str] = []
+
+    async def _on_progress(tool_name: str):
+        _seen_tools.append(tool_name)
+        if placeholder:
+            labels = []
+            for t in dict.fromkeys(_seen_tools):  # unique, ordered
+                labels.append(_tool_label(t))
+            status = "\n".join(labels[-5:])  # show last 5 tools
+            try:
+                await placeholder.edit_text(f"⏳ Working…\n\n{status}")
+            except Exception:
+                pass  # ignore edit conflicts
+
     return await cc.ask_claude_async(
         text, history,
         model=_model(uid),
@@ -117,6 +151,7 @@ async def _ask(uid: int, text: str) -> tuple[str, dict]:
         add_dirs=cc.CLAUDE_ADD_DIRS,
         perm_mode=_perm(uid),
         timeout=cc.CLAUDE_TIMEOUT,
+        on_progress=_on_progress,
     )
 
 
@@ -295,7 +330,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     typing_task = asyncio.create_task(_typing_loop(update.effective_chat.id, ctx, stop))
 
     try:
-        reply, stats = await _ask(uid, user_text)
+        reply, stats = await _ask(uid, user_text, placeholder=placeholder)
         cc.save_turn(PLATFORM, str(uid), user_text, reply)
         cc.track_usage(PLATFORM, str(uid), stats.get("input_tokens", 0), stats.get("output_tokens", 0))
 
@@ -351,7 +386,7 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         save_path.write_bytes(raw)
 
         prompt = f"{caption}\n\n[Image saved at: {save_path}]"
-        reply, stats = await _ask(uid, prompt)
+        reply, stats = await _ask(uid, prompt, placeholder=placeholder)
 
         cc.save_turn(PLATFORM, str(uid), f"[Image at {save_path}] {caption}", reply)
         cc.track_usage(PLATFORM, str(uid), stats.get("input_tokens", 0), stats.get("output_tokens", 0))
@@ -394,7 +429,7 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         save_path.write_bytes(raw)
 
         prompt = f"{caption}\n\n[File '{filename}' saved at: {save_path}]"
-        reply, stats = await _ask(uid, prompt)
+        reply, stats = await _ask(uid, prompt, placeholder=placeholder)
 
         cc.save_turn(PLATFORM, str(uid), f"[File '{filename}' at {save_path}] {caption}", reply)
         cc.track_usage(PLATFORM, str(uid), stats.get("input_tokens", 0), stats.get("output_tokens", 0))

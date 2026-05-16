@@ -233,8 +233,13 @@ async def ask_claude_async(
     add_dirs: str = CLAUDE_ADD_DIRS,
     perm_mode: str = CLAUDE_PERM_MODE,
     timeout: int = CLAUDE_TIMEOUT,
+    on_progress: Optional[callable] = None,
 ) -> tuple[str, dict]:
-    """Async Claude CLI call. Returns (reply_text, stats_dict)."""
+    """Async Claude CLI call with streaming progress. Returns (reply_text, stats_dict).
+
+    on_progress(tool_name: str) is called whenever Claude starts using a tool,
+    so the caller can update the user (e.g. "🔧 Reading file…").
+    """
     full_prompt = _build_prompt(user_text, history)
 
     cmd = [
@@ -248,21 +253,62 @@ async def ask_claude_async(
     for d in [x.strip() for x in add_dirs.split(",") if x.strip()]:
         cmd += ["--add-dir", d]
 
+    # Use 10MB buffer limit — Claude can produce very large JSON lines
+    # when writing files (default 64KB is too small)
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         cwd=CLAUDE_WORK_DIR,
+        limit=10 * 1024 * 1024,
     )
+
+    stdout_lines: list[str] = []
     try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        async def _read_stream():
+            while True:
+                line = await proc.stdout.readline()
+                if not line:
+                    break
+                decoded = line.decode().strip()
+                if not decoded:
+                    continue
+                stdout_lines.append(decoded)
+
+                # Parse streaming events for progress callbacks
+                if on_progress:
+                    try:
+                        event = json.loads(decoded)
+                        etype = event.get("type", "")
+
+                        # Tool use detected in assistant message blocks
+                        if etype == "assistant":
+                            msg = event.get("message", {})
+                            if isinstance(msg, dict):
+                                for block in msg.get("content", []):
+                                    if block.get("type") == "tool_use":
+                                        await on_progress(block.get("name", "tool"))
+
+                        # Tool use detected in content_block_start events
+                        elif etype == "content_block_start":
+                            cb = event.get("content_block", {})
+                            if cb.get("type") == "tool_use":
+                                await on_progress(cb.get("name", "tool"))
+
+                    except (json.JSONDecodeError, Exception):
+                        pass
+
+        await asyncio.wait_for(_read_stream(), timeout=timeout)
+        await proc.wait()
+        stderr_data = await proc.stderr.read()
     except asyncio.TimeoutError:
         proc.kill()
         await proc.wait()
         return f"[Timeout] Claude took more than {timeout}s.", {}
 
+    stdout_text = "\n".join(stdout_lines)
     return _parse_cli_output(
-        stdout.decode(), stderr.decode(), proc.returncode, timeout
+        stdout_text, stderr_data.decode(), proc.returncode, timeout
     )
 
 
