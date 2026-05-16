@@ -100,6 +100,8 @@ class TaskSession:
     def __init__(self, placeholder, uid: int, prompt_preview: str):
         self.task_id = next(_task_counter)
         self.placeholder = placeholder
+        self.chat_id = None  # set externally for intermediate messages
+        self.bot = None       # set externally
         self.uid = uid
         self.prompt_preview = prompt_preview[:40]
         self.start_time = time.time()
@@ -112,6 +114,7 @@ class TaskSession:
         self._partial_text = ""
         self._phase = "thinking"  # thinking → working → streaming
         self._current_activity = ""  # detailed activity description
+        self._sent_intermediate = False  # only send one intermediate update
 
     @property
     def cancelled(self) -> bool:
@@ -249,6 +252,30 @@ class TaskSession:
         while not self._cancelled:
             await self._update(force=True)
             elapsed = time.time() - self.start_time
+
+            # For very long tasks (>60s), send intermediate result as new message
+            if (elapsed > 60 and not self._sent_intermediate
+                    and self._partial_text and len(self._partial_text) > 100
+                    and self.bot and self.chat_id):
+                self._sent_intermediate = True
+                preview = self._partial_text[:2000]
+                if len(self._partial_text) > 2000:
+                    preview += "\n\n⏳ _Still working… full response coming soon._"
+                try:
+                    await self.bot.send_message(
+                        chat_id=self.chat_id,
+                        text=f"📝 *Interim update* ({self._elapsed()}):\n\n{preview}",
+                        parse_mode=ParseMode.MARKDOWN,
+                    )
+                except Exception:
+                    try:
+                        await self.bot.send_message(
+                            chat_id=self.chat_id,
+                            text=f"📝 Interim update ({self._elapsed()}):\n\n{preview}",
+                        )
+                    except Exception:
+                        pass
+
             if elapsed < 30:
                 interval = 4
             elif elapsed < 120:
@@ -306,6 +333,24 @@ class TaskRegistry:
 
 
 _task_registry = TaskRegistry()
+
+# ─── Response store (for pagination and retry) ─────────────────────────────────
+
+_response_store: dict[str, dict] = {}  # response_id → {text, uid, prompt, page}
+_response_counter = itertools.count(1)
+
+RESPONSE_PAGE_SIZE = 3000  # chars per page
+
+
+def _store_response(uid: int, prompt: str, text: str) -> str:
+    """Store a long response and return its ID for pagination."""
+    rid = f"r{next(_response_counter)}"
+    _response_store[rid] = {"text": text, "uid": uid, "prompt": prompt}
+    # Keep only last 50 responses in memory
+    if len(_response_store) > 50:
+        oldest = list(_response_store.keys())[0]
+        del _response_store[oldest]
+    return rid
 
 
 # ─── Reply helper ───────────────────────────────────────────────────────────────
@@ -932,6 +977,91 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _handle_browse_callback(q, uid)
         return
 
+    # Handle pagination
+    if kind == "pg":
+        # value = "rid:page"
+        pg_parts = value.split(":")
+        if len(pg_parts) < 2:
+            return
+        rid, page_num = pg_parts[0], int(pg_parts[1])
+        resp = _response_store.get(rid)
+        if not resp or resp["uid"] != uid:
+            await q.edit_message_text("Response expired.", reply_markup=None)
+            return
+
+        text = resp["text"]
+        total_pages = (len(text) + RESPONSE_PAGE_SIZE - 1) // RESPONSE_PAGE_SIZE
+        page_num = min(page_num, total_pages - 1)
+        start = page_num * RESPONSE_PAGE_SIZE
+        page_text = text[start:start + RESPONSE_PAGE_SIZE]
+
+        footer = f"\n\n📄 _Page {page_num + 1}/{total_pages}_"
+
+        nav = []
+        if page_num > 0:
+            nav.append(InlineKeyboardButton("◀️ Prev", callback_data=f"tg:pg:{rid}:{page_num - 1}"))
+        if page_num < total_pages - 1:
+            nav.append(InlineKeyboardButton("▶️ Next", callback_data=f"tg:pg:{rid}:{page_num + 1}"))
+        markup = InlineKeyboardMarkup([nav]) if nav else None
+
+        try:
+            await q.edit_message_text(page_text + footer, parse_mode=ParseMode.MARKDOWN, reply_markup=markup)
+        except Exception:
+            await q.edit_message_text(page_text + footer, reply_markup=markup)
+        return
+
+    # Handle retry
+    if kind == "retry":
+        retry_key = f"retry_{value}"
+        resp = _response_store.get(retry_key)
+        if not resp or resp["uid"] != uid:
+            await q.edit_message_text("Retry expired.", reply_markup=None)
+            return
+
+        prompt = resp["prompt"]
+        del _response_store[retry_key]
+        await q.edit_message_text("🔄 Retrying…", reply_markup=None)
+
+        # Re-run as a task
+        placeholder = q.message
+        stop_evt = asyncio.Event()
+        task = TaskSession(placeholder, uid, prompt)
+        task.start_heartbeat()
+        _task_registry.register(task)
+        try:
+            reply, stats = await _ask(uid, prompt, tracker=task)
+            if task.cancelled:
+                await placeholder.edit_text("⏹ Retry cancelled.", reply_markup=None)
+                return
+            cc.save_turn(PLATFORM, str(uid), prompt, reply)
+            cc.track_usage(PLATFORM, str(uid), stats.get("input_tokens", 0), stats.get("output_tokens", 0))
+            summary = task.finish_summary()
+            reply = f"{summary}\n\n{reply}"
+            md_text = _protect_urls_for_markdown(reply)
+            if len(md_text) <= 4096:
+                try:
+                    await placeholder.edit_text(md_text, parse_mode=ParseMode.MARKDOWN, reply_markup=None)
+                except Exception:
+                    await placeholder.edit_text(reply[:4096], reply_markup=None)
+            else:
+                rid = _store_response(uid, prompt, md_text)
+                page_text = md_text[:RESPONSE_PAGE_SIZE]
+                total_pages = (len(md_text) + RESPONSE_PAGE_SIZE - 1) // RESPONSE_PAGE_SIZE
+                btns = [[InlineKeyboardButton("▶️ Next page", callback_data=f"tg:pg:{rid}:1")]]
+                footer = f"\n\n📄 _Page 1/{total_pages}_"
+                try:
+                    await placeholder.edit_text(page_text + footer, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(btns))
+                except Exception:
+                    await placeholder.edit_text(reply[:RESPONSE_PAGE_SIZE] + footer, reply_markup=InlineKeyboardMarkup(btns))
+        except Exception as exc:
+            retry_btn = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Retry", callback_data=f"tg:retry:{task.task_id}")]])
+            _response_store[f"retry_{task.task_id}"] = {"prompt": prompt, "uid": uid}
+            await placeholder.edit_text(f"❌ Retry failed: {str(exc)[:150]}", reply_markup=retry_btn)
+        finally:
+            await task.stop()
+            _task_registry.unregister(task.task_id)
+        return
+
     if kind == "model":
         _user_model[uid] = value
         cur = _model(uid)
@@ -987,6 +1117,62 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ─── Message handler ─────────────────────────────────────────────────────────────
 
+async def _send_paginated(update: Update, uid: int, prompt: str, text: str, placeholder=None):
+    """Send a response with pagination buttons if it's long."""
+    chunk = 4096
+    md_text = _protect_urls_for_markdown(text)
+
+    # Short responses: send directly
+    if len(md_text) <= chunk:
+        btns = []
+        if placeholder:
+            try:
+                await placeholder.edit_text(md_text, parse_mode=ParseMode.MARKDOWN, reply_markup=None)
+                return
+            except Exception:
+                try:
+                    await placeholder.edit_text(text, reply_markup=None)
+                    return
+                except Exception:
+                    pass
+
+        # Fallback: new message
+        await update.effective_message.reply_text(md_text, parse_mode=ParseMode.MARKDOWN)
+        return
+
+    # Long responses: paginate
+    rid = _store_response(uid, prompt, md_text)
+    page_text = md_text[:RESPONSE_PAGE_SIZE]
+    total_pages = (len(md_text) + RESPONSE_PAGE_SIZE - 1) // RESPONSE_PAGE_SIZE
+
+    footer = f"\n\n📄 _Page 1/{total_pages}_"
+    btns = [[InlineKeyboardButton("▶️ Next page", callback_data=f"tg:pg:{rid}:1")]]
+    markup = InlineKeyboardMarkup(btns)
+
+    if placeholder:
+        try:
+            await placeholder.edit_text(
+                page_text + footer, parse_mode=ParseMode.MARKDOWN, reply_markup=markup
+            )
+            return
+        except Exception:
+            try:
+                await placeholder.edit_text(
+                    text[:RESPONSE_PAGE_SIZE] + footer, reply_markup=markup
+                )
+                return
+            except Exception:
+                pass
+
+    # Fallback: new message
+    try:
+        await update.effective_message.reply_text(
+            page_text + footer, parse_mode=ParseMode.MARKDOWN, reply_markup=markup
+        )
+    except Exception:
+        await update.effective_message.reply_text(text[:RESPONSE_PAGE_SIZE], reply_markup=markup)
+
+
 async def _run_task(update: Update, ctx: ContextTypes.DEFAULT_TYPE, uid: int, user_text: str):
     """Execute a single Claude task. Can run concurrently with other tasks."""
     placeholder = await update.message.reply_text("🧠 Thinking…")
@@ -995,6 +1181,8 @@ async def _run_task(update: Update, ctx: ContextTypes.DEFAULT_TYPE, uid: int, us
 
     # Create task session with progress tracking
     task = TaskSession(placeholder, uid, user_text)
+    task.chat_id = update.effective_chat.id
+    task.bot = ctx.bot
     task.start_heartbeat()
     _task_registry.register(task)
 
@@ -1027,7 +1215,19 @@ async def _run_task(update: Update, ctx: ContextTypes.DEFAULT_TYPE, uid: int, us
             cost_str = f" · ${cost:.4f}" if cost else ""
             reply += f"\n\n_({stats['input_tokens']}→{stats['output_tokens']} tokens{cost_str})_"
 
-        await _send(placeholder, update, reply)
+        await _send_paginated(update, uid, user_text, reply, placeholder=placeholder)
+
+        # Notification ping for long tasks (>30s) — vibrates the phone
+        elapsed_secs = time.time() - task.start_time
+        if elapsed_secs > 30:
+            try:
+                await update.effective_message.reply_text(
+                    f"🔔 Task complete ({task._elapsed()})",
+                    disable_notification=False,
+                )
+            except Exception:
+                pass
+
     except asyncio.CancelledError:
         await placeholder.edit_text(
             f"⏹ Task cancelled after {task._elapsed()}.", reply_markup=None,
@@ -1035,10 +1235,19 @@ async def _run_task(update: Update, ctx: ContextTypes.DEFAULT_TYPE, uid: int, us
     except Exception as exc:
         log.exception("handle_message error (task #%d)", task.task_id)
         error_msg = str(exc)[:200]
+        # Show error with retry button
+        retry_btn = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 Retry", callback_data=f"tg:retry:{task.task_id}")],
+        ])
+        # Store the prompt for retry
+        _response_store[f"retry_{task.task_id}"] = {"prompt": user_text, "uid": uid}
         try:
-            await placeholder.edit_text(f"❌ Error after {task._elapsed()}: {error_msg}", reply_markup=None)
+            await placeholder.edit_text(
+                f"❌ Error after {task._elapsed()}: {error_msg}",
+                reply_markup=retry_btn,
+            )
         except Exception:
-            await update.message.reply_text(f"❌ Error: {error_msg}")
+            await update.message.reply_text(f"❌ Error: {error_msg}", reply_markup=retry_btn)
     finally:
         await task.stop()
         _task_registry.unregister(task.task_id)
