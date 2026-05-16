@@ -6,7 +6,6 @@ Run via main.py with BOT_MODE=telegram or BOT_MODE=both.
 import asyncio
 import logging
 import os
-import tempfile
 import time
 from pathlib import Path
 
@@ -315,6 +314,19 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await typing_task
 
 
+# ─── Upload directory for persistent file storage ─────────────────────────────
+
+UPLOAD_DIR = Path(cc.CLAUDE_WORK_DIR) / "telegram_uploads"
+UPLOAD_DIR.mkdir(exist_ok=True)
+
+
+def _upload_path(uid: int, suffix: str, prefix: str = "") -> Path:
+    """Return a persistent path for an uploaded file."""
+    ts = int(time.time() * 1000)
+    name = f"{prefix}{uid}_{ts}{suffix}"
+    return UPLOAD_DIR / name
+
+
 # ─── Photo handler ───────────────────────────────────────────────────────────────
 
 async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -335,15 +347,13 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     typing_task = asyncio.create_task(_typing_loop(update.effective_chat.id, ctx, stop))
 
     try:
-        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False, dir=cc.CLAUDE_WORK_DIR) as tmp:
-            tmp.write(raw)
-            tmp_path = tmp.name
+        save_path = _upload_path(uid, ".jpg", "img_")
+        save_path.write_bytes(raw)
 
-        prompt = f"{caption}\n\n[Image saved at: {tmp_path}]"
+        prompt = f"{caption}\n\n[Image saved at: {save_path}]"
         reply, stats = await _ask(uid, prompt)
-        import os; os.unlink(tmp_path)
 
-        cc.save_turn(PLATFORM, str(uid), f"[Image] {caption}", reply)
+        cc.save_turn(PLATFORM, str(uid), f"[Image at {save_path}] {caption}", reply)
         cc.track_usage(PLATFORM, str(uid), stats.get("input_tokens", 0), stats.get("output_tokens", 0))
         await _send(placeholder, update, reply)
     except Exception as exc:
@@ -380,15 +390,13 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     try:
         suffix = Path(filename).suffix or ".txt"
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False, dir=cc.CLAUDE_WORK_DIR, prefix="tg_") as tmp:
-            tmp.write(raw)
-            tmp_path = tmp.name
+        save_path = _upload_path(uid, suffix, "doc_")
+        save_path.write_bytes(raw)
 
-        prompt = f"{caption}\n\n[File '{filename}' saved at: {tmp_path}]"
+        prompt = f"{caption}\n\n[File '{filename}' saved at: {save_path}]"
         reply, stats = await _ask(uid, prompt)
-        import os; os.unlink(tmp_path)
 
-        cc.save_turn(PLATFORM, str(uid), f"[File: {filename}] {caption}", reply)
+        cc.save_turn(PLATFORM, str(uid), f"[File '{filename}' at {save_path}] {caption}", reply)
         cc.track_usage(PLATFORM, str(uid), stats.get("input_tokens", 0), stats.get("output_tokens", 0))
         await _send(placeholder, update, reply)
     except Exception as exc:
