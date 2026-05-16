@@ -306,12 +306,13 @@ async def ask_claude_async(
     perm_mode: str = CLAUDE_PERM_MODE,
     timeout: int = CLAUDE_TIMEOUT,
     on_progress: Optional[callable] = None,
+    on_text: Optional[callable] = None,
     is_cancelled: Optional[callable] = None,
 ) -> tuple[str, dict]:
     """Async Claude CLI call with streaming progress. Returns (reply_text, stats_dict).
 
-    on_progress(tool_name: str) is called whenever Claude starts using a tool,
-    so the caller can update the user (e.g. "🔧 Reading file…").
+    on_progress(tool_name: str) is called whenever Claude starts using a tool.
+    on_text(partial_text: str) is called when text content is received.
     """
     full_prompt = _build_prompt(user_text, history)
 
@@ -354,7 +355,7 @@ async def ask_claude_async(
                 stdout_lines.append(decoded)
 
                 # Parse streaming events for progress callbacks
-                if on_progress:
+                if on_progress or on_text:
                     try:
                         event = json.loads(decoded)
                         etype = event.get("type", "")
@@ -364,14 +365,22 @@ async def ask_claude_async(
                             msg = event.get("message", {})
                             if isinstance(msg, dict):
                                 for block in msg.get("content", []):
-                                    if block.get("type") == "tool_use":
+                                    if block.get("type") == "tool_use" and on_progress:
                                         await on_progress(block.get("name", "tool"))
+                                    elif block.get("type") == "text" and on_text:
+                                        await on_text(block.get("text", ""))
 
                         # Tool use detected in content_block_start events
                         elif etype == "content_block_start":
                             cb = event.get("content_block", {})
-                            if cb.get("type") == "tool_use":
+                            if cb.get("type") == "tool_use" and on_progress:
                                 await on_progress(cb.get("name", "tool"))
+
+                        # Partial text in content_block_delta
+                        elif etype == "content_block_delta" and on_text:
+                            delta = event.get("delta", {})
+                            if delta.get("type") == "text_delta":
+                                await on_text(delta.get("text", ""))
 
                     except (json.JSONDecodeError, Exception):
                         pass
@@ -433,6 +442,7 @@ async def ask_claude_sdk(
     add_dirs: str = CLAUDE_ADD_DIRS,
     timeout: int = CLAUDE_TIMEOUT,
     on_progress: Optional[callable] = None,
+    on_text: Optional[callable] = None,
     is_cancelled: Optional[callable] = None,
 ) -> tuple[str, dict]:
     """Async Claude Code SDK call with streaming progress. Returns (reply_text, stats_dict).
@@ -487,6 +497,11 @@ async def ask_claude_sdk(
                                 pass
                     elif isinstance(block, TextBlock):
                         result_text = block.text
+                        if on_text:
+                            try:
+                                await on_text(block.text)
+                            except Exception:
+                                pass
 
             elif isinstance(message, ResultMessage):
                 if message.result:

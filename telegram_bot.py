@@ -108,6 +108,8 @@ class TaskSession:
         self._last_update = 0.0
         self._cancelled = False
         self._heartbeat_task: asyncio.Task | None = None
+        self._partial_text = ""
+        self._phase = "thinking"  # thinking → working → streaming
 
     @property
     def cancelled(self) -> bool:
@@ -135,7 +137,15 @@ class TaskSession:
         user_tasks = _task_registry.get_user_tasks(self.uid)
         task_label = f" `#{self.task_id}`" if len(user_tasks) > 1 else ""
 
-        lines = [f"{spinner} *Working…* `{elapsed}`{task_label}"]
+        # Phase indicator
+        if self._phase == "thinking":
+            phase_label = "Thinking…"
+        elif self._phase == "working":
+            phase_label = "Working…"
+        else:
+            phase_label = "Writing…"
+
+        lines = [f"{spinner} *{phase_label}* `{elapsed}`{task_label}"]
 
         if self.tools:
             unique_recent = list(dict.fromkeys(self.tools[-8:]))[-5:]
@@ -146,22 +156,39 @@ class TaskSession:
         if self.tool_count > 5:
             lines.append(f"\n_({self.tool_count} tool calls total)_")
 
+        # Show partial streaming text preview
+        if self._partial_text:
+            preview = self._partial_text[-300:]
+            if len(self._partial_text) > 300:
+                preview = "…" + preview
+            lines.append(f"\n───\n{preview}")
+
         return "\n".join(lines)
 
     async def on_tool(self, tool_name: str):
         """Called when Claude starts using a tool."""
+        self._phase = "working"
         self.tools.append(tool_name)
         self.tool_count += 1
+        await self._update()
+
+    async def on_text(self, text: str):
+        """Called when Claude streams text content."""
+        self._phase = "streaming"
+        self._partial_text = text if len(text) > len(self._partial_text) else self._partial_text + text
         await self._update()
 
     async def _update(self):
         """Update the placeholder message (rate-limited to avoid Telegram 429s)."""
         now = time.time()
-        if now - self._last_update < 2.0:
+        if now - self._last_update < 3.0:
             return
         self._last_update = now
 
         status = self._build_status()
+        # Truncate to stay within Telegram's 4096 char limit
+        if len(status) > 4000:
+            status = status[:4000] + "\n…"
         cancel_btn = InlineKeyboardMarkup([
             [InlineKeyboardButton("⏹ Cancel", callback_data=f"tg:cancel:{self.task_id}")]
         ])
@@ -172,7 +199,14 @@ class TaskSession:
                 parse_mode=ParseMode.MARKDOWN,
             )
         except Exception:
-            pass
+            # Fallback without markdown if it fails
+            try:
+                await self.placeholder.edit_text(
+                    status,
+                    reply_markup=cancel_btn,
+                )
+            except Exception:
+                pass
 
     async def _heartbeat(self):
         """Periodic updates even without tool activity."""
@@ -278,6 +312,9 @@ def _protect_urls_for_markdown(text: str) -> str:
 
 async def _send(placeholder, update: Update, text: str):
     chunk = 4096
+    if not text or not text.strip():
+        await placeholder.edit_text("(empty response)", reply_markup=None)
+        return
     # Protect URLs so they remain clickable in Markdown mode
     md_text = _protect_urls_for_markdown(text)
     try:
@@ -289,12 +326,16 @@ async def _send(placeholder, update: Update, text: str):
                 await update.effective_message.reply_text(md_text[i:i+chunk], parse_mode=ParseMode.MARKDOWN)
     except Exception:
         # Fallback: plain text (Telegram auto-links bare URLs in plain text)
-        if len(text) <= chunk:
-            await placeholder.edit_text(text, reply_markup=None)
-        else:
-            await placeholder.edit_text(text[:chunk], reply_markup=None)
-            for i in range(chunk, len(text), chunk):
-                await update.effective_message.reply_text(text[i:i+chunk])
+        try:
+            if len(text) <= chunk:
+                await placeholder.edit_text(text, reply_markup=None)
+            else:
+                await placeholder.edit_text(text[:chunk], reply_markup=None)
+                for i in range(chunk, len(text), chunk):
+                    await update.effective_message.reply_text(text[i:i+chunk])
+        except Exception as exc:
+            log.error("_send fallback failed: %s", exc)
+            await placeholder.edit_text(f"⚠️ Response received but couldn't display ({len(text)} chars). Error: {str(exc)[:100]}", reply_markup=None)
 
 
 # ─── Tool name → friendly emoji/label ──────────────────────────────────────────
@@ -343,6 +384,11 @@ async def _ask(uid: int, text: str, tracker: TaskSession | None = None) -> tuple
         if tracker:
             await tracker.on_tool(tool_name)
 
+    # Text streaming callback
+    async def _on_text(text_chunk: str):
+        if tracker:
+            await tracker.on_text(text_chunk)
+
     # Cancellation check
     def _is_cancelled() -> bool:
         return tracker.cancelled if tracker else False
@@ -355,6 +401,7 @@ async def _ask(uid: int, text: str, tracker: TaskSession | None = None) -> tuple
             add_dirs=cc.CLAUDE_ADD_DIRS,
             timeout=cc.CLAUDE_TIMEOUT,
             on_progress=_on_progress,
+            on_text=_on_text,
             is_cancelled=_is_cancelled,
         )
 
@@ -367,6 +414,7 @@ async def _ask(uid: int, text: str, tracker: TaskSession | None = None) -> tuple
         perm_mode=_perm(uid),
         timeout=cc.CLAUDE_TIMEOUT,
         on_progress=_on_progress,
+        on_text=_on_text,
         is_cancelled=_is_cancelled,
     )
 
