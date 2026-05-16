@@ -101,15 +101,17 @@ class TaskSession:
         self.task_id = next(_task_counter)
         self.placeholder = placeholder
         self.uid = uid
-        self.prompt_preview = prompt_preview[:40]  # Short label
+        self.prompt_preview = prompt_preview[:40]
         self.start_time = time.time()
         self.tools: list[str] = []
         self.tool_count = 0
         self._last_update = 0.0
+        self._last_status = ""
         self._cancelled = False
         self._heartbeat_task: asyncio.Task | None = None
         self._partial_text = ""
         self._phase = "thinking"  # thinking → working → streaming
+        self._current_activity = ""  # detailed activity description
 
     @property
     def cancelled(self) -> bool:
@@ -124,68 +126,101 @@ class TaskSession:
             return f"{secs}s"
         return f"{secs // 60}m {secs % 60}s"
 
-    def _spinner(self) -> str:
+    def _progress_bar(self) -> str:
+        """Visual progress bar based on activity."""
         secs = int(time.time() - self.start_time)
-        frames = ["◐", "◓", "◑", "◒"]
-        return frames[secs % 4]
+        # Animated fill that moves based on time + activity
+        if self._phase == "streaming":
+            fill = min(9, 7 + (secs % 3))
+        elif self.tool_count > 0:
+            fill = min(7, 2 + self.tool_count)
+        else:
+            fill = min(3, 1 + secs // 10)
+        bar = "▓" * fill + "░" * (10 - fill)
+        return f"[{bar}]"
 
     def _build_status(self) -> str:
         elapsed = self._elapsed()
-        spinner = self._spinner()
 
         # Show task ID if user has multiple active tasks
         user_tasks = _task_registry.get_user_tasks(self.uid)
-        task_label = f" `#{self.task_id}`" if len(user_tasks) > 1 else ""
+        task_label = f"  `#{self.task_id}`" if len(user_tasks) > 1 else ""
 
-        # Phase indicator
+        # Phase with emoji
         if self._phase == "thinking":
-            phase_label = "Thinking…"
+            phase = "🧠 *Thinking…*"
         elif self._phase == "working":
-            phase_label = "Working…"
+            phase = "⚙️ *Working…*"
         else:
-            phase_label = "Writing…"
+            phase = "✍️ *Writing…*"
 
-        lines = [f"{spinner} *{phase_label}* `{elapsed}`{task_label}"]
+        progress = self._progress_bar()
+        lines = [f"{phase} `{elapsed}`{task_label}", progress]
 
-        if self.tools:
-            unique_recent = list(dict.fromkeys(self.tools[-8:]))[-5:]
-            tool_lines = [_tool_label(t) for t in unique_recent]
-            lines.append("")
-            lines.extend(tool_lines)
+        # Current activity (detailed)
+        if self._current_activity:
+            lines.append(f"\n{self._current_activity}")
+        elif self.tools:
+            last_tool = self.tools[-1]
+            lines.append(f"\n{_tool_label(last_tool)}")
 
-        if self.tool_count > 5:
-            lines.append(f"\n_({self.tool_count} tool calls total)_")
+        # Tool history summary
+        if self.tool_count > 1:
+            unique = list(dict.fromkeys(self.tools))
+            summary_parts = []
+            for t in unique[-4:]:
+                count = self.tools.count(t)
+                icon = _TOOL_ICONS.get(t, "🔧")
+                summary_parts.append(f"{icon}×{count}" if count > 1 else icon)
+            lines.append(f"\n{'  '.join(summary_parts)}  _({self.tool_count} steps)_")
 
         # Show partial streaming text preview
         if self._partial_text:
-            preview = self._partial_text[-300:]
-            if len(self._partial_text) > 300:
+            preview = self._partial_text[-400:]
+            if len(self._partial_text) > 400:
                 preview = "…" + preview
-            lines.append(f"\n───\n{preview}")
+            # Escape markdown special chars in preview to avoid parse errors
+            lines.append(f"\n{'─' * 20}\n{preview}")
 
         return "\n".join(lines)
 
-    async def on_tool(self, tool_name: str):
+    async def on_tool(self, tool_name: str, detail: str = ""):
         """Called when Claude starts using a tool."""
         self._phase = "working"
         self.tools.append(tool_name)
         self.tool_count += 1
+        if detail:
+            self._current_activity = f"{_tool_label(tool_name).rstrip('…')} `{detail}`…"
+        else:
+            self._current_activity = _tool_label(tool_name)
         await self._update()
 
     async def on_text(self, text: str):
         """Called when Claude streams text content."""
         self._phase = "streaming"
-        self._partial_text = text if len(text) > len(self._partial_text) else self._partial_text + text
+        self._current_activity = ""
+        # Handle both full-text updates and delta appends
+        if len(text) > len(self._partial_text):
+            self._partial_text = text
+        else:
+            self._partial_text += text
         await self._update()
 
-    async def _update(self):
+    async def _update(self, force: bool = False):
         """Update the placeholder message (rate-limited to avoid Telegram 429s)."""
         now = time.time()
-        if now - self._last_update < 3.0:
+        # Adaptive rate: faster for first 15s (2s), slower after (4s)
+        min_interval = 2.0 if (now - self.start_time) < 15 else 4.0
+        if not force and (now - self._last_update < min_interval):
             return
         self._last_update = now
 
         status = self._build_status()
+        # Don't send identical updates (Telegram would error "message not modified")
+        if status == self._last_status:
+            return
+        self._last_status = status
+
         # Truncate to stay within Telegram's 4096 char limit
         if len(status) > 4000:
             status = status[:4000] + "\n…"
@@ -209,17 +244,17 @@ class TaskSession:
                 pass
 
     async def _heartbeat(self):
-        """Periodic updates even without tool activity."""
-        await asyncio.sleep(5)
+        """Periodic updates to keep elapsed time fresh."""
+        await asyncio.sleep(4)
         while not self._cancelled:
-            await self._update()
+            await self._update(force=True)
             elapsed = time.time() - self.start_time
             if elapsed < 30:
-                interval = 5
+                interval = 4
             elif elapsed < 120:
-                interval = 10
+                interval = 8
             else:
-                interval = 15
+                interval = 12
             await asyncio.sleep(interval)
 
     def start_heartbeat(self):
@@ -236,8 +271,8 @@ class TaskSession:
     def finish_summary(self) -> str:
         elapsed = self._elapsed()
         if self.tool_count > 0:
-            return f"⚡ _{self.tool_count} tools · {elapsed}_"
-        return f"⚡ _{elapsed}_"
+            return f"✅ _{self.tool_count} tools · {elapsed}_"
+        return f"✅ _{elapsed}_"
 
 
 class TaskRegistry:
@@ -313,7 +348,7 @@ def _protect_urls_for_markdown(text: str) -> str:
 async def _send(placeholder, update: Update, text: str):
     chunk = 4096
     if not text or not text.strip():
-        await placeholder.edit_text("(empty response)", reply_markup=None)
+        await placeholder.edit_text("_(empty response)_", parse_mode=ParseMode.MARKDOWN, reply_markup=None)
         return
     # Protect URLs so they remain clickable in Markdown mode
     md_text = _protect_urls_for_markdown(text)
@@ -325,7 +360,7 @@ async def _send(placeholder, update: Update, text: str):
             for i in range(chunk, len(md_text), chunk):
                 await update.effective_message.reply_text(md_text[i:i+chunk], parse_mode=ParseMode.MARKDOWN)
     except Exception:
-        # Fallback: plain text (Telegram auto-links bare URLs in plain text)
+        # Fallback 1: plain text edit
         try:
             if len(text) <= chunk:
                 await placeholder.edit_text(text, reply_markup=None)
@@ -333,22 +368,42 @@ async def _send(placeholder, update: Update, text: str):
                 await placeholder.edit_text(text[:chunk], reply_markup=None)
                 for i in range(chunk, len(text), chunk):
                     await update.effective_message.reply_text(text[i:i+chunk])
-        except Exception as exc:
-            log.error("_send fallback failed: %s", exc)
-            await placeholder.edit_text(f"⚠️ Response received but couldn't display ({len(text)} chars). Error: {str(exc)[:100]}", reply_markup=None)
+        except Exception:
+            # Fallback 2: send as new message if editing fails entirely
+            try:
+                await placeholder.edit_text("✅ Done — see reply below.", reply_markup=None)
+            except Exception:
+                pass
+            try:
+                if len(text) <= chunk:
+                    await update.effective_message.reply_text(text)
+                else:
+                    for i in range(0, len(text), chunk):
+                        await update.effective_message.reply_text(text[i:i+chunk])
+            except Exception as exc:
+                log.error("_send all fallbacks failed: %s", exc)
 
 
 # ─── Tool name → friendly emoji/label ──────────────────────────────────────────
 
 _TOOL_LABELS = {
-    "Bash":      "🖥️ Running command…",
-    "Read":      "📖 Reading file…",
-    "Write":     "📝 Writing file…",
-    "Edit":      "✏️ Editing file…",
-    "Grep":      "🔍 Searching…",
-    "WebSearch": "🌐 Searching the web…",
-    "WebFetch":  "🌐 Fetching page…",
-    "Agent":     "🤖 Delegating to agent…",
+    "Bash":       "🖥️ Running command…",
+    "Read":       "📖 Reading file…",
+    "Write":      "📝 Writing file…",
+    "Edit":       "✏️ Editing file…",
+    "Grep":       "🔍 Searching code…",
+    "ListDir":    "📂 Listing directory…",
+    "WebSearch":  "🌐 Searching the web…",
+    "WebFetch":   "🌐 Fetching page…",
+    "Agent":      "🤖 Delegating to agent…",
+    "TodoWrite":  "📋 Planning…",
+    "TodoRead":   "📋 Checking plan…",
+}
+
+_TOOL_ICONS = {
+    "Bash": "🖥️", "Read": "📖", "Write": "📝", "Edit": "✏️",
+    "Grep": "🔍", "ListDir": "📂", "WebSearch": "🌐", "WebFetch": "🌐",
+    "Agent": "🤖", "TodoWrite": "📋", "TodoRead": "📋",
 }
 
 
@@ -380,9 +435,9 @@ async def _ask(uid: int, text: str, tracker: TaskSession | None = None) -> tuple
         return cc.ask_claude_api(text, history, system=cc.CLAUDE_SYSTEM)
 
     # Progress callback via tracker
-    async def _on_progress(tool_name: str):
+    async def _on_progress(tool_name: str, detail: str = ""):
         if tracker:
-            await tracker.on_tool(tool_name)
+            await tracker.on_tool(tool_name, detail)
 
     # Text streaming callback
     async def _on_text(text_chunk: str):
@@ -934,7 +989,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def _run_task(update: Update, ctx: ContextTypes.DEFAULT_TYPE, uid: int, user_text: str):
     """Execute a single Claude task. Can run concurrently with other tasks."""
-    placeholder = await update.message.reply_text("⏳ Thinking…")
+    placeholder = await update.message.reply_text("🧠 Thinking…")
     stop = asyncio.Event()
     typing_task = asyncio.create_task(_typing_loop(update.effective_chat.id, ctx, stop))
 
@@ -948,7 +1003,7 @@ async def _run_task(update: Update, ctx: ContextTypes.DEFAULT_TYPE, uid: int, us
 
         if task.cancelled:
             await placeholder.edit_text(
-                f"⏹ Task cancelled. `#{task.task_id}`", reply_markup=None, parse_mode=ParseMode.MARKDOWN
+                f"⏹ Task cancelled after {task._elapsed()}.", reply_markup=None,
             )
             return
 
@@ -957,12 +1012,15 @@ async def _run_task(update: Update, ctx: ContextTypes.DEFAULT_TYPE, uid: int, us
         cc.track_tool_usage(PLATFORM, str(uid), stats.get("tools_used", []))
         cc.track_cost(PLATFORM, str(uid), stats.get("input_tokens", 0), stats.get("output_tokens", 0), stats.get("cost_usd", 0))
 
+        # Build header with completion stats
         v = _verbose(uid)
+        summary = task.finish_summary()
         if v >= 1 and stats.get("tools_used"):
-            summary = task.finish_summary()
-            reply = f"{summary}\n🔧 _{', '.join(stats['tools_used'][:5])}_\n\n{reply}"
-        elif v >= 1 and task.tool_count == 0:
-            summary = task.finish_summary()
+            tools_str = ', '.join(stats['tools_used'][:5])
+            if len(stats['tools_used']) > 5:
+                tools_str += f" +{len(stats['tools_used']) - 5} more"
+            reply = f"{summary}\n🔧 _{tools_str}_\n\n{reply}"
+        elif v >= 1:
             reply = f"{summary}\n\n{reply}"
         if v >= 2 and stats.get("input_tokens"):
             cost = stats.get("cost_usd", 0)
@@ -972,11 +1030,15 @@ async def _run_task(update: Update, ctx: ContextTypes.DEFAULT_TYPE, uid: int, us
         await _send(placeholder, update, reply)
     except asyncio.CancelledError:
         await placeholder.edit_text(
-            f"⏹ Task cancelled. `#{task.task_id}`", reply_markup=None, parse_mode=ParseMode.MARKDOWN
+            f"⏹ Task cancelled after {task._elapsed()}.", reply_markup=None,
         )
     except Exception as exc:
         log.exception("handle_message error (task #%d)", task.task_id)
-        await placeholder.edit_text(f"Error: {exc}", reply_markup=None)
+        error_msg = str(exc)[:200]
+        try:
+            await placeholder.edit_text(f"❌ Error after {task._elapsed()}: {error_msg}", reply_markup=None)
+        except Exception:
+            await update.message.reply_text(f"❌ Error: {error_msg}")
     finally:
         await task.stop()
         _task_registry.unregister(task.task_id)

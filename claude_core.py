@@ -366,7 +366,8 @@ async def ask_claude_async(
                             if isinstance(msg, dict):
                                 for block in msg.get("content", []):
                                     if block.get("type") == "tool_use" and on_progress:
-                                        await on_progress(block.get("name", "tool"))
+                                        detail = _extract_tool_detail(block)
+                                        await on_progress(block.get("name", "tool"), detail)
                                     elif block.get("type") == "text" and on_text:
                                         await on_text(block.get("text", ""))
 
@@ -374,7 +375,8 @@ async def ask_claude_async(
                         elif etype == "content_block_start":
                             cb = event.get("content_block", {})
                             if cb.get("type") == "tool_use" and on_progress:
-                                await on_progress(cb.get("name", "tool"))
+                                detail = _extract_tool_detail(cb)
+                                await on_progress(cb.get("name", "tool"), detail)
 
                         # Partial text in content_block_delta
                         elif etype == "content_block_delta" and on_text:
@@ -492,7 +494,9 @@ async def ask_claude_sdk(
                         tools_used.append(block.name)
                         if on_progress:
                             try:
-                                await on_progress(block.name)
+                                inp = getattr(block, "input", {}) or {}
+                                detail = _extract_tool_detail({"input": inp})
+                                await on_progress(block.name, detail)
                             except Exception:
                                 pass
                     elif isinstance(block, TextBlock):
@@ -527,6 +531,28 @@ async def ask_claude_sdk(
 
 
 # ─── Internal helpers ───────────────────────────────────────────────────────────
+
+def _extract_tool_detail(block: dict) -> str:
+    """Extract a short detail string from a tool_use block (e.g. file path, command)."""
+    inp = block.get("input", {})
+    if not isinstance(inp, dict):
+        return ""
+    # Read/Write/Edit → file_path
+    fp = inp.get("file_path", "")
+    if fp:
+        # Show just the filename or last 2 path components
+        parts = fp.rsplit("/", 2)
+        return "/".join(parts[-2:]) if len(parts) > 2 else fp
+    # Bash → command (truncated)
+    cmd = inp.get("command", "")
+    if cmd:
+        return cmd[:50]
+    # Grep → pattern
+    pattern = inp.get("pattern", "")
+    if pattern:
+        return f"/{pattern[:30]}/"
+    return ""
+
 
 def _build_prompt(user_text: str, history: list[dict]) -> str:
     parts = []
