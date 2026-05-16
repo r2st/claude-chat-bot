@@ -288,12 +288,13 @@ class TaskSession:
         self._heartbeat_task = asyncio.create_task(self._heartbeat())
 
     async def stop(self):
-        if self._heartbeat_task:
+        if self._heartbeat_task and not self._heartbeat_task.done():
             self._heartbeat_task.cancel()
             try:
                 await self._heartbeat_task
             except asyncio.CancelledError:
                 pass
+            self._heartbeat_task = None
 
     def finish_summary(self) -> str:
         elapsed = self._elapsed()
@@ -1284,20 +1285,22 @@ async def _send_paginated(update: Update, uid: int, prompt: str, text: str, plac
 
     # Short responses: send directly
     if len(md_text) <= chunk:
-        btns = []
         if placeholder:
             try:
                 await placeholder.edit_text(md_text, parse_mode=ParseMode.MARKDOWN, reply_markup=None)
                 return
             except Exception:
                 try:
-                    await placeholder.edit_text(text, reply_markup=None)
+                    await placeholder.edit_text(text[:chunk], reply_markup=None)
                     return
                 except Exception:
                     pass
 
-        # Fallback: new message
-        await update.effective_message.reply_text(md_text, parse_mode=ParseMode.MARKDOWN)
+        # Fallback: always try a new message
+        try:
+            await update.effective_message.reply_text(md_text, parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            await update.effective_message.reply_text(text[:chunk])
         return
 
     # Long responses: paginate
@@ -1324,13 +1327,16 @@ async def _send_paginated(update: Update, uid: int, prompt: str, text: str, plac
             except Exception:
                 pass
 
-    # Fallback: new message
+    # Fallback: always send as new message (never silently lose a response)
     try:
         await update.effective_message.reply_text(
             page_text + footer, parse_mode=ParseMode.MARKDOWN, reply_markup=markup
         )
     except Exception:
-        await update.effective_message.reply_text(text[:RESPONSE_PAGE_SIZE], reply_markup=markup)
+        try:
+            await update.effective_message.reply_text(text[:RESPONSE_PAGE_SIZE], reply_markup=markup)
+        except Exception:
+            log.error("Failed to send response for uid=%s, text len=%d", uid, len(text))
 
 
 async def _run_task(update: Update, ctx: ContextTypes.DEFAULT_TYPE, uid: int, user_text: str):
@@ -1356,6 +1362,13 @@ async def _run_task(update: Update, ctx: ContextTypes.DEFAULT_TYPE, uid: int, us
                 f"⏹ Task cancelled after {task._elapsed()}.", reply_markup=None,
             )
             return
+
+        # Stop heartbeat before sending final response to avoid edit race
+        await task.stop()
+
+        if not reply or not reply.strip():
+            reply = "(No response from Claude — the task may have completed without output.)"
+            log.warning("Empty reply for uid=%s, task #%d", uid, task.task_id)
 
         cc.save_turn(PLATFORM, str(uid), user_text, reply, session_name=sess.name)
         cc.track_usage(PLATFORM, str(uid), stats.get("input_tokens", 0), stats.get("output_tokens", 0))
@@ -1383,8 +1396,16 @@ async def _run_task(update: Update, ctx: ContextTypes.DEFAULT_TYPE, uid: int, us
         elapsed_secs = time.time() - task.start_time
         if elapsed_secs > 30:
             try:
+                # Include a short preview so the user sees what happened
+                raw_reply = reply
+                # Strip the prepended summary/tools header to get actual content
+                if "\n\n" in raw_reply:
+                    raw_reply = raw_reply.split("\n\n", 1)[1]
+                preview = raw_reply[:200].strip()
+                if len(raw_reply) > 200:
+                    preview += "…"
                 await update.effective_message.reply_text(
-                    f"🔔 Task complete ({task._elapsed()})",
+                    f"🔔 Task complete ({task._elapsed()})\n\n{preview}",
                     disable_notification=False,
                 )
             except Exception:
