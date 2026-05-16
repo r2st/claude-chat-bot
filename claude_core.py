@@ -26,7 +26,7 @@ CLAUDE_SYSTEM     = os.getenv(
 CLAUDE_ADD_DIRS   = os.getenv("CLAUDE_ADD_DIRS", "")
 CLAUDE_WORK_DIR   = os.getenv("CLAUDE_CLI_WORK_DIR", os.path.expanduser("~"))
 CLAUDE_TIMEOUT    = int(os.getenv("CLAUDE_TIMEOUT", "180"))
-CLAUDE_MODE       = os.getenv("CLAUDE_MODE", "cli")   # cli | api
+CLAUDE_MODE       = os.getenv("CLAUDE_MODE", "cli")   # cli | api | sdk
 CLAUDE_API_KEY    = os.getenv("ANTHROPIC_API_KEY", "")
 CLAUDE_API_MODEL  = os.getenv("CLAUDE_API_MODEL", "claude-sonnet-4-20250514")
 CLAUDE_MAX_TOKENS = int(os.getenv("MAX_TOKENS", "4096"))
@@ -57,6 +57,9 @@ def check_rate_limit(key: str) -> bool:
 
 def init_db() -> None:
     conn = sqlite3.connect(DB_PATH)
+
+    # Enable WAL mode for better concurrent access
+    conn.execute("PRAGMA journal_mode=WAL")
 
     # Migrate from old schema (no platform column) if needed
     cols = {row[1] for row in conn.execute("PRAGMA table_info(conversations)").fetchall()}
@@ -104,6 +107,41 @@ def init_db() -> None:
         """)
         conn.commit()
 
+    # Enhanced tables: tool_usage, cost_tracking, sessions
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS tool_usage (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            platform TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            tool_name TEXT NOT NULL,
+            success INTEGER DEFAULT 1,
+            ts REAL NOT NULL)
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS cost_tracking (
+            platform TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            date TEXT NOT NULL,
+            requests INTEGER DEFAULT 0,
+            input_tokens INTEGER DEFAULT 0,
+            output_tokens INTEGER DEFAULT 0,
+            cost_usd REAL DEFAULT 0,
+            PRIMARY KEY (platform, user_id, date))
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            platform TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            session_id TEXT,
+            engine TEXT DEFAULT 'cli',
+            model TEXT,
+            started_at REAL NOT NULL,
+            ended_at REAL,
+            total_cost_usd REAL DEFAULT 0,
+            num_turns INTEGER DEFAULT 0)
+    """)
+    conn.commit()
     conn.close()
 
 
@@ -179,6 +217,40 @@ def get_usage(platform: str, user_id: str) -> dict:
     ).fetchone()
     conn.close()
     return {"messages": row[0], "input": row[1], "output": row[2]} if row else {"messages": 0, "input": 0, "output": 0}
+
+
+def track_tool_usage(platform: str, user_id: str, tools: list[str]) -> None:
+    """Record tool usage for analytics."""
+    if not tools:
+        return
+    conn = sqlite3.connect(DB_PATH)
+    now = time.time()
+    for tool in tools:
+        conn.execute(
+            "INSERT INTO tool_usage (platform, user_id, tool_name, ts) VALUES (?,?,?,?)",
+            (platform, user_id, tool, now),
+        )
+    conn.commit()
+    conn.close()
+
+
+def track_cost(platform: str, user_id: str, in_tok: int, out_tok: int, cost_usd: float) -> None:
+    """Track daily cost for analytics."""
+    from datetime import date
+    today = date.today().isoformat()
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        """INSERT INTO cost_tracking (platform, user_id, date, requests, input_tokens, output_tokens, cost_usd)
+           VALUES (?,?,?,1,?,?,?)
+           ON CONFLICT(platform, user_id, date) DO UPDATE SET
+               requests = requests + 1,
+               input_tokens = input_tokens + excluded.input_tokens,
+               output_tokens = output_tokens + excluded.output_tokens,
+               cost_usd = cost_usd + excluded.cost_usd""",
+        (platform, user_id, today, in_tok, out_tok, cost_usd),
+    )
+    conn.commit()
+    conn.close()
 
 
 # ─── Claude CLI (sync — for WhatsApp threading model) ──────────────────────────
@@ -342,6 +414,90 @@ def ask_claude_api(
         "tools_used": [],
     }
     return text, stats
+
+
+# ─── Claude Code SDK (async — requires Python 3.10+) ─────────────────────────
+
+async def ask_claude_sdk(
+    user_text: str,
+    history: list[dict],
+    *,
+    model: str = CLAUDE_MODEL,
+    system: str = CLAUDE_SYSTEM,
+    add_dirs: str = CLAUDE_ADD_DIRS,
+    timeout: int = CLAUDE_TIMEOUT,
+    on_progress: Optional[callable] = None,
+) -> tuple[str, dict]:
+    """Async Claude Code SDK call with streaming progress. Returns (reply_text, stats_dict).
+
+    Uses the claude-code-sdk package which communicates with the Claude CLI
+    via subprocess but provides a cleaner Python API with typed messages.
+    """
+    try:
+        from claude_code_sdk import (
+            query,
+            ClaudeCodeOptions,
+            AssistantMessage,
+            ResultMessage,
+            TextBlock,
+            ToolUseBlock,
+        )
+    except ImportError:
+        return "[Error] claude-code-sdk not installed. Run: pip install claude-code-sdk", {}
+
+    full_prompt = _build_prompt(user_text, history)
+
+    # Build options
+    opts = ClaudeCodeOptions(
+        model=model,
+        system_prompt=system,
+        cwd=CLAUDE_WORK_DIR,
+        permission_mode="bypassPermissions",
+        max_turns=50,
+    )
+    if add_dirs:
+        opts.add_dirs = [d.strip() for d in add_dirs.split(",") if d.strip()]
+
+    result_text = ""
+    tools_used: list[str] = []
+    stats: dict = {}
+
+    try:
+        async for message in query(prompt=full_prompt, options=opts):
+            if isinstance(message, AssistantMessage):
+                # Extract tool use blocks for progress
+                for block in getattr(message, "content", []):
+                    if isinstance(block, ToolUseBlock):
+                        tools_used.append(block.name)
+                        if on_progress:
+                            try:
+                                await on_progress(block.name)
+                            except Exception:
+                                pass
+                    elif isinstance(block, TextBlock):
+                        result_text = block.text
+
+            elif isinstance(message, ResultMessage):
+                if message.result:
+                    result_text = message.result
+                usage = message.usage or {}
+                stats = {
+                    "input_tokens": usage.get("input_tokens", 0)
+                                    + usage.get("cache_read_input_tokens", 0),
+                    "output_tokens": usage.get("output_tokens", 0),
+                    "cost_usd": message.total_cost_usd or 0,
+                    "session_id": message.session_id,
+                    "num_turns": message.num_turns,
+                    "duration_ms": message.duration_ms,
+                }
+
+    except asyncio.TimeoutError:
+        return f"[Timeout] Claude took more than {timeout}s.", {}
+    except Exception as exc:
+        return f"[SDK Error] {exc}", {}
+
+    stats["tools_used"] = tools_used
+    return result_text or "(no response)", stats
 
 
 # ─── Internal helpers ───────────────────────────────────────────────────────────

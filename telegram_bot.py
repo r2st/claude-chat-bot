@@ -124,9 +124,25 @@ def _tool_label(tool_name: str) -> str:
 
 # ─── Core ask ───────────────────────────────────────────────────────────────────
 
+# Per-user engine override (cli, sdk, api)
+_user_engine: dict[int, str] = {}
+
+ENGINE_MODES = {
+    "cli": "CLI (default — claude subprocess)",
+    "sdk": "SDK (claude-code-sdk, streaming)",
+    "api": "API (Anthropic Messages API)",
+}
+
+
+def _engine(uid: int) -> str:
+    return _user_engine.get(uid, cc.CLAUDE_MODE)
+
+
 async def _ask(uid: int, text: str, placeholder=None) -> tuple[str, dict]:
     history = cc.load_history(PLATFORM, str(uid))
-    if cc.CLAUDE_MODE == "api":
+    engine = _engine(uid)
+
+    if engine == "api":
         return cc.ask_claude_api(text, history, system=cc.CLAUDE_SYSTEM)
 
     # Progress callback: update the placeholder with tool activity
@@ -144,6 +160,17 @@ async def _ask(uid: int, text: str, placeholder=None) -> tuple[str, dict]:
             except Exception:
                 pass  # ignore edit conflicts
 
+    if engine == "sdk":
+        return await cc.ask_claude_sdk(
+            text, history,
+            model=_model(uid),
+            system=cc.CLAUDE_SYSTEM,
+            add_dirs=cc.CLAUDE_ADD_DIRS,
+            timeout=cc.CLAUDE_TIMEOUT,
+            on_progress=_on_progress,
+        )
+
+    # Default: CLI mode
     return await cc.ask_claude_async(
         text, history,
         model=_model(uid),
@@ -163,6 +190,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Commands:\n"
         "/reset — clear conversation history\n"
         "/model — switch Claude model\n"
+        "/engine — switch engine (cli/sdk/api)\n"
         "/permissions — change CLI permission mode\n"
         "/verbose — set verbosity (0/1/2)\n"
         "/usage — show usage stats\n"
@@ -184,13 +212,28 @@ async def cmd_mode(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     info = (
         f"Platform: `telegram`\n"
-        f"Claude mode: `{cc.CLAUDE_MODE}`\n"
+        f"Engine: `{_engine(uid)}`\n"
         f"Model: `{_model(uid)}`\n"
         f"Permission mode: `{_perm(uid) or 'default'}`\n"
         f"Verbose: `{_verbose(uid)}`\n"
         f"Timeout: `{cc.CLAUDE_TIMEOUT}s`"
     )
     await update.message.reply_text(info, parse_mode="Markdown")
+
+
+async def cmd_engine(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Switch between CLI, SDK, and API execution engines."""
+    uid = update.effective_user.id
+    cur = _engine(uid)
+    btns = [
+        [InlineKeyboardButton(f"{lbl}{' ✓' if k==cur else ''}", callback_data=f"tg:engine:{k}")]
+        for k, lbl in ENGINE_MODES.items()
+    ]
+    await update.message.reply_text(
+        f"Current engine: *{cur}*\n\nSelect execution engine:",
+        reply_markup=InlineKeyboardMarkup(btns),
+        parse_mode="Markdown",
+    )
 
 
 async def cmd_usage(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -307,6 +350,19 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown",
         )
 
+    elif kind == "engine":
+        _user_engine[uid] = value
+        cur = _engine(uid)
+        btns = [
+            [InlineKeyboardButton(f"{lbl}{' ✓' if k==cur else ''}", callback_data=f"tg:engine:{k}")]
+            for k, lbl in ENGINE_MODES.items()
+        ]
+        await q.edit_message_text(
+            f"Engine set to: *{ENGINE_MODES.get(value, value)}*",
+            reply_markup=InlineKeyboardMarkup(btns),
+            parse_mode="Markdown",
+        )
+
 
 # ─── Message handler ─────────────────────────────────────────────────────────────
 
@@ -333,6 +389,8 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         reply, stats = await _ask(uid, user_text, placeholder=placeholder)
         cc.save_turn(PLATFORM, str(uid), user_text, reply)
         cc.track_usage(PLATFORM, str(uid), stats.get("input_tokens", 0), stats.get("output_tokens", 0))
+        cc.track_tool_usage(PLATFORM, str(uid), stats.get("tools_used", []))
+        cc.track_cost(PLATFORM, str(uid), stats.get("input_tokens", 0), stats.get("output_tokens", 0), stats.get("cost_usd", 0))
 
         v = _verbose(uid)
         if v >= 1 and stats.get("tools_used"):
@@ -460,6 +518,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("reset",       cmd_reset))
     app.add_handler(CommandHandler("mode",        cmd_mode))
     app.add_handler(CommandHandler("model",       cmd_model))
+    app.add_handler(CommandHandler("engine",      cmd_engine))
     app.add_handler(CommandHandler("verbose",     cmd_verbose))
     app.add_handler(CommandHandler("permissions", cmd_permissions))
     app.add_handler(CommandHandler("usage",       cmd_usage))
