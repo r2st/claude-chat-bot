@@ -1,7 +1,7 @@
 # Claude Messenger Bot
 
-> **Claude AI on your phone** — personal, self-hosted, zero-infrastructure.  
-> Supports **WhatsApp** and **Telegram** simultaneously from a single process.
+> **Claude AI on your phone / desktop** — personal, self-hosted, zero-infrastructure.  
+> Supports **WhatsApp**, **Telegram**, and **Slack** simultaneously from a single process.
 
 A bot that connects to Claude AI via two modes:
 
@@ -88,34 +88,63 @@ id - Show your Telegram user ID
 
 ### 2b — Slack setup (Socket Mode — no public URL needed)
 
-1. Go to <https://api.slack.com/apps> → **Create New App** → **From scratch**
-2. **Settings → Socket Mode → Enable** → Create an App-Level Token  
-   Scope: `connections:write` → copy the `xapp-...` token
-3. **OAuth & Permissions → Bot Token Scopes** — add:  
-   `chat:write`, `channels:history`, `groups:history`,  
-   `im:history`, `im:write`, `app_mentions:read`, `reactions:write`
-4. **Event Subscriptions → Enable** → Subscribe to bot events:  
-   `message.im`, `message.channels`, `message.groups`, `app_mention`
-5. **Install to Workspace** → copy the `xoxb-...` Bot Token
-6. In your Slack workspace: `/invite @yourbot` in any channel
+> **Corporate / enterprise workspace?** Most company Slack workspaces (e.g. Intuit) block
+> individual users from installing new apps. If you hit _"An error occurred while creating
+> your request"_, create a **free personal workspace** at [slack.com/get-started](https://slack.com/get-started)
+> and install the bot there instead. You're the admin — no approval needed. Invite your
+> teammates to the personal workspace to share the bot.
 
-Paste both tokens into `.env`:
+#### Step-by-step
+
+1. Go to <https://api.slack.com/apps> → **Create New App** → **From scratch**  
+   _(pick your personal workspace, not a corporate one)_
+
+2. **Settings → Socket Mode → Enable**  
+   → **Create an App-Level Token** → name it anything → scope: `connections:write`  
+   → copy the `xapp-1-...` token — this is `SLACK_APP_TOKEN`
+
+3. **OAuth & Permissions → Bot Token Scopes** → add all of these:
+
+   | Scope | Purpose |
+   |-------|---------|
+   | `chat:write` | Send messages |
+   | `channels:history` | Read public channel messages |
+   | `groups:history` | Read private channel messages |
+   | `im:history` | Read DMs |
+   | `im:write` | Open DM conversations |
+   | `app_mentions:read` | Detect @mentions |
+   | `reactions:write` | Show ⏳ while Claude thinks |
+
+4. **Event Subscriptions → Enable** → Subscribe to bot events:  
+   `message.im`, `message.channels`, `message.groups`, `app_mention`  
+   → **Save Changes**
+
+5. **OAuth & Permissions → Install to Workspace** → Allow  
+   → copy the `xoxb-...` Bot Token — this is `SLACK_BOT_TOKEN`
+
+6. In your Slack workspace, invite the bot to any channel: `/invite @yourbot`
+
+#### `.env` for Slack
 
 ```env
 BOT_MODE=slack
 SLACK_BOT_TOKEN=xoxb-...
-SLACK_APP_TOKEN=xapp-...
-SLACK_ALLOWED_USER_IDS=U01234567   # your Slack member ID (or leave empty)
+SLACK_APP_TOKEN=xapp-1-...
+
+# Your Slack member ID to restrict access (leave empty to allow everyone)
+# Find it: click your name → View profile → ⋯ → Copy member ID
+SLACK_ALLOWED_USER_IDS=U01234567
 ```
 
-> **Finding your Slack member ID:** Click your name → View profile → ⋯ → Copy member ID
+#### How it works
 
-The bot responds to:
-- **Direct messages** — just message it
-- **Channel mentions** — `@yourbot what does this code do?`
-- **Thread replies** — always replies in-thread to avoid noise
+| Trigger | How to use |
+|---------|-----------|
+| Direct message | Just message the bot |
+| Channel | `@yourbot <question>` |
+| Thread | Reply mentioning the bot to keep conversation in-thread |
 
-A ⏳ reaction appears on your message while Claude is thinking.
+A ⏳ reaction appears on your message while Claude is thinking, removed when done.
 
 ---
 
@@ -286,8 +315,10 @@ No shared server. No shared credentials. Fully private.
 | Symptom | Fix |
 |---------|-----|
 | WhatsApp: no replies | Check instance status in Green API console — must be `authorized` |
-| Slack: bot doesn't respond | Check Socket Mode is enabled and App-Level Token has `connections:write` scope |
-| Slack: bot responds in channel but not DMs | Add `im:history` scope and reinstall the app to workspace |
+| Slack: "error creating request" on install | Corporate workspace blocks app installs — create a free personal workspace at [slack.com/get-started](https://slack.com/get-started) instead |
+| Slack: bot doesn't respond | Check Socket Mode is enabled; App-Level Token must have `connections:write` scope |
+| Slack: works in channels but not DMs | Add `im:history` + `im:write` scopes and reinstall the app to workspace |
+| Slack: missing messages after reinstall | Re-subscribe to events (`message.im`, `message.channels`, etc.) under Event Subscriptions |
 | Telegram: SSL/handshake error | Telegram may be blocked on your network; use `BOT_MODE=slack` or `BOT_MODE=whatsapp` |
 | `claude: command not found` | Install Claude Code CLI and ensure it's in PATH |
 | Response cut off | Bot auto-chunks at 4 000 chars per message — expected |
