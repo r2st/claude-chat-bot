@@ -27,27 +27,32 @@ nano .env
 
 ## Platform comparison
 
-| | Telegram | WhatsApp |
-|--|----------|----------|
-| Bridge | Telegram Bot API (free) | [Green API](https://green-api.com) free tier |
-| Setup | Talk to @BotFather | Scan a QR code |
-| Photo / file support | Yes | Text only (currently) |
-| Inline buttons | Yes (`/model`, `/permissions`, …) | No |
-| Works without public URL | Yes (polling) | Yes (polling) |
+| | Telegram | WhatsApp | Slack |
+|--|----------|----------|-------|
+| Bridge | Telegram Bot API | [Green API](https://green-api.com) free tier | Slack Bolt + Socket Mode |
+| Setup | Talk to @BotFather | Scan a QR code | Create a Slack app |
+| Photo / file support | Yes | Text only | Text only |
+| Interactive UI | Inline buttons | No | Reactions as status indicator |
+| Works without public URL | Yes (polling) | Yes (polling) | Yes (WebSocket) |
+| Works on corporate Wi-Fi | Depends | Yes | Yes |
 
 ---
 
 ## Setup
 
-### 1 — Choose your platform
+### 1 — Choose your platform(s)
 
-Set `BOT_MODE` in `.env`:
+Set `BOT_MODE` in `.env` — accepts a comma-separated list or a shorthand:
 
 | Value | What starts |
 |-------|-------------|
 | `telegram` | Telegram only *(default)* |
 | `whatsapp` | WhatsApp only |
-| `both` | Both simultaneously (one process) |
+| `slack` | Slack only |
+| `telegram,slack` | Telegram + Slack |
+| `telegram,whatsapp` | Telegram + WhatsApp |
+| `both` | Telegram + WhatsApp (legacy alias) |
+| `all` | All three platforms |
 
 ---
 
@@ -81,7 +86,40 @@ id - Show your Telegram user ID
 
 ---
 
-### 2b — WhatsApp setup (Green API — free, no Meta account needed)
+### 2b — Slack setup (Socket Mode — no public URL needed)
+
+1. Go to <https://api.slack.com/apps> → **Create New App** → **From scratch**
+2. **Settings → Socket Mode → Enable** → Create an App-Level Token  
+   Scope: `connections:write` → copy the `xapp-...` token
+3. **OAuth & Permissions → Bot Token Scopes** — add:  
+   `chat:write`, `channels:history`, `groups:history`,  
+   `im:history`, `im:write`, `app_mentions:read`, `reactions:write`
+4. **Event Subscriptions → Enable** → Subscribe to bot events:  
+   `message.im`, `message.channels`, `message.groups`, `app_mention`
+5. **Install to Workspace** → copy the `xoxb-...` Bot Token
+6. In your Slack workspace: `/invite @yourbot` in any channel
+
+Paste both tokens into `.env`:
+
+```env
+BOT_MODE=slack
+SLACK_BOT_TOKEN=xoxb-...
+SLACK_APP_TOKEN=xapp-...
+SLACK_ALLOWED_USER_IDS=U01234567   # your Slack member ID (or leave empty)
+```
+
+> **Finding your Slack member ID:** Click your name → View profile → ⋯ → Copy member ID
+
+The bot responds to:
+- **Direct messages** — just message it
+- **Channel mentions** — `@yourbot what does this code do?`
+- **Thread replies** — always replies in-thread to avoid noise
+
+A ⏳ reaction appears on your message while Claude is thinking.
+
+---
+
+### 2c — WhatsApp setup (Green API — free, no Meta account needed)
 
 1. Sign up at <https://console.green-api.com>
 2. Click **Create instance** → choose **Developer** plan (free — 1 500 msg/month)
@@ -193,6 +231,7 @@ kept simple.
 ├── claude_core.py     Shared: Claude CLI/API, SQLite history, rate limiting
 ├── telegram_bot.py    Telegram adapter
 ├── whatsapp_bot.py    WhatsApp adapter (Green API polling)
+├── slack_bot.py       Slack adapter (Socket Mode)
 ├── bot.py             Backward-compat shim (runs Telegram, same as before)
 ├── scripts/
 │   ├── install.sh
@@ -208,7 +247,7 @@ kept simple.
 
 ## Features
 
-- **Dual platform** — Telegram and WhatsApp from one process (`BOT_MODE=both`)
+- **Three platforms** — Telegram, WhatsApp, and Slack from one process (`BOT_MODE=all`)
 - **Dual Claude mode** — CLI (free with Claude subscription) or API
 - **Typing indicator** — shows "typing…" while Claude processes
 - **Image & file analysis** — Telegram only (photos + documents)
@@ -247,7 +286,9 @@ No shared server. No shared credentials. Fully private.
 | Symptom | Fix |
 |---------|-----|
 | WhatsApp: no replies | Check instance status in Green API console — must be `authorized` |
-| Telegram: SSL/handshake error | Telegram may be blocked on your network; use `BOT_MODE=whatsapp` |
+| Slack: bot doesn't respond | Check Socket Mode is enabled and App-Level Token has `connections:write` scope |
+| Slack: bot responds in channel but not DMs | Add `im:history` scope and reinstall the app to workspace |
+| Telegram: SSL/handshake error | Telegram may be blocked on your network; use `BOT_MODE=slack` or `BOT_MODE=whatsapp` |
 | `claude: command not found` | Install Claude Code CLI and ensure it's in PATH |
 | Response cut off | Bot auto-chunks at 4 000 chars per message — expected |
 | Bot stops after reboot | Use `./scripts/service.sh install` for a proper system service |
