@@ -16,6 +16,7 @@ SYSTEM_PROMPT = os.environ.get("SYSTEM_PROMPT", "You are a helpful assistant acc
 
 CLAUDE_CLI_WORK_DIR = os.environ.get("CLAUDE_CLI_WORK_DIR", os.path.expanduser("~"))
 CLAUDE_CLI_ADD_DIRS = os.environ.get("CLAUDE_CLI_ADD_DIRS", "")
+CLAUDE_CLI_PERMISSION_MODE = os.environ.get("CLAUDE_CLI_PERMISSION_MODE", "")
 
 ALLOWED_USER_IDS = set()
 raw_ids = os.environ.get("ALLOWED_USER_IDS", "")
@@ -79,6 +80,8 @@ async def call_claude_cli(prompt: str, history: list[dict]) -> str:
     full_prompt += f"User: {prompt}"
 
     cmd = ["claude", "-p", full_prompt]
+    if CLAUDE_CLI_PERMISSION_MODE:
+        cmd.extend(["--permission-mode", CLAUDE_CLI_PERMISSION_MODE])
     for d in CLAUDE_CLI_ADD_DIRS.split(","):
         d = d.strip()
         if d:

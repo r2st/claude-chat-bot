@@ -84,6 +84,7 @@ Copy `.env.example` to `.env` and set your values:
 | `SYSTEM_PROMPT` | No | Custom system prompt |
 | `CLAUDE_CLI_WORK_DIR` | No | Working directory for CLI mode (default: `~`) |
 | `CLAUDE_CLI_ADD_DIRS` | No | Extra directories the CLI can access (comma-separated) |
+| `CLAUDE_CLI_PERMISSION_MODE` | No | Permission mode: `auto`, `acceptEdits`, or `bypassPermissions` |
 | `ALLOWED_USER_IDS` | No | Comma-separated user IDs to restrict access |
 
 ### 3. Choose a mode
@@ -96,13 +97,23 @@ Copy `.env.example` to `.env` and set your values:
 claude auth login
 ```
 
-By default, the CLI runs from your home directory. To access other directories:
+By default, the CLI runs from your home directory. To access other directories and skip permission prompts:
 
 ```bash
 # In .env:
 CLAUDE_CLI_WORK_DIR=/Users/you
 CLAUDE_CLI_ADD_DIRS=/Users/you/projects,/Users/you/documents
+CLAUDE_CLI_PERMISSION_MODE=auto
 ```
+
+Permission modes:
+
+| Mode | Behavior |
+|---|---|
+| *(empty)* | Default — prompts for each tool use (blocks in non-interactive `-p` mode) |
+| `acceptEdits` | Auto-approves file reads/writes, prompts for shell commands |
+| `auto` | Auto-approves most actions |
+| `bypassPermissions` | Approves everything (use with caution) |
 
 **API mode** — requires an Anthropic API key:
 
