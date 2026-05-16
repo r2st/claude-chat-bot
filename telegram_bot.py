@@ -265,8 +265,13 @@ def _protect_urls_for_markdown(text: str) -> str:
         for ls, le in existing_link_spans:
             if ls <= start < le:
                 return match.group(0)
+        # Strip trailing markdown punctuation that got captured with the URL
+        trailing = ""
+        while url and url[-1] in ("*", "_", "`", "~"):
+            trailing = url[-1] + trailing
+            url = url[:-1]
         # Wrap bare URL as clickable markdown link
-        return f"[{url}]({url})"
+        return f"[{url}]({url}){trailing}"
 
     return _URL_RE.sub(_replace_bare_url, text)
 
@@ -375,6 +380,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Commands:\n"
         "/tasks — show active running tasks\n"
         "/cancel — cancel a task (or all)\n"
+        "/browse — browse project folders interactively\n"
         "/reset — clear conversation history\n"
         "/model — switch Claude model\n"
         "/engine — switch engine (cli/sdk/api)\n"
@@ -492,6 +498,239 @@ async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# ─── Folder browser ─────────────────────────────────────────────────────────────
+
+BROWSE_ROOT = Path(cc.CLAUDE_WORK_DIR)
+BROWSE_PAGE_SIZE = 8
+
+# Path registry: maps short IDs to absolute paths (per-session, in-memory)
+_path_registry: dict[str, Path] = {}
+_path_counter = itertools.count(1)
+
+
+def _pid(path: Path) -> str:
+    """Register a path and return a short ID for use in callback_data."""
+    for k, v in _path_registry.items():
+        if v == path:
+            return k
+    pid = f"p{next(_path_counter)}"
+    _path_registry[pid] = path
+    return pid
+
+
+def _resolve_pid(pid: str) -> Path | None:
+    """Look up a path by its short ID."""
+    return _path_registry.get(pid)
+
+
+def _browse_buttons(directory: Path, page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
+    """Build message text and inline buttons for a directory listing."""
+    try:
+        entries = sorted(directory.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+    except PermissionError:
+        parent_id = _pid(directory.parent)
+        return "⛔ Permission denied.", InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬆️ ..", callback_data=f"tg:br:{parent_id}:0")]
+        ])
+
+    dirs = [e for e in entries if e.is_dir() and not e.name.startswith(".")]
+    files = [e for e in entries if e.is_file() and not e.name.startswith(".")]
+    all_items = dirs + files
+
+    total_pages = max(1, (len(all_items) + BROWSE_PAGE_SIZE - 1) // BROWSE_PAGE_SIZE)
+    page = min(page, total_pages - 1)
+    start = page * BROWSE_PAGE_SIZE
+    page_items = all_items[start:start + BROWSE_PAGE_SIZE]
+
+    rel = directory.relative_to(BROWSE_ROOT) if directory != BROWSE_ROOT else Path(".")
+    header = f"📂 `{rel}/`\n_{len(dirs)} folders, {len(files)} files_"
+    if total_pages > 1:
+        header += f" — page {page + 1}/{total_pages}"
+
+    dir_id = _pid(directory)
+    btns = []
+    for item in page_items:
+        item_id = _pid(item)
+        if item.is_dir():
+            label = f"📁 {item.name}/"
+            cb = f"tg:br:{item_id}:0"
+        else:
+            size = item.stat().st_size
+            if size < 1024:
+                sz = f"{size}B"
+            elif size < 1024 * 1024:
+                sz = f"{size // 1024}KB"
+            else:
+                sz = f"{size // (1024*1024)}MB"
+            label = f"📄 {item.name} ({sz})"
+            cb = f"tg:bf:{item_id}"
+        btns.append([InlineKeyboardButton(label, callback_data=cb)])
+
+    nav = []
+    if directory != BROWSE_ROOT:
+        parent_id = _pid(directory.parent)
+        nav.append(InlineKeyboardButton("⬆️ ..", callback_data=f"tg:br:{parent_id}:0"))
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀️", callback_data=f"tg:br:{dir_id}:{page-1}"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton("▶️", callback_data=f"tg:br:{dir_id}:{page+1}"))
+    if nav:
+        btns.append(nav)
+
+    btns.append([InlineKeyboardButton(
+        "🤖 Ask Claude about this folder",
+        callback_data=f"tg:ba:{dir_id}"
+    )])
+
+    return header, InlineKeyboardMarkup(btns)
+
+
+async def cmd_browse(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Browse project folders interactively."""
+    uid = update.effective_user.id
+    if not _allowed(uid):
+        return
+
+    args_text = " ".join(ctx.args) if ctx.args else ""
+    if args_text:
+        target = BROWSE_ROOT / args_text
+        if not target.exists() or not target.is_dir():
+            await update.message.reply_text(f"Directory not found: `{args_text}`", parse_mode="Markdown")
+            return
+    else:
+        target = BROWSE_ROOT
+
+    header, markup = _browse_buttons(target)
+    await update.message.reply_text(header, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
+
+
+async def _handle_browse_callback(q, uid: int):
+    """Handle br/bf/bv/ba callbacks for folder browsing."""
+    data = q.data
+    parts = data.split(":")
+    if len(parts) < 3:
+        return
+    kind = parts[1]
+
+    if kind == "br":
+        # tg:br:<path_id>:<page>
+        if len(parts) < 4:
+            return
+        pid, page = parts[2], int(parts[3])
+        dir_path = _resolve_pid(pid)
+        if not dir_path or not dir_path.is_dir():
+            await q.edit_message_text("Directory no longer exists.")
+            return
+        try:
+            dir_path.resolve().relative_to(BROWSE_ROOT.resolve())
+        except ValueError:
+            await q.edit_message_text("⛔ Access denied.")
+            return
+
+        header, markup = _browse_buttons(dir_path, page)
+        await q.edit_message_text(header, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
+
+    elif kind == "bf":
+        # tg:bf:<path_id>
+        pid = parts[2]
+        file_path = _resolve_pid(pid)
+        if not file_path or not file_path.is_file():
+            await q.edit_message_text("File no longer exists.")
+            return
+        try:
+            file_path.resolve().relative_to(BROWSE_ROOT.resolve())
+        except ValueError:
+            await q.edit_message_text("⛔ Access denied.")
+            return
+
+        stat = file_path.stat()
+        rel = file_path.relative_to(BROWSE_ROOT)
+        info = f"📄 `{rel}`\nSize: {stat.st_size:,} bytes"
+
+        parent_id = _pid(file_path.parent)
+        btns = [
+            [InlineKeyboardButton("📖 View (first 50 lines)", callback_data=f"tg:bv:{pid}")],
+            [InlineKeyboardButton("🤖 Ask Claude about file", callback_data=f"tg:ba:{pid}")],
+            [InlineKeyboardButton("⬆️ Back", callback_data=f"tg:br:{parent_id}:0")],
+        ]
+        await q.edit_message_text(info, reply_markup=InlineKeyboardMarkup(btns), parse_mode=ParseMode.MARKDOWN)
+
+    elif kind == "bv":
+        # tg:bv:<path_id>
+        pid = parts[2]
+        file_path = _resolve_pid(pid)
+        if not file_path or not file_path.is_file():
+            await q.edit_message_text("File no longer exists.")
+            return
+        try:
+            file_path.resolve().relative_to(BROWSE_ROOT.resolve())
+        except ValueError:
+            await q.edit_message_text("⛔ Access denied.")
+            return
+
+        try:
+            lines = file_path.read_text(errors="replace").splitlines()[:50]
+            content = "\n".join(lines)
+            if len(content) > 3500:
+                content = content[:3500] + "\n…(truncated)"
+            rel = file_path.relative_to(BROWSE_ROOT)
+            text = f"📄 `{rel}` (first 50 lines):\n```\n{content}\n```"
+        except Exception as e:
+            text = f"Error reading file: {e}"
+
+        parent_id = _pid(file_path.parent)
+        btns = [
+            [InlineKeyboardButton("🤖 Ask Claude about file", callback_data=f"tg:ba:{pid}")],
+            [InlineKeyboardButton("⬆️ Back", callback_data=f"tg:br:{parent_id}:0")],
+        ]
+        await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(btns), parse_mode=ParseMode.MARKDOWN)
+
+    elif kind == "ba":
+        # tg:ba:<path_id>
+        pid = parts[2]
+        target = _resolve_pid(pid)
+        if not target or not target.exists():
+            await q.edit_message_text("Path no longer exists.")
+            return
+        try:
+            target.resolve().relative_to(BROWSE_ROOT.resolve())
+        except ValueError:
+            await q.edit_message_text("⛔ Access denied.")
+            return
+
+        rel = target.relative_to(BROWSE_ROOT)
+        if target.is_dir():
+            prompt = f"List and briefly describe the contents of the directory: {rel}/"
+        else:
+            prompt = f"Read and summarize this file: {rel}"
+
+        await q.edit_message_text(f"🤖 Asking Claude about `{rel}`…", reply_markup=None, parse_mode=ParseMode.MARKDOWN)
+
+        task = TaskSession(q.message, uid, f"[Browse] {rel}")
+        task.start_heartbeat()
+        _task_registry.register(task)
+        try:
+            reply, stats = await _ask(uid, prompt, tracker=task)
+            cc.save_turn(PLATFORM, str(uid), prompt, reply)
+            cc.track_usage(PLATFORM, str(uid), stats.get("input_tokens", 0), stats.get("output_tokens", 0))
+
+            back_dir = target if target.is_dir() else target.parent
+            back_id = _pid(back_dir)
+            btns = [[InlineKeyboardButton("⬆️ Back to browser", callback_data=f"tg:br:{back_id}:0")]]
+            md_text = _protect_urls_for_markdown(reply)
+            if len(md_text) > 4000:
+                md_text = md_text[:4000] + "\n…(truncated)"
+            try:
+                await q.message.edit_text(md_text, reply_markup=InlineKeyboardMarkup(btns), parse_mode=ParseMode.MARKDOWN)
+            except Exception:
+                await q.message.edit_text(reply[:4000], reply_markup=InlineKeyboardMarkup(btns))
+        except Exception as exc:
+            await q.message.edit_text(f"Error: {exc}", reply_markup=None)
+        finally:
+            await task.stop()
+            _task_registry.unregister(task.task_id)
+
+
 async def cmd_usage(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     u = cc.get_usage(PLATFORM, str(uid))
@@ -583,6 +822,11 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if kind == "cancelall":
         count = _task_registry.cancel_all_user(uid)
         await q.edit_message_text(f"⏹ Cancelling {count} task(s)…", reply_markup=None)
+        return
+
+    # Handle folder browser callbacks
+    if kind in ("br", "bf", "bv", "ba"):
+        await _handle_browse_callback(q, uid)
         return
 
     if kind == "model":
@@ -858,6 +1102,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("start",       cmd_start))
     app.add_handler(CommandHandler("tasks",       cmd_tasks))
     app.add_handler(CommandHandler("cancel",      cmd_cancel))
+    app.add_handler(CommandHandler("browse",      cmd_browse))
     app.add_handler(CommandHandler("reset",       cmd_reset))
     app.add_handler(CommandHandler("mode",        cmd_mode))
     app.add_handler(CommandHandler("model",       cmd_model))
