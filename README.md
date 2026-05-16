@@ -85,6 +85,8 @@ Copy `.env.example` to `.env` and set your values:
 | `CLAUDE_CLI_WORK_DIR` | No | Working directory for CLI mode (default: `~`) |
 | `CLAUDE_CLI_ADD_DIRS` | No | Extra directories the CLI can access (comma-separated) |
 | `CLAUDE_CLI_PERMISSION_MODE` | No | Permission mode: `auto`, `acceptEdits`, or `bypassPermissions` |
+| `CLAUDE_CLI_MODEL` | No | Default CLI model: `haiku`, `sonnet` (default), or `opus` |
+| `CLAUDE_TIMEOUT` | No | CLI response timeout in seconds (default: `120`) |
 | `ALLOWED_USER_IDS` | No | Comma-separated user IDs to restrict access |
 
 ### 3. Choose a mode
@@ -157,6 +159,8 @@ docker logs -f claude-telegram-bot
 | `/start` | Welcome message |
 | `/reset` | Clear conversation history |
 | `/mode` | Show current mode and model |
+| `/model` | Switch CLI model (haiku/sonnet/opus) |
+| `/permissions` | Change CLI permission mode |
 | `/id` | Show your Telegram user ID |
 
 ## Security
