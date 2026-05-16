@@ -82,6 +82,8 @@ Copy `.env.example` to `.env` and set your values:
 | `CLAUDE_MODEL` | No | Model name (default: `claude-sonnet-4-20250514`) |
 | `MAX_TOKENS` | No | Max response tokens (default: `4096`) |
 | `SYSTEM_PROMPT` | No | Custom system prompt |
+| `CLAUDE_CLI_WORK_DIR` | No | Working directory for CLI mode (default: `~`) |
+| `CLAUDE_CLI_ADD_DIRS` | No | Extra directories the CLI can access (comma-separated) |
 | `ALLOWED_USER_IDS` | No | Comma-separated user IDs to restrict access |
 
 ### 3. Choose a mode
@@ -92,6 +94,14 @@ Copy `.env.example` to `.env` and set your values:
 # Install Claude Code CLI: https://docs.anthropic.com/en/docs/claude-code
 # Then authenticate:
 claude auth login
+```
+
+By default, the CLI runs from your home directory. To access other directories:
+
+```bash
+# In .env:
+CLAUDE_CLI_WORK_DIR=/Users/you
+CLAUDE_CLI_ADD_DIRS=/Users/you/projects,/Users/you/documents
 ```
 
 **API mode** — requires an Anthropic API key:

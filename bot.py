@@ -14,6 +14,9 @@ CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-20250514")
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "4096"))
 SYSTEM_PROMPT = os.environ.get("SYSTEM_PROMPT", "You are a helpful assistant accessible via Telegram.")
 
+CLAUDE_CLI_WORK_DIR = os.environ.get("CLAUDE_CLI_WORK_DIR", os.path.expanduser("~"))
+CLAUDE_CLI_ADD_DIRS = os.environ.get("CLAUDE_CLI_ADD_DIRS", "")
+
 ALLOWED_USER_IDS = set()
 raw_ids = os.environ.get("ALLOWED_USER_IDS", "")
 if raw_ids:
@@ -75,10 +78,17 @@ async def call_claude_cli(prompt: str, history: list[dict]) -> str:
         full_prompt += f"{role}: {msg['content']}\n\n"
     full_prompt += f"User: {prompt}"
 
+    cmd = ["claude", "-p", full_prompt]
+    for d in CLAUDE_CLI_ADD_DIRS.split(","):
+        d = d.strip()
+        if d:
+            cmd.extend(["--add-dir", d])
+
     proc = await asyncio.create_subprocess_exec(
-        "claude", "-p", full_prompt,
+        *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        cwd=CLAUDE_CLI_WORK_DIR,
     )
     stdout, stderr = await proc.communicate()
 
