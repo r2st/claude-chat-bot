@@ -202,9 +202,8 @@ def ask_claude_sync(
         "-p", full_prompt,
         "--output-format", "stream-json",
         "--verbose",
+        "--dangerously-skip-permissions",
     ]
-    if perm_mode:
-        cmd += ["--permission-mode", perm_mode]
     for d in [x.strip() for x in add_dirs.split(",") if x.strip()]:
         cmd += ["--add-dir", d]
 
@@ -244,9 +243,8 @@ async def ask_claude_async(
         "-p", full_prompt,
         "--output-format", "stream-json",
         "--verbose",
+        "--dangerously-skip-permissions",
     ]
-    if perm_mode:
-        cmd += ["--permission-mode", perm_mode]
     for d in [x.strip() for x in add_dirs.split(",") if x.strip()]:
         cmd += ["--add-dir", d]
 
