@@ -87,6 +87,9 @@ Copy `.env.example` to `.env` and set your values:
 | `CLAUDE_CLI_PERMISSION_MODE` | No | Permission mode: `auto`, `acceptEdits`, or `bypassPermissions` |
 | `CLAUDE_CLI_MODEL` | No | Default CLI model: `haiku`, `sonnet` (default), or `opus` |
 | `CLAUDE_TIMEOUT` | No | CLI response timeout in seconds (default: `120`) |
+| `RATE_LIMIT_REQUESTS` | No | Max requests per window (default: `10`) |
+| `RATE_LIMIT_WINDOW` | No | Rate limit window in seconds (default: `60`) |
+| `DB_PATH` | No | SQLite database path (default: `bot.db` in project dir) |
 | `ALLOWED_USER_IDS` | No | Comma-separated user IDs to restrict access |
 
 ### 3. Choose a mode
@@ -160,8 +163,23 @@ docker logs -f claude-telegram-bot
 | `/reset` | Clear conversation history |
 | `/mode` | Show current mode and model |
 | `/model` | Switch CLI model (haiku/sonnet/opus) |
+| `/verbose` | Set output verbosity (0=quiet, 1=normal, 2=detailed) |
 | `/permissions` | Change CLI permission mode |
+| `/usage` | Show usage statistics |
 | `/id` | Show your Telegram user ID |
+
+## Features
+
+- **Dual mode** — CLI (free with Claude subscription) or API (needs key, works in Docker)
+- **Typing indicator** — shows "typing..." while Claude processes your request
+- **Image analysis** — send photos for Claude to analyze
+- **File uploads** — send documents (code, text, etc.) for review
+- **Model switching** — switch between haiku/sonnet/opus from Telegram
+- **Verbose mode** — see what tools Claude is using in real-time
+- **Rate limiting** — configurable per-user request throttling
+- **Persistent history** — conversations survive bot restarts (SQLite)
+- **Usage tracking** — per-user message and token statistics
+- **Markdown rendering** — formatted responses with plain-text fallback
 
 ## Security
 
