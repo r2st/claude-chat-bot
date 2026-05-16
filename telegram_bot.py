@@ -431,4 +431,16 @@ def build_app() -> Application:
 async def run_telegram():
     log.info("Telegram bot starting…")
     app = build_app()
-    await app.run_polling()
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling()
+    log.info("Telegram bot is running.")
+    try:
+        while True:
+            await asyncio.sleep(3600)
+    except asyncio.CancelledError:
+        pass
+    finally:
+        await app.updater.stop()
+        await app.stop()
+        await app.shutdown()

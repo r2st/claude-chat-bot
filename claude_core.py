@@ -57,27 +57,53 @@ def check_rate_limit(key: str) -> bool:
 
 def init_db() -> None:
     conn = sqlite3.connect(DB_PATH)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS conversations (
-            platform  TEXT NOT NULL,
-            user_id   TEXT NOT NULL,
-            role      TEXT NOT NULL,
-            content   TEXT NOT NULL,
-            ts        REAL NOT NULL,
-            PRIMARY KEY (platform, user_id, ts)
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS usage (
-            platform          TEXT NOT NULL,
-            user_id           TEXT NOT NULL,
-            message_count     INTEGER DEFAULT 0,
-            input_tokens      INTEGER DEFAULT 0,
-            output_tokens     INTEGER DEFAULT 0,
-            PRIMARY KEY (platform, user_id)
-        )
-    """)
-    conn.commit()
+
+    # Migrate from old schema (no platform column) if needed
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(conversations)").fetchall()}
+    if cols and "platform" not in cols:
+        log.info("Migrating database to multi-platform schema…")
+        conn.execute("ALTER TABLE conversations RENAME TO _conv_old")
+        conn.execute("""
+            CREATE TABLE conversations (
+                platform TEXT NOT NULL, user_id TEXT NOT NULL,
+                role TEXT NOT NULL, content TEXT NOT NULL,
+                ts REAL NOT NULL, PRIMARY KEY (platform, user_id, ts))
+        """)
+        conn.execute("""
+            INSERT INTO conversations (platform, user_id, role, content, ts)
+            SELECT 'telegram', CAST(user_id AS TEXT), role, content, timestamp FROM _conv_old
+        """)
+        conn.execute("DROP TABLE _conv_old")
+
+        conn.execute("ALTER TABLE usage RENAME TO _usage_old")
+        conn.execute("""
+            CREATE TABLE usage (
+                platform TEXT NOT NULL, user_id TEXT NOT NULL,
+                message_count INTEGER DEFAULT 0, input_tokens INTEGER DEFAULT 0,
+                output_tokens INTEGER DEFAULT 0, PRIMARY KEY (platform, user_id))
+        """)
+        conn.execute("""
+            INSERT INTO usage (platform, user_id, message_count, input_tokens, output_tokens)
+            SELECT 'telegram', CAST(user_id AS TEXT), message_count, total_input_tokens, total_output_tokens FROM _usage_old
+        """)
+        conn.execute("DROP TABLE _usage_old")
+        conn.commit()
+        log.info("Database migration complete.")
+    else:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS conversations (
+                platform  TEXT NOT NULL, user_id TEXT NOT NULL,
+                role TEXT NOT NULL, content TEXT NOT NULL,
+                ts REAL NOT NULL, PRIMARY KEY (platform, user_id, ts))
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS usage (
+                platform TEXT NOT NULL, user_id TEXT NOT NULL,
+                message_count INTEGER DEFAULT 0, input_tokens INTEGER DEFAULT 0,
+                output_tokens INTEGER DEFAULT 0, PRIMARY KEY (platform, user_id))
+        """)
+        conn.commit()
+
     conn.close()
 
 
@@ -173,11 +199,9 @@ def ask_claude_sync(
     cmd = [
         "claude",
         "--model", model,
-        "--system", system,
+        "-p", full_prompt,
         "--output-format", "stream-json",
         "--verbose",
-        "--print",
-        full_prompt,
     ]
     if perm_mode:
         cmd += ["--permission-mode", perm_mode]
@@ -217,11 +241,9 @@ async def ask_claude_async(
     cmd = [
         "claude",
         "--model", model,
-        "--system", system,
+        "-p", full_prompt,
         "--output-format", "stream-json",
         "--verbose",
-        "--print",
-        full_prompt,
     ]
     if perm_mode:
         cmd += ["--permission-mode", perm_mode]
