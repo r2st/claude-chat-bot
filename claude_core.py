@@ -554,8 +554,10 @@ async def ask_claude_async(
     # Try to resume existing session (skips project re-indexing)
     session_id = resume_session_id or (get_session_id(platform, user_id) if platform else None)
 
+    full_prompt = _build_prompt(user_text, history) if history else user_text
+
     if session_id:
-        # Resume session — just send new message, no history needed
+        # Resume: send only new message (CLI has full conversation context)
         cmd = [
             "claude",
             "--model", model,
@@ -566,8 +568,7 @@ async def ask_claude_async(
             "--dangerously-skip-permissions",
         ]
     else:
-        # New session — include full history
-        full_prompt = _build_prompt(user_text, history)
+        # New session: include conversation history in prompt
         cmd = [
             "claude",
             "--model", model,
@@ -649,9 +650,73 @@ async def ask_claude_async(
         return f"[Timeout] Claude took more than {timeout}s.", {}
 
     stdout_text = "\n".join(stdout_lines)
-    return _parse_cli_output(
+    result = _parse_cli_output(
         stdout_text, stderr_data.decode(), proc.returncode, timeout
     )
+
+    # If resume failed (error or empty), retry with full history as a new session
+    if session_id and (proc.returncode != 0 or not result[0] or result[0].startswith("[Claude error]")):
+        log.warning("Session resume failed (rc=%d), retrying with full history", proc.returncode)
+        # Invalidate the stale session
+        if platform:
+            active_sess = _session_mgr.get_or_create_active(platform, user_id)
+            active_sess.claude_session_id = None
+
+        retry_cmd = [
+            "claude",
+            "--model", model,
+            "-p", full_prompt,
+            "--output-format", "stream-json",
+            "--verbose",
+            "--dangerously-skip-permissions",
+        ]
+        for d in [x.strip() for x in add_dirs.split(",") if x.strip()]:
+            retry_cmd += ["--add-dir", d]
+
+        proc2 = await asyncio.create_subprocess_exec(
+            *retry_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=CLAUDE_WORK_DIR,
+            limit=10 * 1024 * 1024,
+        )
+        retry_lines: list[str] = []
+        try:
+            async def _read_retry():
+                while True:
+                    if is_cancelled and is_cancelled():
+                        proc2.kill()
+                        return
+                    line = await proc2.stdout.readline()
+                    if not line:
+                        break
+                    decoded = line.decode().strip()
+                    if decoded:
+                        retry_lines.append(decoded)
+                        if on_progress or on_text:
+                            try:
+                                event = json.loads(decoded)
+                                etype = event.get("type", "")
+                                if etype == "content_block_delta" and on_text:
+                                    delta = event.get("delta", {})
+                                    if delta.get("type") == "text_delta":
+                                        await on_text(delta.get("text", ""))
+                            except Exception:
+                                pass
+
+            await asyncio.wait_for(_read_retry(), timeout=timeout)
+            await proc2.wait()
+            stderr2 = await proc2.stderr.read()
+        except asyncio.TimeoutError:
+            proc2.kill()
+            await proc2.wait()
+            return f"[Timeout] Claude took more than {timeout}s.", {}
+
+        result = _parse_cli_output(
+            "\n".join(retry_lines), stderr2.decode(), proc2.returncode, timeout
+        )
+
+    return result
 
 
 # ─── Claude API (sync — usable from both adapters) ─────────────────────────────
