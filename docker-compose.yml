@@ -1,0 +1,6 @@
+services:
+  claude-bot:
+    build: .
+    container_name: claude-telegram-bot
+    env_file: .env
+    restart: unless-stopped
