@@ -306,6 +306,7 @@ async def ask_claude_async(
     perm_mode: str = CLAUDE_PERM_MODE,
     timeout: int = CLAUDE_TIMEOUT,
     on_progress: Optional[callable] = None,
+    is_cancelled: Optional[callable] = None,
 ) -> tuple[str, dict]:
     """Async Claude CLI call with streaming progress. Returns (reply_text, stats_dict).
 
@@ -339,6 +340,11 @@ async def ask_claude_async(
     try:
         async def _read_stream():
             while True:
+                # Check for cancellation
+                if is_cancelled and is_cancelled():
+                    proc.kill()
+                    return
+
                 line = await proc.stdout.readline()
                 if not line:
                     break
@@ -427,6 +433,7 @@ async def ask_claude_sdk(
     add_dirs: str = CLAUDE_ADD_DIRS,
     timeout: int = CLAUDE_TIMEOUT,
     on_progress: Optional[callable] = None,
+    is_cancelled: Optional[callable] = None,
 ) -> tuple[str, dict]:
     """Async Claude Code SDK call with streaming progress. Returns (reply_text, stats_dict).
 
@@ -464,6 +471,10 @@ async def ask_claude_sdk(
 
     try:
         async for message in query(prompt=full_prompt, options=opts):
+            # Check for cancellation
+            if is_cancelled and is_cancelled():
+                break
+
             if isinstance(message, AssistantMessage):
                 # Extract tool use blocks for progress
                 for block in getattr(message, "content", []):

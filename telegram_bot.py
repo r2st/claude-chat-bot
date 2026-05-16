@@ -85,6 +85,124 @@ async def _typing_loop(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, stop: async
             continue
 
 
+# ─── Progress tracker for long-running tasks ──────────────────────────────────
+
+class ProgressTracker:
+    """Manages live progress updates for a running Claude task."""
+
+    CANCEL_CALLBACK = "tg:cancel"
+
+    def __init__(self, placeholder, uid: int):
+        self.placeholder = placeholder
+        self.uid = uid
+        self.start_time = time.time()
+        self.tools: list[str] = []
+        self.tool_count = 0
+        self._last_update = 0.0
+        self._cancelled = False
+        self._heartbeat_task: asyncio.Task | None = None
+
+    @property
+    def cancelled(self) -> bool:
+        return self._cancelled
+
+    def cancel(self):
+        self._cancelled = True
+
+    def _elapsed(self) -> str:
+        secs = int(time.time() - self.start_time)
+        if secs < 60:
+            return f"{secs}s"
+        return f"{secs // 60}m {secs % 60}s"
+
+    def _progress_bar(self) -> str:
+        """Animated progress indicator based on elapsed time."""
+        secs = int(time.time() - self.start_time)
+        frames = ["◐", "◓", "◑", "◒"]
+        return frames[secs % 4]
+
+    def _build_status(self) -> str:
+        elapsed = self._elapsed()
+        spinner = self._progress_bar()
+        lines = [f"{spinner} *Working…* `{elapsed}`"]
+
+        if self.tools:
+            # Show recent tool activity (last 5 unique tools)
+            unique_recent = list(dict.fromkeys(self.tools[-8:]))[-5:]
+            tool_lines = [_tool_label(t) for t in unique_recent]
+            lines.append("")
+            lines.extend(tool_lines)
+
+        if self.tool_count > 5:
+            lines.append(f"\n_({self.tool_count} tool calls total)_")
+
+        return "\n".join(lines)
+
+    async def on_tool(self, tool_name: str):
+        """Called when Claude starts using a tool."""
+        self.tools.append(tool_name)
+        self.tool_count += 1
+        await self._update()
+
+    async def _update(self):
+        """Update the placeholder message (rate-limited to avoid Telegram 429s)."""
+        now = time.time()
+        # Rate limit updates to once per 2 seconds
+        if now - self._last_update < 2.0:
+            return
+        self._last_update = now
+
+        status = self._build_status()
+        cancel_btn = InlineKeyboardMarkup([
+            [InlineKeyboardButton("⏹ Cancel", callback_data=f"{self.CANCEL_CALLBACK}:{self.uid}")]
+        ])
+        try:
+            await self.placeholder.edit_text(
+                status,
+                reply_markup=cancel_btn,
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        except Exception:
+            pass
+
+    async def _heartbeat(self):
+        """Periodic updates even without tool activity — keeps user informed."""
+        await asyncio.sleep(5)  # First heartbeat after 5s
+        while not self._cancelled:
+            await self._update()
+            # Increase interval as task runs longer
+            elapsed = time.time() - self.start_time
+            if elapsed < 30:
+                interval = 5
+            elif elapsed < 120:
+                interval = 10
+            else:
+                interval = 15
+            await asyncio.sleep(interval)
+
+    def start_heartbeat(self):
+        self._heartbeat_task = asyncio.create_task(self._heartbeat())
+
+    async def stop(self):
+        if self._heartbeat_task:
+            self._heartbeat_task.cancel()
+            try:
+                await self._heartbeat_task
+            except asyncio.CancelledError:
+                pass
+
+    def finish_summary(self) -> str:
+        """Return a brief summary line showing work done."""
+        elapsed = self._elapsed()
+        if self.tool_count > 0:
+            return f"⚡ _{self.tool_count} tools · {elapsed}_"
+        return f"⚡ _{elapsed}_"
+
+
+# Active progress trackers by user (for cancel support)
+_active_tasks: dict[int, ProgressTracker] = {}
+
+
 # ─── Reply helper ───────────────────────────────────────────────────────────────
 
 # Regex to find bare URLs not already inside markdown link syntax
@@ -123,17 +241,17 @@ async def _send(placeholder, update: Update, text: str):
     md_text = _protect_urls_for_markdown(text)
     try:
         if len(md_text) <= chunk:
-            await placeholder.edit_text(md_text, parse_mode=ParseMode.MARKDOWN)
+            await placeholder.edit_text(md_text, parse_mode=ParseMode.MARKDOWN, reply_markup=None)
         else:
-            await placeholder.edit_text(md_text[:chunk], parse_mode=ParseMode.MARKDOWN)
+            await placeholder.edit_text(md_text[:chunk], parse_mode=ParseMode.MARKDOWN, reply_markup=None)
             for i in range(chunk, len(md_text), chunk):
                 await update.effective_message.reply_text(md_text[i:i+chunk], parse_mode=ParseMode.MARKDOWN)
     except Exception:
         # Fallback: plain text (Telegram auto-links bare URLs in plain text)
         if len(text) <= chunk:
-            await placeholder.edit_text(text)
+            await placeholder.edit_text(text, reply_markup=None)
         else:
-            await placeholder.edit_text(text[:chunk])
+            await placeholder.edit_text(text[:chunk], reply_markup=None)
             for i in range(chunk, len(text), chunk):
                 await update.effective_message.reply_text(text[i:i+chunk])
 
@@ -172,27 +290,21 @@ def _engine(uid: int) -> str:
     return _user_engine.get(uid, cc.CLAUDE_MODE)
 
 
-async def _ask(uid: int, text: str, placeholder=None) -> tuple[str, dict]:
+async def _ask(uid: int, text: str, tracker: ProgressTracker | None = None) -> tuple[str, dict]:
     history = cc.load_history(PLATFORM, str(uid))
     engine = _engine(uid)
 
     if engine == "api":
         return cc.ask_claude_api(text, history, system=cc.CLAUDE_SYSTEM)
 
-    # Progress callback: update the placeholder with tool activity
-    _seen_tools: list[str] = []
-
+    # Progress callback via tracker
     async def _on_progress(tool_name: str):
-        _seen_tools.append(tool_name)
-        if placeholder:
-            labels = []
-            for t in dict.fromkeys(_seen_tools):  # unique, ordered
-                labels.append(_tool_label(t))
-            status = "\n".join(labels[-5:])  # show last 5 tools
-            try:
-                await placeholder.edit_text(f"⏳ Working…\n\n{status}")
-            except Exception:
-                pass  # ignore edit conflicts
+        if tracker:
+            await tracker.on_tool(tool_name)
+
+    # Cancellation check
+    def _is_cancelled() -> bool:
+        return tracker.cancelled if tracker else False
 
     if engine == "sdk":
         return await cc.ask_claude_sdk(
@@ -202,6 +314,7 @@ async def _ask(uid: int, text: str, placeholder=None) -> tuple[str, dict]:
             add_dirs=cc.CLAUDE_ADD_DIRS,
             timeout=cc.CLAUDE_TIMEOUT,
             on_progress=_on_progress,
+            is_cancelled=_is_cancelled,
         )
 
     # Default: CLI mode
@@ -213,6 +326,7 @@ async def _ask(uid: int, text: str, placeholder=None) -> tuple[str, dict]:
         perm_mode=_perm(uid),
         timeout=cc.CLAUDE_TIMEOUT,
         on_progress=_on_progress,
+        is_cancelled=_is_cancelled,
     )
 
 
@@ -343,7 +457,18 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     data = q.data  # e.g. "tg:model:sonnet"
-    _, kind, value = data.split(":", 2)
+    parts = data.split(":", 2)
+    if len(parts) < 3:
+        return
+    _, kind, value = parts
+
+    # Handle cancel button
+    if kind == "cancel":
+        target_uid = int(value)
+        if target_uid == uid and target_uid in _active_tasks:
+            _active_tasks[target_uid].cancel()
+            await q.edit_message_text("⏹ Cancelling…", reply_markup=None)
+        return
 
     if kind == "model":
         _user_model[uid] = value
@@ -419,8 +544,18 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     stop = asyncio.Event()
     typing_task = asyncio.create_task(_typing_loop(update.effective_chat.id, ctx, stop))
 
+    # Set up progress tracker with heartbeat and cancel support
+    tracker = ProgressTracker(placeholder, uid)
+    tracker.start_heartbeat()
+    _active_tasks[uid] = tracker
+
     try:
-        reply, stats = await _ask(uid, user_text, placeholder=placeholder)
+        reply, stats = await _ask(uid, user_text, tracker=tracker)
+
+        if tracker.cancelled:
+            await placeholder.edit_text("⏹ Task cancelled.", reply_markup=None)
+            return
+
         cc.save_turn(PLATFORM, str(uid), user_text, reply)
         cc.track_usage(PLATFORM, str(uid), stats.get("input_tokens", 0), stats.get("output_tokens", 0))
         cc.track_tool_usage(PLATFORM, str(uid), stats.get("tools_used", []))
@@ -428,15 +563,25 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         v = _verbose(uid)
         if v >= 1 and stats.get("tools_used"):
-            reply = f"🔧 _{', '.join(stats['tools_used'][:5])}_\n\n{reply}"
+            summary = tracker.finish_summary()
+            reply = f"{summary}\n🔧 _{', '.join(stats['tools_used'][:5])}_\n\n{reply}"
+        elif v >= 1 and tracker.tool_count == 0:
+            summary = tracker.finish_summary()
+            reply = f"{summary}\n\n{reply}"
         if v >= 2 and stats.get("input_tokens"):
-            reply += f"\n\n_({stats['input_tokens']}→{stats['output_tokens']} tokens)_"
+            cost = stats.get("cost_usd", 0)
+            cost_str = f" · ${cost:.4f}" if cost else ""
+            reply += f"\n\n_({stats['input_tokens']}→{stats['output_tokens']} tokens{cost_str})_"
 
         await _send(placeholder, update, reply)
+    except asyncio.CancelledError:
+        await placeholder.edit_text("⏹ Task cancelled.", reply_markup=None)
     except Exception as exc:
         log.exception("handle_message error")
-        await placeholder.edit_text(f"Error: {exc}")
+        await placeholder.edit_text(f"Error: {exc}", reply_markup=None)
     finally:
+        await tracker.stop()
+        _active_tasks.pop(uid, None)
         stop.set()
         await typing_task
 
@@ -472,21 +617,30 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     placeholder = await update.message.reply_text("🔍 Analyzing image…")
     stop = asyncio.Event()
     typing_task = asyncio.create_task(_typing_loop(update.effective_chat.id, ctx, stop))
+    tracker = ProgressTracker(placeholder, uid)
+    tracker.start_heartbeat()
+    _active_tasks[uid] = tracker
 
     try:
         save_path = _upload_path(uid, ".jpg", "img_")
         save_path.write_bytes(raw)
 
         prompt = f"{caption}\n\n[Image saved at: {save_path}]"
-        reply, stats = await _ask(uid, prompt, placeholder=placeholder)
+        reply, stats = await _ask(uid, prompt, tracker=tracker)
+
+        if tracker.cancelled:
+            await placeholder.edit_text("⏹ Task cancelled.", reply_markup=None)
+            return
 
         cc.save_turn(PLATFORM, str(uid), f"[Image at {save_path}] {caption}", reply)
         cc.track_usage(PLATFORM, str(uid), stats.get("input_tokens", 0), stats.get("output_tokens", 0))
         await _send(placeholder, update, reply)
     except Exception as exc:
         log.exception("handle_photo error")
-        await placeholder.edit_text(f"Error: {exc}")
+        await placeholder.edit_text(f"Error: {exc}", reply_markup=None)
     finally:
+        await tracker.stop()
+        _active_tasks.pop(uid, None)
         stop.set()
         await typing_task
 
@@ -514,6 +668,9 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     placeholder = await update.message.reply_text(f"📄 Processing {filename}…")
     stop = asyncio.Event()
     typing_task = asyncio.create_task(_typing_loop(update.effective_chat.id, ctx, stop))
+    tracker = ProgressTracker(placeholder, uid)
+    tracker.start_heartbeat()
+    _active_tasks[uid] = tracker
 
     try:
         suffix = Path(filename).suffix or ".txt"
@@ -521,15 +678,21 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         save_path.write_bytes(raw)
 
         prompt = f"{caption}\n\n[File '{filename}' saved at: {save_path}]"
-        reply, stats = await _ask(uid, prompt, placeholder=placeholder)
+        reply, stats = await _ask(uid, prompt, tracker=tracker)
+
+        if tracker.cancelled:
+            await placeholder.edit_text("⏹ Task cancelled.", reply_markup=None)
+            return
 
         cc.save_turn(PLATFORM, str(uid), f"[File '{filename}' at {save_path}] {caption}", reply)
         cc.track_usage(PLATFORM, str(uid), stats.get("input_tokens", 0), stats.get("output_tokens", 0))
         await _send(placeholder, update, reply)
     except Exception as exc:
         log.exception("handle_document error")
-        await placeholder.edit_text(f"Error: {exc}")
+        await placeholder.edit_text(f"Error: {exc}", reply_markup=None)
     finally:
+        await tracker.stop()
+        _active_tasks.pop(uid, None)
         stop.set()
         await typing_task
 
