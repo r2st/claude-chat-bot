@@ -100,16 +100,21 @@ class TaskSession:
     def __init__(self, placeholder, uid: int, prompt_preview: str):
         self.task_id = next(_task_counter)
         self.placeholder = placeholder
+        self.chat_id = None  # set externally for intermediate messages
+        self.bot = None       # set externally
         self.uid = uid
-        self.prompt_preview = prompt_preview[:40]  # Short label
+        self.prompt_preview = prompt_preview[:40]
         self.start_time = time.time()
         self.tools: list[str] = []
         self.tool_count = 0
         self._last_update = 0.0
+        self._last_status = ""
         self._cancelled = False
         self._heartbeat_task: asyncio.Task | None = None
         self._partial_text = ""
         self._phase = "thinking"  # thinking → working → streaming
+        self._current_activity = ""  # detailed activity description
+        self._sent_intermediate = False  # only send one intermediate update
 
     @property
     def cancelled(self) -> bool:
@@ -124,68 +129,101 @@ class TaskSession:
             return f"{secs}s"
         return f"{secs // 60}m {secs % 60}s"
 
-    def _spinner(self) -> str:
+    def _progress_bar(self) -> str:
+        """Visual progress bar based on activity."""
         secs = int(time.time() - self.start_time)
-        frames = ["◐", "◓", "◑", "◒"]
-        return frames[secs % 4]
+        # Animated fill that moves based on time + activity
+        if self._phase == "streaming":
+            fill = min(9, 7 + (secs % 3))
+        elif self.tool_count > 0:
+            fill = min(7, 2 + self.tool_count)
+        else:
+            fill = min(3, 1 + secs // 10)
+        bar = "▓" * fill + "░" * (10 - fill)
+        return f"[{bar}]"
 
     def _build_status(self) -> str:
         elapsed = self._elapsed()
-        spinner = self._spinner()
 
         # Show task ID if user has multiple active tasks
         user_tasks = _task_registry.get_user_tasks(self.uid)
-        task_label = f" `#{self.task_id}`" if len(user_tasks) > 1 else ""
+        task_label = f"  `#{self.task_id}`" if len(user_tasks) > 1 else ""
 
-        # Phase indicator
+        # Phase with emoji
         if self._phase == "thinking":
-            phase_label = "Thinking…"
+            phase = "🧠 *Thinking…*"
         elif self._phase == "working":
-            phase_label = "Working…"
+            phase = "⚙️ *Working…*"
         else:
-            phase_label = "Writing…"
+            phase = "✍️ *Writing…*"
 
-        lines = [f"{spinner} *{phase_label}* `{elapsed}`{task_label}"]
+        progress = self._progress_bar()
+        lines = [f"{phase} `{elapsed}`{task_label}", progress]
 
-        if self.tools:
-            unique_recent = list(dict.fromkeys(self.tools[-8:]))[-5:]
-            tool_lines = [_tool_label(t) for t in unique_recent]
-            lines.append("")
-            lines.extend(tool_lines)
+        # Current activity (detailed)
+        if self._current_activity:
+            lines.append(f"\n{self._current_activity}")
+        elif self.tools:
+            last_tool = self.tools[-1]
+            lines.append(f"\n{_tool_label(last_tool)}")
 
-        if self.tool_count > 5:
-            lines.append(f"\n_({self.tool_count} tool calls total)_")
+        # Tool history summary
+        if self.tool_count > 1:
+            unique = list(dict.fromkeys(self.tools))
+            summary_parts = []
+            for t in unique[-4:]:
+                count = self.tools.count(t)
+                icon = _TOOL_ICONS.get(t, "🔧")
+                summary_parts.append(f"{icon}×{count}" if count > 1 else icon)
+            lines.append(f"\n{'  '.join(summary_parts)}  _({self.tool_count} steps)_")
 
         # Show partial streaming text preview
         if self._partial_text:
-            preview = self._partial_text[-300:]
-            if len(self._partial_text) > 300:
+            preview = self._partial_text[-400:]
+            if len(self._partial_text) > 400:
                 preview = "…" + preview
-            lines.append(f"\n───\n{preview}")
+            # Escape markdown special chars in preview to avoid parse errors
+            lines.append(f"\n{'─' * 20}\n{preview}")
 
         return "\n".join(lines)
 
-    async def on_tool(self, tool_name: str):
+    async def on_tool(self, tool_name: str, detail: str = ""):
         """Called when Claude starts using a tool."""
         self._phase = "working"
         self.tools.append(tool_name)
         self.tool_count += 1
+        if detail:
+            self._current_activity = f"{_tool_label(tool_name).rstrip('…')} `{detail}`…"
+        else:
+            self._current_activity = _tool_label(tool_name)
         await self._update()
 
     async def on_text(self, text: str):
         """Called when Claude streams text content."""
         self._phase = "streaming"
-        self._partial_text = text if len(text) > len(self._partial_text) else self._partial_text + text
+        self._current_activity = ""
+        # Handle both full-text updates and delta appends
+        if len(text) > len(self._partial_text):
+            self._partial_text = text
+        else:
+            self._partial_text += text
         await self._update()
 
-    async def _update(self):
+    async def _update(self, force: bool = False):
         """Update the placeholder message (rate-limited to avoid Telegram 429s)."""
         now = time.time()
-        if now - self._last_update < 3.0:
+        # Adaptive rate: faster for first 15s (2s), slower after (4s)
+        min_interval = 2.0 if (now - self.start_time) < 15 else 4.0
+        if not force and (now - self._last_update < min_interval):
             return
         self._last_update = now
 
         status = self._build_status()
+        # Don't send identical updates (Telegram would error "message not modified")
+        if status == self._last_status:
+            return
+        self._last_status = status
+
         # Truncate to stay within Telegram's 4096 char limit
         if len(status) > 4000:
             status = status[:4000] + "\n…"
@@ -209,17 +247,41 @@ class TaskSession:
                 pass
 
     async def _heartbeat(self):
-        """Periodic updates even without tool activity."""
-        await asyncio.sleep(5)
+        """Periodic updates to keep elapsed time fresh."""
+        await asyncio.sleep(4)
         while not self._cancelled:
-            await self._update()
+            await self._update(force=True)
             elapsed = time.time() - self.start_time
+
+            # For very long tasks (>60s), send intermediate result as new message
+            if (elapsed > 60 and not self._sent_intermediate
+                    and self._partial_text and len(self._partial_text) > 100
+                    and self.bot and self.chat_id):
+                self._sent_intermediate = True
+                preview = self._partial_text[:2000]
+                if len(self._partial_text) > 2000:
+                    preview += "\n\n⏳ _Still working… full response coming soon._"
+                try:
+                    await self.bot.send_message(
+                        chat_id=self.chat_id,
+                        text=f"📝 *Interim update* ({self._elapsed()}):\n\n{preview}",
+                        parse_mode=ParseMode.MARKDOWN,
+                    )
+                except Exception:
+                    try:
+                        await self.bot.send_message(
+                            chat_id=self.chat_id,
+                            text=f"📝 Interim update ({self._elapsed()}):\n\n{preview}",
+                        )
+                    except Exception:
+                        pass
+
             if elapsed < 30:
-                interval = 5
+                interval = 4
             elif elapsed < 120:
-                interval = 10
+                interval = 8
             else:
-                interval = 15
+                interval = 12
             await asyncio.sleep(interval)
 
     def start_heartbeat(self):
@@ -236,8 +298,8 @@ class TaskSession:
     def finish_summary(self) -> str:
         elapsed = self._elapsed()
         if self.tool_count > 0:
-            return f"⚡ _{self.tool_count} tools · {elapsed}_"
-        return f"⚡ _{elapsed}_"
+            return f"✅ _{self.tool_count} tools · {elapsed}_"
+        return f"✅ _{elapsed}_"
 
 
 class TaskRegistry:
@@ -271,6 +333,24 @@ class TaskRegistry:
 
 
 _task_registry = TaskRegistry()
+
+# ─── Response store (for pagination and retry) ─────────────────────────────────
+
+_response_store: dict[str, dict] = {}  # response_id → {text, uid, prompt, page}
+_response_counter = itertools.count(1)
+
+RESPONSE_PAGE_SIZE = 3000  # chars per page
+
+
+def _store_response(uid: int, prompt: str, text: str) -> str:
+    """Store a long response and return its ID for pagination."""
+    rid = f"r{next(_response_counter)}"
+    _response_store[rid] = {"text": text, "uid": uid, "prompt": prompt}
+    # Keep only last 50 responses in memory
+    if len(_response_store) > 50:
+        oldest = list(_response_store.keys())[0]
+        del _response_store[oldest]
+    return rid
 
 
 # ─── Reply helper ───────────────────────────────────────────────────────────────
@@ -313,7 +393,7 @@ def _protect_urls_for_markdown(text: str) -> str:
 async def _send(placeholder, update: Update, text: str):
     chunk = 4096
     if not text or not text.strip():
-        await placeholder.edit_text("(empty response)", reply_markup=None)
+        await placeholder.edit_text("_(empty response)_", parse_mode=ParseMode.MARKDOWN, reply_markup=None)
         return
     # Protect URLs so they remain clickable in Markdown mode
     md_text = _protect_urls_for_markdown(text)
@@ -325,7 +405,7 @@ async def _send(placeholder, update: Update, text: str):
             for i in range(chunk, len(md_text), chunk):
                 await update.effective_message.reply_text(md_text[i:i+chunk], parse_mode=ParseMode.MARKDOWN)
     except Exception:
-        # Fallback: plain text (Telegram auto-links bare URLs in plain text)
+        # Fallback 1: plain text edit
         try:
             if len(text) <= chunk:
                 await placeholder.edit_text(text, reply_markup=None)
@@ -333,22 +413,42 @@ async def _send(placeholder, update: Update, text: str):
                 await placeholder.edit_text(text[:chunk], reply_markup=None)
                 for i in range(chunk, len(text), chunk):
                     await update.effective_message.reply_text(text[i:i+chunk])
-        except Exception as exc:
-            log.error("_send fallback failed: %s", exc)
-            await placeholder.edit_text(f"⚠️ Response received but couldn't display ({len(text)} chars). Error: {str(exc)[:100]}", reply_markup=None)
+        except Exception:
+            # Fallback 2: send as new message if editing fails entirely
+            try:
+                await placeholder.edit_text("✅ Done — see reply below.", reply_markup=None)
+            except Exception:
+                pass
+            try:
+                if len(text) <= chunk:
+                    await update.effective_message.reply_text(text)
+                else:
+                    for i in range(0, len(text), chunk):
+                        await update.effective_message.reply_text(text[i:i+chunk])
+            except Exception as exc:
+                log.error("_send all fallbacks failed: %s", exc)
 
 
 # ─── Tool name → friendly emoji/label ──────────────────────────────────────────
 
 _TOOL_LABELS = {
-    "Bash":      "🖥️ Running command…",
-    "Read":      "📖 Reading file…",
-    "Write":     "📝 Writing file…",
-    "Edit":      "✏️ Editing file…",
-    "Grep":      "🔍 Searching…",
-    "WebSearch": "🌐 Searching the web…",
-    "WebFetch":  "🌐 Fetching page…",
-    "Agent":     "🤖 Delegating to agent…",
+    "Bash":       "🖥️ Running command…",
+    "Read":       "📖 Reading file…",
+    "Write":      "📝 Writing file…",
+    "Edit":       "✏️ Editing file…",
+    "Grep":       "🔍 Searching code…",
+    "ListDir":    "📂 Listing directory…",
+    "WebSearch":  "🌐 Searching the web…",
+    "WebFetch":   "🌐 Fetching page…",
+    "Agent":      "🤖 Delegating to agent…",
+    "TodoWrite":  "📋 Planning…",
+    "TodoRead":   "📋 Checking plan…",
+}
+
+_TOOL_ICONS = {
+    "Bash": "🖥️", "Read": "📖", "Write": "📝", "Edit": "✏️",
+    "Grep": "🔍", "ListDir": "📂", "WebSearch": "🌐", "WebFetch": "🌐",
+    "Agent": "🤖", "TodoWrite": "📋", "TodoRead": "📋",
 }
 
 
@@ -372,17 +472,22 @@ def _engine(uid: int) -> str:
     return _user_engine.get(uid, cc.CLAUDE_MODE)
 
 
+def _active_session(uid: int) -> "cc.UserSession":
+    return cc._session_mgr.get_or_create_active(PLATFORM, str(uid))
+
+
 async def _ask(uid: int, text: str, tracker: TaskSession | None = None) -> tuple[str, dict]:
-    history = cc.load_history(PLATFORM, str(uid))
+    sess = cc._session_mgr.get_or_create_active(PLATFORM, str(uid))
+    history = cc.load_history(PLATFORM, str(uid), session_name=sess.name)
     engine = _engine(uid)
 
     if engine == "api":
         return cc.ask_claude_api(text, history, system=cc.CLAUDE_SYSTEM)
 
     # Progress callback via tracker
-    async def _on_progress(tool_name: str):
+    async def _on_progress(tool_name: str, detail: str = ""):
         if tracker:
-            await tracker.on_tool(tool_name)
+            await tracker.on_tool(tool_name, detail)
 
     # Text streaming callback
     async def _on_text(text_chunk: str):
@@ -394,7 +499,7 @@ async def _ask(uid: int, text: str, tracker: TaskSession | None = None) -> tuple
         return tracker.cancelled if tracker else False
 
     if engine == "sdk":
-        return await cc.ask_claude_sdk(
+        result = await cc.ask_claude_sdk(
             text, history,
             model=_model(uid),
             system=cc.CLAUDE_SYSTEM,
@@ -404,9 +509,13 @@ async def _ask(uid: int, text: str, tracker: TaskSession | None = None) -> tuple
             on_text=_on_text,
             is_cancelled=_is_cancelled,
         )
+        # Cache session ID for reuse
+        if result[1].get("session_id"):
+            cc.set_session_id(PLATFORM, str(uid), result[1]["session_id"])
+        return result
 
     # Default: CLI mode
-    return await cc.ask_claude_async(
+    result = await cc.ask_claude_async(
         text, history,
         model=_model(uid),
         system=cc.CLAUDE_SYSTEM,
@@ -416,7 +525,13 @@ async def _ask(uid: int, text: str, tracker: TaskSession | None = None) -> tuple
         on_progress=_on_progress,
         on_text=_on_text,
         is_cancelled=_is_cancelled,
+        platform=PLATFORM,
+        user_id=str(uid),
     )
+    # Cache session ID for reuse
+    if result[1].get("session_id"):
+        cc.set_session_id(PLATFORM, str(uid), result[1]["session_id"])
+    return result
 
 
 # ─── Commands ───────────────────────────────────────────────────────────────────
@@ -428,6 +543,9 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Commands:\n"
         "/tasks — show active running tasks\n"
         "/cancel — cancel a task (or all)\n"
+        "/sessions — view/switch sessions\n"
+        "/new <name> — create a new session\n"
+        "/switch — switch to another session\n"
         "/browse — browse project folders interactively\n"
         "/reset — clear conversation history\n"
         "/model — switch Claude model\n"
@@ -445,14 +563,21 @@ async def cmd_id(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    cc.clear_history(PLATFORM, str(update.effective_user.id))
-    await update.message.reply_text("Conversation history cleared.")
+    uid = str(update.effective_user.id)
+    sess = _active_session(int(uid))
+    cc.clear_history(PLATFORM, uid, session_name=sess.name)
+    cc.clear_session(PLATFORM, uid)
+    sess.claude_session_id = None
+    sess.message_count = 0
+    await update.message.reply_text(f"History cleared for session `{sess.name}`.", parse_mode="Markdown")
 
 
 async def cmd_mode(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+    sess = _active_session(uid)
     info = (
         f"Platform: `telegram`\n"
+        f"Session: `{sess.name}` {sess.status_emoji()}\n"
         f"Engine: `{_engine(uid)}`\n"
         f"Model: `{_model(uid)}`\n"
         f"Permission mode: `{_perm(uid) or 'default'}`\n"
@@ -543,6 +668,90 @@ async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"*{len(tasks)} active task(s).* Which to cancel?",
         reply_markup=InlineKeyboardMarkup(btns),
         parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+# ─── Session management ────────────────────────────────────────────────────────
+
+async def cmd_sessions(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Show all sessions for this user with status indicators."""
+    uid = update.effective_user.id
+    sessions = cc._session_mgr.get_all(PLATFORM, str(uid))
+    if not sessions:
+        sessions = [cc._session_mgr.get_or_create_active(PLATFORM, str(uid))]
+
+    active_idx = cc._session_mgr.get_active_index(PLATFORM, str(uid))
+
+    lines = ["*Your sessions:*\n"]
+    btns = []
+    for i, s in enumerate(sessions):
+        marker = " ← active" if i == active_idx else ""
+        lines.append(
+            f"{s.status_emoji()} `{s.name}` — {s.message_count} msgs, {s.age_str()}{marker}"
+        )
+        if i != active_idx:
+            btns.append([InlineKeyboardButton(
+                f"Switch to: {s.name}", callback_data=f"tg:sess:sw:{i}"
+            )])
+
+    btns.append([InlineKeyboardButton("➕ New session", callback_data="tg:sess:new:_")])
+    if len(sessions) > 1:
+        btns.append([InlineKeyboardButton("🗑 Delete a session…", callback_data="tg:sess:delmenu:_")])
+
+    await update.message.reply_text(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(btns),
+        parse_mode="Markdown",
+    )
+
+
+async def cmd_new(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Create a new named session. Usage: /new <name>"""
+    uid = update.effective_user.id
+    name = " ".join(ctx.args).strip() if ctx.args else f"session-{int(time.time()) % 10000}"
+    name = re.sub(r"[^a-zA-Z0-9_-]", "-", name)[:20]
+
+    sess = cc._session_mgr.create(PLATFORM, str(uid), name)
+    await update.message.reply_text(
+        f"✅ Created and switched to session `{sess.name}`",
+        parse_mode="Markdown",
+    )
+
+
+async def cmd_switch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Switch to another session by name or index."""
+    uid = update.effective_user.id
+    sessions = cc._session_mgr.get_all(PLATFORM, str(uid))
+
+    if not sessions or len(sessions) <= 1:
+        await update.message.reply_text("Only one session exists. Use /new to create more.")
+        return
+
+    if ctx.args:
+        target = ctx.args[0].strip()
+        for i, s in enumerate(sessions):
+            if s.name == target or str(i) == target:
+                cc._session_mgr.switch_to(PLATFORM, str(uid), i)
+                await update.message.reply_text(
+                    f"✅ Switched to `{s.name}`", parse_mode="Markdown"
+                )
+                return
+        await update.message.reply_text(f"Session `{target}` not found.", parse_mode="Markdown")
+        return
+
+    active_idx = cc._session_mgr.get_active_index(PLATFORM, str(uid))
+    btns = []
+    for i, s in enumerate(sessions):
+        if i == active_idx:
+            continue
+        btns.append([InlineKeyboardButton(
+            f"{s.status_emoji()} {s.name} ({s.message_count} msgs)",
+            callback_data=f"tg:sess:sw:{i}",
+        )])
+
+    await update.message.reply_text(
+        "Switch to which session?",
+        reply_markup=InlineKeyboardMarkup(btns),
     )
 
 
@@ -759,7 +968,8 @@ async def _handle_browse_callback(q, uid: int):
         _task_registry.register(task)
         try:
             reply, stats = await _ask(uid, prompt, tracker=task)
-            cc.save_turn(PLATFORM, str(uid), prompt, reply)
+            browse_sess = _active_session(uid)
+            cc.save_turn(PLATFORM, str(uid), prompt, reply, session_name=browse_sess.name)
             cc.track_usage(PLATFORM, str(uid), stats.get("input_tokens", 0), stats.get("output_tokens", 0))
 
             back_dir = target if target.is_dir() else target.parent
@@ -872,9 +1082,142 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(f"⏹ Cancelling {count} task(s)…", reply_markup=None)
         return
 
+    # Handle session management callbacks
+    if kind == "sess":
+        # value format: "action:param" e.g. "sw:2", "del:1", "new:_", "delmenu:_"
+        sess_parts = value.split(":", 1)
+        action = sess_parts[0]
+        param = sess_parts[1] if len(sess_parts) > 1 else ""
+
+        if action == "sw":
+            idx = int(param)
+            s = cc._session_mgr.switch_to(PLATFORM, str(uid), idx)
+            if s:
+                await q.edit_message_text(f"✅ Switched to `{s.name}`", parse_mode="Markdown")
+            else:
+                await q.edit_message_text("Session not found.")
+        elif action == "new":
+            name = f"session-{int(time.time()) % 10000}"
+            s = cc._session_mgr.create(PLATFORM, str(uid), name)
+            await q.edit_message_text(
+                f"✅ Created and switched to `{s.name}`\n\nTip: use `/new <name>` to pick a name.",
+                parse_mode="Markdown",
+            )
+        elif action == "delmenu":
+            sessions = cc._session_mgr.get_all(PLATFORM, str(uid))
+            active_idx = cc._session_mgr.get_active_index(PLATFORM, str(uid))
+            btns = []
+            for i, s in enumerate(sessions):
+                if s.is_busy:
+                    continue
+                label = f"🗑 {s.name}" + (" (active)" if i == active_idx else "")
+                btns.append([InlineKeyboardButton(label, callback_data=f"tg:sess:del:{i}")])
+            btns.append([InlineKeyboardButton("↩️ Cancel", callback_data="tg:sess:back:_")])
+            await q.edit_message_text(
+                "Which session to delete?",
+                reply_markup=InlineKeyboardMarkup(btns),
+            )
+        elif action == "del":
+            idx = int(param)
+            sessions = cc._session_mgr.get_all(PLATFORM, str(uid))
+            name = sessions[idx].name if idx < len(sessions) else "?"
+            if cc._session_mgr.delete(PLATFORM, str(uid), idx):
+                await q.edit_message_text(f"🗑 Deleted session `{name}`", parse_mode="Markdown")
+            else:
+                await q.edit_message_text("Cannot delete (busy or not found).")
+        elif action == "back":
+            await q.edit_message_text("Cancelled.")
+        return
+
     # Handle folder browser callbacks
     if kind in ("br", "bf", "bv", "ba"):
         await _handle_browse_callback(q, uid)
+        return
+
+    # Handle pagination
+    if kind == "pg":
+        # value = "rid:page"
+        pg_parts = value.split(":")
+        if len(pg_parts) < 2:
+            return
+        rid, page_num = pg_parts[0], int(pg_parts[1])
+        resp = _response_store.get(rid)
+        if not resp or resp["uid"] != uid:
+            await q.edit_message_text("Response expired.", reply_markup=None)
+            return
+
+        text = resp["text"]
+        total_pages = (len(text) + RESPONSE_PAGE_SIZE - 1) // RESPONSE_PAGE_SIZE
+        page_num = min(page_num, total_pages - 1)
+        start = page_num * RESPONSE_PAGE_SIZE
+        page_text = text[start:start + RESPONSE_PAGE_SIZE]
+
+        footer = f"\n\n📄 _Page {page_num + 1}/{total_pages}_"
+
+        nav = []
+        if page_num > 0:
+            nav.append(InlineKeyboardButton("◀️ Prev", callback_data=f"tg:pg:{rid}:{page_num - 1}"))
+        if page_num < total_pages - 1:
+            nav.append(InlineKeyboardButton("▶️ Next", callback_data=f"tg:pg:{rid}:{page_num + 1}"))
+        markup = InlineKeyboardMarkup([nav]) if nav else None
+
+        try:
+            await q.edit_message_text(page_text + footer, parse_mode=ParseMode.MARKDOWN, reply_markup=markup)
+        except Exception:
+            await q.edit_message_text(page_text + footer, reply_markup=markup)
+        return
+
+    # Handle retry
+    if kind == "retry":
+        retry_key = f"retry_{value}"
+        resp = _response_store.get(retry_key)
+        if not resp or resp["uid"] != uid:
+            await q.edit_message_text("Retry expired.", reply_markup=None)
+            return
+
+        prompt = resp["prompt"]
+        del _response_store[retry_key]
+        await q.edit_message_text("🔄 Retrying…", reply_markup=None)
+
+        # Re-run as a task
+        placeholder = q.message
+        stop_evt = asyncio.Event()
+        task = TaskSession(placeholder, uid, prompt)
+        task.start_heartbeat()
+        _task_registry.register(task)
+        try:
+            reply, stats = await _ask(uid, prompt, tracker=task)
+            if task.cancelled:
+                await placeholder.edit_text("⏹ Retry cancelled.", reply_markup=None)
+                return
+            retry_sess = _active_session(uid)
+            cc.save_turn(PLATFORM, str(uid), prompt, reply, session_name=retry_sess.name)
+            cc.track_usage(PLATFORM, str(uid), stats.get("input_tokens", 0), stats.get("output_tokens", 0))
+            summary = task.finish_summary()
+            reply = f"{summary}\n\n{reply}"
+            md_text = _protect_urls_for_markdown(reply)
+            if len(md_text) <= 4096:
+                try:
+                    await placeholder.edit_text(md_text, parse_mode=ParseMode.MARKDOWN, reply_markup=None)
+                except Exception:
+                    await placeholder.edit_text(reply[:4096], reply_markup=None)
+            else:
+                rid = _store_response(uid, prompt, md_text)
+                page_text = md_text[:RESPONSE_PAGE_SIZE]
+                total_pages = (len(md_text) + RESPONSE_PAGE_SIZE - 1) // RESPONSE_PAGE_SIZE
+                btns = [[InlineKeyboardButton("▶️ Next page", callback_data=f"tg:pg:{rid}:1")]]
+                footer = f"\n\n📄 _Page 1/{total_pages}_"
+                try:
+                    await placeholder.edit_text(page_text + footer, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(btns))
+                except Exception:
+                    await placeholder.edit_text(reply[:RESPONSE_PAGE_SIZE] + footer, reply_markup=InlineKeyboardMarkup(btns))
+        except Exception as exc:
+            retry_btn = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Retry", callback_data=f"tg:retry:{task.task_id}")]])
+            _response_store[f"retry_{task.task_id}"] = {"prompt": prompt, "uid": uid}
+            await placeholder.edit_text(f"❌ Retry failed: {str(exc)[:150]}", reply_markup=retry_btn)
+        finally:
+            await task.stop()
+            _task_registry.unregister(task.task_id)
         return
 
     if kind == "model":
@@ -932,52 +1275,141 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ─── Message handler ─────────────────────────────────────────────────────────────
 
+async def _send_paginated(update: Update, uid: int, prompt: str, text: str, placeholder=None):
+    """Send a response with pagination buttons if it's long."""
+    chunk = 4096
+    md_text = _protect_urls_for_markdown(text)
+
+    # Short responses: send directly
+    if len(md_text) <= chunk:
+        btns = []
+        if placeholder:
+            try:
+                await placeholder.edit_text(md_text, parse_mode=ParseMode.MARKDOWN, reply_markup=None)
+                return
+            except Exception:
+                try:
+                    await placeholder.edit_text(text, reply_markup=None)
+                    return
+                except Exception:
+                    pass
+
+        # Fallback: new message
+        await update.effective_message.reply_text(md_text, parse_mode=ParseMode.MARKDOWN)
+        return
+
+    # Long responses: paginate
+    rid = _store_response(uid, prompt, md_text)
+    page_text = md_text[:RESPONSE_PAGE_SIZE]
+    total_pages = (len(md_text) + RESPONSE_PAGE_SIZE - 1) // RESPONSE_PAGE_SIZE
+
+    footer = f"\n\n📄 _Page 1/{total_pages}_"
+    btns = [[InlineKeyboardButton("▶️ Next page", callback_data=f"tg:pg:{rid}:1")]]
+    markup = InlineKeyboardMarkup(btns)
+
+    if placeholder:
+        try:
+            await placeholder.edit_text(
+                page_text + footer, parse_mode=ParseMode.MARKDOWN, reply_markup=markup
+            )
+            return
+        except Exception:
+            try:
+                await placeholder.edit_text(
+                    text[:RESPONSE_PAGE_SIZE] + footer, reply_markup=markup
+                )
+                return
+            except Exception:
+                pass
+
+    # Fallback: new message
+    try:
+        await update.effective_message.reply_text(
+            page_text + footer, parse_mode=ParseMode.MARKDOWN, reply_markup=markup
+        )
+    except Exception:
+        await update.effective_message.reply_text(text[:RESPONSE_PAGE_SIZE], reply_markup=markup)
+
+
 async def _run_task(update: Update, ctx: ContextTypes.DEFAULT_TYPE, uid: int, user_text: str):
     """Execute a single Claude task. Can run concurrently with other tasks."""
-    placeholder = await update.message.reply_text("⏳ Thinking…")
+    placeholder = await update.message.reply_text("🧠 Thinking…")
     stop = asyncio.Event()
     typing_task = asyncio.create_task(_typing_loop(update.effective_chat.id, ctx, stop))
 
     # Create task session with progress tracking
     task = TaskSession(placeholder, uid, user_text)
+    task.chat_id = update.effective_chat.id
+    task.bot = ctx.bot
     task.start_heartbeat()
     _task_registry.register(task)
 
+    sess = _active_session(uid)
+    sess.is_busy = True
     try:
         reply, stats = await _ask(uid, user_text, tracker=task)
 
         if task.cancelled:
             await placeholder.edit_text(
-                f"⏹ Task cancelled. `#{task.task_id}`", reply_markup=None, parse_mode=ParseMode.MARKDOWN
+                f"⏹ Task cancelled after {task._elapsed()}.", reply_markup=None,
             )
             return
 
-        cc.save_turn(PLATFORM, str(uid), user_text, reply)
+        cc.save_turn(PLATFORM, str(uid), user_text, reply, session_name=sess.name)
         cc.track_usage(PLATFORM, str(uid), stats.get("input_tokens", 0), stats.get("output_tokens", 0))
         cc.track_tool_usage(PLATFORM, str(uid), stats.get("tools_used", []))
         cc.track_cost(PLATFORM, str(uid), stats.get("input_tokens", 0), stats.get("output_tokens", 0), stats.get("cost_usd", 0))
 
+        # Build header with completion stats
         v = _verbose(uid)
+        summary = task.finish_summary()
         if v >= 1 and stats.get("tools_used"):
-            summary = task.finish_summary()
-            reply = f"{summary}\n🔧 _{', '.join(stats['tools_used'][:5])}_\n\n{reply}"
-        elif v >= 1 and task.tool_count == 0:
-            summary = task.finish_summary()
+            tools_str = ', '.join(stats['tools_used'][:5])
+            if len(stats['tools_used']) > 5:
+                tools_str += f" +{len(stats['tools_used']) - 5} more"
+            reply = f"{summary}\n🔧 _{tools_str}_\n\n{reply}"
+        elif v >= 1:
             reply = f"{summary}\n\n{reply}"
         if v >= 2 and stats.get("input_tokens"):
             cost = stats.get("cost_usd", 0)
             cost_str = f" · ${cost:.4f}" if cost else ""
             reply += f"\n\n_({stats['input_tokens']}→{stats['output_tokens']} tokens{cost_str})_"
 
-        await _send(placeholder, update, reply)
+        await _send_paginated(update, uid, user_text, reply, placeholder=placeholder)
+
+        # Notification ping for long tasks (>30s) — vibrates the phone
+        elapsed_secs = time.time() - task.start_time
+        if elapsed_secs > 30:
+            try:
+                await update.effective_message.reply_text(
+                    f"🔔 Task complete ({task._elapsed()})",
+                    disable_notification=False,
+                )
+            except Exception:
+                pass
+
     except asyncio.CancelledError:
         await placeholder.edit_text(
-            f"⏹ Task cancelled. `#{task.task_id}`", reply_markup=None, parse_mode=ParseMode.MARKDOWN
+            f"⏹ Task cancelled after {task._elapsed()}.", reply_markup=None,
         )
     except Exception as exc:
         log.exception("handle_message error (task #%d)", task.task_id)
-        await placeholder.edit_text(f"Error: {exc}", reply_markup=None)
+        error_msg = str(exc)[:200]
+        # Show error with retry button
+        retry_btn = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 Retry", callback_data=f"tg:retry:{task.task_id}")],
+        ])
+        # Store the prompt for retry
+        _response_store[f"retry_{task.task_id}"] = {"prompt": user_text, "uid": uid}
+        try:
+            await placeholder.edit_text(
+                f"❌ Error after {task._elapsed()}: {error_msg}",
+                reply_markup=retry_btn,
+            )
+        except Exception:
+            await update.message.reply_text(f"❌ Error: {error_msg}", reply_markup=retry_btn)
     finally:
+        sess.is_busy = False
         await task.stop()
         _task_registry.unregister(task.task_id)
         stop.set()
@@ -1066,7 +1498,8 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        cc.save_turn(PLATFORM, str(uid), f"[Image at {save_path}] {caption}", reply)
+        img_sess = _active_session(uid)
+        cc.save_turn(PLATFORM, str(uid), f"[Image at {save_path}] {caption}", reply, session_name=img_sess.name)
         cc.track_usage(PLATFORM, str(uid), stats.get("input_tokens", 0), stats.get("output_tokens", 0))
         await _send(placeholder, update, reply)
     except Exception as exc:
@@ -1120,7 +1553,8 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        cc.save_turn(PLATFORM, str(uid), f"[File '{filename}' at {save_path}] {caption}", reply)
+        doc_sess = _active_session(uid)
+        cc.save_turn(PLATFORM, str(uid), f"[File '{filename}' at {save_path}] {caption}", reply, session_name=doc_sess.name)
         cc.track_usage(PLATFORM, str(uid), stats.get("input_tokens", 0), stats.get("output_tokens", 0))
         await _send(placeholder, update, reply)
     except Exception as exc:
@@ -1150,6 +1584,9 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("start",       cmd_start))
     app.add_handler(CommandHandler("tasks",       cmd_tasks))
     app.add_handler(CommandHandler("cancel",      cmd_cancel))
+    app.add_handler(CommandHandler("sessions",    cmd_sessions))
+    app.add_handler(CommandHandler("new",         cmd_new))
+    app.add_handler(CommandHandler("switch",      cmd_switch))
     app.add_handler(CommandHandler("browse",      cmd_browse))
     app.add_handler(CommandHandler("reset",       cmd_reset))
     app.add_handler(CommandHandler("mode",        cmd_mode))
