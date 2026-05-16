@@ -27,7 +27,7 @@ PLATFORM = "whatsapp"
 
 INSTANCE_ID   = os.environ["GREEN_API_INSTANCE_ID"]
 API_TOKEN     = os.environ["GREEN_API_TOKEN"]
-BASE_URL      = f"https://api.green-api.com/waInstance{INSTANCE_ID}"
+BASE_URL      = os.getenv("GREEN_API_BASE_URL", f"https://api.green-api.com").rstrip("/") + f"/waInstance{INSTANCE_ID}"
 
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL_SECONDS", "2"))
 
