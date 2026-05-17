@@ -6,9 +6,68 @@ const path = require("path");
 const readline = require("readline");
 const https = require("https");
 
+const fs = require("fs");
+
 const PYPI_PACKAGE = "telechatai";
 const NPM_VERSION = require("../package.json").version;
-const ENV_FILE = path.join(process.cwd(), ".env");
+
+// ─── Workdir management ─────────────────────────────────────────────────────
+// Persistent config at ~/.telechat/config.json stores the working directory.
+// All commands auto-cd there so users can run `telechat` from anywhere.
+
+const CONFIG_DIR = path.join(require("os").homedir(), ".telechat");
+const CONFIG_FILE = path.join(CONFIG_DIR, "config.json");
+const DEFAULT_WORKDIR = path.join(require("os").homedir(), "telechat");
+
+function loadConfig() {
+  try {
+    return JSON.parse(fs.readFileSync(CONFIG_FILE, "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+function saveConfig(config) {
+  if (!existsSync(CONFIG_DIR)) fs.mkdirSync(CONFIG_DIR, { recursive: true });
+  writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2) + "\n");
+}
+
+function getWorkdir() {
+  const config = loadConfig();
+  if (config.workdir && existsSync(config.workdir)) return config.workdir;
+  // Fallback: if cwd has a .env or .telechat.pid, use it (backwards compat)
+  if (existsSync(path.join(process.cwd(), ".env")) || existsSync(path.join(process.cwd(), ".telechat.pid"))) {
+    return process.cwd();
+  }
+  return null;
+}
+
+function setWorkdir(dir) {
+  const config = loadConfig();
+  config.workdir = dir;
+  saveConfig(config);
+}
+
+function ensureWorkdir(dir) {
+  if (!existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+// Resolve workdir — used by all commands
+function resolveWorkdir() {
+  const wd = getWorkdir();
+  if (wd) {
+    process.chdir(wd);
+    return wd;
+  }
+  return null;
+}
+
+const ENV_FILE = (() => {
+  const wd = getWorkdir();
+  if (wd) return path.join(wd, ".env");
+  return path.join(process.cwd(), ".env");
+})();
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -97,6 +156,37 @@ function spin(msg) {
 }
 
 async function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+async function chooseWorkdir() {
+  const current = getWorkdir();
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+
+  console.log(`\n  ── Working Directory ──`);
+  console.log(`  telechat stores .env, logs, and data in a working directory.`);
+  if (current) {
+    console.log(`  Current: ${current}\n`);
+    const keep = await ask(rl, `  Keep this directory? (Enter = keep, or type a new path): `);
+    if (!keep) {
+      rl.close();
+      return current;
+    }
+    const dir = keep.replace(/^~/, require("os").homedir());
+    ensureWorkdir(dir);
+    setWorkdir(dir);
+    rl.close();
+    console.log(`  ✓ Working directory: ${dir}`);
+    return dir;
+  }
+
+  console.log(`  Suggested: ${DEFAULT_WORKDIR}\n`);
+  const choice = await ask(rl, `  Working directory (Enter = ${DEFAULT_WORKDIR}): `);
+  rl.close();
+  const dir = choice ? choice.replace(/^~/, require("os").homedir()) : DEFAULT_WORKDIR;
+  ensureWorkdir(dir);
+  setWorkdir(dir);
+  console.log(`  ✓ Working directory: ${dir}`);
+  return dir;
+}
 
 // ─── Token validators ────────────────────────────────────────────────────────
 
@@ -493,9 +583,13 @@ function checkAndFixIssues() {
 
 // ─── Service management ──────────────────────────────────────────────────────
 
-const PID_FILE = path.join(process.cwd(), ".telechat.pid");
-const LOG_FILE = path.join(process.cwd(), "bot.log");
-const ERR_FILE = path.join(process.cwd(), "bot.err");
+function _wdPath(file) {
+  const wd = getWorkdir();
+  return path.join(wd || process.cwd(), file);
+}
+const PID_FILE = _wdPath(".telechat.pid");
+const LOG_FILE = _wdPath("bot.log");
+const ERR_FILE = _wdPath("bot.err");
 
 function getRunningPid() {
   try {
@@ -561,12 +655,13 @@ function printTips() {
     telechat [start]      Start bot as background service
     telechat stop         Stop the bot
     telechat restart      Restart the bot
-    telechat status       Check status, uptime, health
+    telechat status       Show status, uptime, health
     telechat logs         Tail the bot log
     telechat env          Show config (tokens masked)
     telechat clean        Remove .env (clear credentials)
     telechat init         AI-guided setup (recommended)
     telechat setup        Manual setup wizard
+    telechat workdir      Show/change working directory
     telechat update       Update to latest version
 
   Tips:
@@ -597,13 +692,13 @@ Usage:
   telechat [start]       Start bot (shows setup guide if no .env)
   telechat stop          Stop the bot
   telechat restart       Restart the bot
-  telechat status        Check status, uptime, and health
+  telechat status        Check status, uptime, health, workdir
   telechat logs          Tail the bot log
   telechat env           Show environment variables (tokens masked)
-  telechat env clean     Remove .env file (all credentials)
-  telechat clean         Same as env clean
+  telechat clean         Remove .env file (all credentials)
   telechat init          AI-guided setup (opens browser, validates tokens)
   telechat setup         Manual setup wizard (no Claude CLI needed)
+  telechat workdir       Show/set working directory
   telechat update        Update to latest version
   telechat --debug       Start with verbose logging
   telechat --version     Show version
@@ -614,6 +709,29 @@ Docs: https://github.com/telechatai/telechat`);
 
   if (args.includes("--version") || args.includes("-v")) {
     console.log(`telechat ${NPM_VERSION}`);
+    process.exit(0);
+  }
+
+  // ── Workdir ──
+  if (cmd === "workdir" || cmd === "dir" || cmd === "home") {
+    const subcmd = args.find((a) => !a.startsWith("-") && a !== cmd);
+    if (subcmd) {
+      // telechat workdir /path/to/dir — set directly
+      const dir = subcmd.replace(/^~/, require("os").homedir());
+      ensureWorkdir(dir);
+      setWorkdir(dir);
+      console.log(`  ✓ Working directory set to: ${dir}`);
+    } else {
+      const wd = getWorkdir();
+      if (wd) {
+        console.log(`  Working directory: ${wd}`);
+        console.log(`  Change: telechat workdir /new/path`);
+      } else {
+        console.log(`  No working directory set.`);
+        console.log(`  Set one: telechat workdir ~/telechat`);
+        console.log(`  Or run: telechat init`);
+      }
+    }
     process.exit(0);
   }
 
@@ -694,10 +812,15 @@ Docs: https://github.com/telechatai/telechat`);
       process.exit(1);
     }
 
-    const fs = require("fs");
-    const existingEnv = existsSync(ENV_FILE) ? fs.readFileSync(ENV_FILE, "utf8") : null;
+    // Choose working directory first
+    const workdir = await chooseWorkdir();
+    process.chdir(workdir);
 
-    const systemPrompt = `You are telechat's setup agent. Configure ${ENV_FILE} silently and autonomously.
+    const envFile = path.join(workdir, ".env");
+    const existingEnv = existsSync(envFile) ? fs.readFileSync(envFile, "utf8") : null;
+
+    const systemPrompt = `You are telechat's setup agent. Configure ${envFile} silently and autonomously.
+Working directory: ${workdir}
 
 ${existingEnv ? `Current .env:\n${existingEnv}\nPreserve existing values.` : "No .env exists. Create from scratch."}
 
@@ -893,20 +1016,27 @@ FLOW:
 
   // ── Status ──
   if (cmd === "status") {
+    const wd = getWorkdir();
     const pid = getRunningPid();
+
+    console.log("");
+    console.log(`  Working dir : ${wd || process.cwd()}`);
+    console.log(`  Status      : ${pid ? `✓ running (PID ${pid})` : "✗ not running"}`);
+
+    if (wd && existsSync(path.join(wd, ".env"))) {
+      const envContent = fs.readFileSync(path.join(wd, ".env"), "utf8");
+      const platforms = [];
+      if (envContent.includes("TELEGRAM_BOT_TOKEN=")) platforms.push("Telegram");
+      if (envContent.includes("GREEN_API_INSTANCE_ID=")) platforms.push("WhatsApp");
+      if (envContent.includes("SLACK_BOT_TOKEN=")) platforms.push("Slack");
+      if (platforms.length) console.log(`  Platforms   : ${platforms.join(", ")}`);
+
+      // Claude mode
+      const modeMatch = envContent.match(/CLAUDE_MODE=(\w+)/);
+      if (modeMatch) console.log(`  Claude      : ${modeMatch[1]} mode`);
+    }
+
     if (pid) {
-      console.log(`  ✓ telechat is running (PID ${pid})`);
-
-      // Show platform info from .env
-      if (existsSync(ENV_FILE)) {
-        const envContent = require("fs").readFileSync(ENV_FILE, "utf8");
-        const platforms = [];
-        if (envContent.includes("TELEGRAM_BOT_TOKEN=")) platforms.push("Telegram");
-        if (envContent.includes("GREEN_API_INSTANCE_ID=")) platforms.push("WhatsApp");
-        if (envContent.includes("SLACK_BOT_TOKEN=")) platforms.push("Slack");
-        if (platforms.length) console.log(`    Platforms: ${platforms.join(", ")}`);
-      }
-
       // Try health check
       try {
         const health = execSync("curl -s http://localhost:8484/health", { encoding: "utf8", timeout: 3000 });
@@ -914,7 +1044,7 @@ FLOW:
         if (h.uptime_seconds) {
           const hrs = Math.floor(h.uptime_seconds / 3600);
           const mins = Math.floor((h.uptime_seconds % 3600) / 60);
-          console.log(`    Uptime: ${hrs}h ${mins}m`);
+          console.log(`  Uptime      : ${hrs}h ${mins}m`);
         }
         if (h.components) {
           const statuses = [];
@@ -923,13 +1053,16 @@ FLOW:
               statuses.push(`${name}: ${info.healthy ? "✓" : "✗"}`);
             }
           }
-          if (statuses.length) console.log(`    Health: ${statuses.join(", ")}`);
+          if (statuses.length) console.log(`  Health      : ${statuses.join(", ")}`);
         }
       } catch {}
     } else {
-      console.log("  ✗ telechat is not running");
-      console.log("    Start: telechat start");
+      console.log("");
+      console.log(`  Commands:`);
+      console.log(`    telechat start      Start the bot`);
+      console.log(`    telechat init       Set up / reconfigure`);
     }
+    console.log("");
     process.exit(0);
   }
 
@@ -1005,10 +1138,16 @@ FLOW:
       console.log("  ✓ Python backend installed");
     }
 
+    // Try to resolve workdir
+    const wd = getWorkdir();
+    const envFile = wd ? path.join(wd, ".env") : ENV_FILE;
+    if (wd) process.chdir(wd);
+
     // No .env — guide the user
-    if (!existsSync(ENV_FILE)) {
+    if (!existsSync(envFile)) {
+      const wdInfo = wd ? `  Working directory: ${wd}\n` : "";
       console.log(`
-  No .env configuration found. You need to set up your bot first.
+${wdInfo}  No .env configuration found. You need to set up your bot first.
 
   Choose a setup method:
 
@@ -1022,7 +1161,7 @@ FLOW:
 
   Quick start (Telegram only):
     1. Message @BotFather on Telegram → /newbot → copy token
-    2. Create .env file:
+    2. Create .env file:${wd ? `\n       cd ${wd}` : ""}
        echo "TELEGRAM_BOT_TOKEN=your_token_here" > .env
        echo "CLAUDE_MODE=cli" >> .env
     3. telechat start
@@ -1031,7 +1170,7 @@ FLOW:
     }
 
     // Validate .env has at least one platform configured
-    const envContent = require("fs").readFileSync(ENV_FILE, "utf8");
+    const envContent = fs.readFileSync(envFile, "utf8");
     const envVars = {};
     for (const line of envContent.split("\n")) {
       if (!line.trim() || line.startsWith("#")) continue;
