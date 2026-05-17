@@ -113,6 +113,13 @@ async function validateGreenApi(instanceId, token) {
   return res.data;
 }
 
+async function getGreenApiSettings(instanceId, token) {
+  const url = `https://api.green-api.com/waInstance${instanceId}/getSettings/${token}`;
+  const res = await httpGet(url);
+  if (!res || res.status !== 200) return null;
+  return res.data;
+}
+
 async function waitForTelegramMessage(token, timeoutSec) {
   const deadline = Date.now() + timeoutSec * 1000;
   let offset = 0;
@@ -246,54 +253,74 @@ async function setup() {
 
   // ── WhatsApp setup ──
   if (platforms.includes("whatsapp")) {
-    console.log("\n── WhatsApp setup (Green API — free tier) ──\n");
-    console.log("  I'll open the Green API console where you create a free instance.");
-    console.log("  Steps:");
-    console.log("    1. Sign up / log in");
-    console.log("    2. Create instance → Developer plan (free)");
-    console.log("    3. Scan QR code with your WhatsApp phone");
-    console.log("    4. Copy Instance ID and API Token from the dashboard\n");
+    console.log("\n── WhatsApp setup ──\n");
+    console.log("  WhatsApp uses Green API (free Developer plan).\n");
+    console.log("  I'll open the Green API console. Here's what to do:");
+    console.log("    1. Sign up with Google/GitHub/email (takes 30 seconds)");
+    console.log("    2. You'll see a free instance already created");
+    console.log("    3. Scan the QR code with your WhatsApp phone");
+    console.log("       (WhatsApp → Settings → Linked Devices → Link a Device)");
+    console.log("    4. Copy the idInstance and apiTokenInstance from the dashboard\n");
 
     const opened = openUrl("https://console.green-api.com");
     if (opened) {
       console.log("  ✓ Opened Green API console in your browser\n");
     } else {
-      console.log("  Open: https://console.green-api.com\n");
+      console.log("  → Open: https://console.green-api.com\n");
     }
 
-    await ask(rl, "  Press Enter when you have your Instance ID and Token...");
+    await ask(rl, "  Press Enter when you have the Instance ID and API Token...");
 
     let validated = false;
     while (!validated) {
-      const instanceId = await ask(rl, "  Instance ID: ");
-      const apiToken = await ask(rl, "  API Token: ");
+      const instanceId = await ask(rl, "  Instance ID (idInstance): ");
+      const apiToken = await ask(rl, "  API Token (apiTokenInstance): ");
 
       if (!instanceId || !apiToken) {
         console.log("  ⚠ Skipped — set GREEN_API_INSTANCE_ID and GREEN_API_TOKEN in .env later");
         break;
       }
 
-      const s = spin("Validating Green API credentials...");
+      const s = spin("Connecting to WhatsApp...");
       const state = await validateGreenApi(instanceId, apiToken);
-      if (state) {
-        const stateStr = state.stateInstance || "unknown";
-        if (stateStr === "authorized") {
-          s.ok(`Connected! WhatsApp instance is authorized.`);
-        } else {
-          s.ok(`Credentials valid (instance state: ${stateStr}).`);
-          if (stateStr === "notAuthorized") {
-            console.log("  ⚠ Scan the QR code in Green API console to authorize WhatsApp.");
-          }
-        }
-        env.GREEN_API_INSTANCE_ID = instanceId;
-        env.GREEN_API_TOKEN = apiToken;
-        validated = true;
-      } else {
+
+      if (!state) {
         s.fail("Invalid credentials. Check and try again (or press Enter to skip).");
+        continue;
+      }
+
+      env.GREEN_API_INSTANCE_ID = instanceId;
+      env.GREEN_API_TOKEN = apiToken;
+      validated = true;
+
+      const stateStr = state.stateInstance || "unknown";
+
+      if (stateStr === "authorized") {
+        // Fetch phone number automatically
+        const settings = await getGreenApiSettings(instanceId, apiToken);
+        const phone = settings?.wid ? settings.wid.split("@")[0] : null;
+
+        if (phone) {
+          s.ok(`Connected! WhatsApp number: +${phone}`);
+          env.WHATSAPP_ALLOWED_NUMBERS = phone;
+          console.log(`  ✓ Access control set to your number (+${phone})`);
+        } else {
+          s.ok("Connected! WhatsApp instance is authorized.");
+        }
+      } else if (stateStr === "notAuthorized") {
+        s.ok("Credentials valid, but WhatsApp not linked yet.");
+        console.log("\n  ⚠ You still need to scan the QR code:");
+        console.log("    1. Go to the Green API console");
+        console.log("    2. Click your instance → scan QR");
+        console.log("    3. On your phone: WhatsApp → Settings → Linked Devices → Link a Device");
+        console.log("    4. Restart telechat after scanning\n");
+      } else {
+        s.ok(`Credentials valid (status: ${stateStr}).`);
       }
     }
 
-    if (env.GREEN_API_INSTANCE_ID) {
+    // If we didn't auto-detect the phone, ask manually
+    if (env.GREEN_API_INSTANCE_ID && !env.WHATSAPP_ALLOWED_NUMBERS) {
       const waNum = await ask(rl, "  Your WhatsApp number (without +, e.g. 919876543210, blank=allow all): ");
       if (waNum) env.WHATSAPP_ALLOWED_NUMBERS = waNum;
     }
