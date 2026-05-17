@@ -2,45 +2,39 @@
 
 > Claude AI on your phone/desktop — personal, self-hosted messenger bot for Telegram, WhatsApp, and Slack.
 
-## Install
+## Quick Start
+
+One command to install, configure, and start:
 
 ```bash
 npm install -g telechat
-```
-
-Or use directly:
-
-```bash
-npx telechat
-```
-
-## Requirements
-
-- **Python 3.9+** must be installed on your system
-- A `.env` file with your bot tokens (Telegram, WhatsApp, and/or Slack)
-
-The npm package is a thin wrapper that auto-installs the Python package from PyPI on first run.
-
-## Usage
-
-```bash
-# Create a project directory
-mkdir my-telechat && cd my-telechat
-
-# Create .env with your config (see docs for all options)
-cat > .env << 'EOF'
-BOT_MODE=telegram
-TELEGRAM_BOT_TOKEN=your_token_here
-CLAUDE_MODE=cli
-EOF
-
-# Start the bot
 telechat
 ```
 
-## Python users
+The interactive wizard walks you through:
+1. Platform selection (Telegram, WhatsApp, Slack, or any combination)
+2. Token/credential setup with step-by-step instructions
+3. Claude mode selection (CLI with subscription or API with key)
+4. Automatic Python package installation
+5. Bot startup
 
-If you prefer pip:
+## Requirements
+
+- **Node.js 16+** (for the CLI)
+- **Python 3.9+** (auto-detected)
+- **Claude CLI** (optional, for CLI mode — `npm install -g @anthropic-ai/claude-code`)
+
+## Commands
+
+```bash
+telechat              # Start bot (runs setup wizard if first time)
+telechat setup        # Re-run setup wizard
+telechat start        # Start without setup
+telechat --version    # Show version
+telechat --help       # Show help
+```
+
+## Python users
 
 ```bash
 pip install telechat
@@ -49,7 +43,7 @@ telechat
 
 ## Documentation
 
-Full setup guide: https://github.com/telechatai/telechat
+Full docs: https://github.com/telechatai/telechat
 
 ## License
 
