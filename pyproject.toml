@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "telechat"
+version = "1.0.0"
+description = "Claude AI on your phone/desktop — personal, self-hosted messenger bot for Telegram, WhatsApp, and Slack"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.9"
+authors = [{ name = "telechatai" }]
+keywords = ["telechat", "claude", "telegram", "whatsapp", "slack", "chatbot", "ai", "anthropic"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Communications :: Chat",
+]
+dependencies = [
+    "python-telegram-bot>=21.6",
+    "anthropic>=0.99.0",
+    "requests>=2.32.0",
+    "python-dotenv>=1.0.0",
+    "slack-bolt>=1.21.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/telechatai/telechat"
+Repository = "https://github.com/telechatai/telechat"
+Issues = "https://github.com/telechatai/telechat/issues"
+
+[project.scripts]
+telechat = "telechat_pkg.main:cli_entry"
+
+[tool.setuptools.packages.find]
+include = ["telechat_pkg*"]
+
+[tool.setuptools.package-data]
+telechat_pkg = ["scripts/*"]

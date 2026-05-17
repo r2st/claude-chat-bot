@@ -1,0 +1,31 @@
+{
+  "name": "telechat",
+  "version": "1.0.2",
+  "description": "Claude AI on your phone/desktop — personal, self-hosted messenger bot for Telegram, WhatsApp, and Slack",
+  "keywords": [
+    "claude",
+    "telegram",
+    "whatsapp",
+    "slack",
+    "chatbot",
+    "ai",
+    "anthropic"
+  ],
+  "license": "MIT",
+  "author": "telechatai",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/telechatai/telechat"
+  },
+  "bin": {
+    "telechat": "./bin/telechat.js"
+  },
+  "files": [
+    "bin/",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=16"
+  }
+}

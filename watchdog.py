@@ -34,7 +34,7 @@ log = logging.getLogger("watchdog")
 
 # ─── Config ──────────────────────────────────────────────────────────────────
 
-PROJECT_DIR = Path(os.getenv("WATCHDOG_PROJECT_DIR", "/Users/dev/projects/claude-chat-bot"))
+PROJECT_DIR = Path(os.getenv("WATCHDOG_PROJECT_DIR", "/Users/dev/projects/telechat"))
 BOT_LOG = PROJECT_DIR / "bot.log"
 WATCHDOG_LOG = PROJECT_DIR / "watchdog.log"
 WATCHDOG_STATE = PROJECT_DIR / ".watchdog_state.json"

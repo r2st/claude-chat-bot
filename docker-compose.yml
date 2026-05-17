@@ -1,6 +1,6 @@
 services:
-  claude-bot:
+  telechat:
     build: .
-    container_name: claude-telegram-bot
+    container_name: telechat
     env_file: .env
     restart: unless-stopped

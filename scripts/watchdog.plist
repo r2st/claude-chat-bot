@@ -3,14 +3,14 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.claude.watchdog</string>
+    <string>com.telechat.watchdog</string>
     <key>ProgramArguments</key>
     <array>
         <string>/opt/homebrew/bin/python3.11</string>
-        <string>/Users/dev/projects/claude-chat-bot/watchdog.py</string>
+        <string>/Users/dev/projects/telechat/watchdog.py</string>
     </array>
     <key>WorkingDirectory</key>
-    <string>/Users/dev/projects/claude-chat-bot</string>
+    <string>/Users/dev/projects/telechat</string>
     <key>EnvironmentVariables</key>
     <dict>
         <key>WATCHDOG_ENABLED</key>
@@ -24,7 +24,7 @@
         <key>WATCHDOG_CLAUDE_MODEL</key>
         <string>sonnet</string>
         <key>WATCHDOG_BOT_SERVICE</key>
-        <string>com.claude.chat-bot</string>
+        <string>com.telechat.bot</string>
         <key>PATH</key>
         <string>/Users/dev/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     </dict>
@@ -35,6 +35,6 @@
     <key>StandardOutPath</key>
     <string>/dev/null</string>
     <key>StandardErrorPath</key>
-    <string>/Users/dev/projects/claude-chat-bot/watchdog.err</string>
+    <string>/Users/dev/projects/telechat/watchdog.err</string>
 </dict>
 </plist>

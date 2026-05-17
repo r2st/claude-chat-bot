@@ -23,7 +23,7 @@ from telegram.ext import (
     filters,
 )
 
-import claude_core as cc
+from . import claude_core as cc
 
 log = logging.getLogger(__name__)
 

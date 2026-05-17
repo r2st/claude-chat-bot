@@ -1,4 +1,4 @@
-# Claude Messenger Bot
+# Telechat
 
 > **Claude AI on your phone / desktop** — personal, self-hosted, zero-infrastructure.  
 > Supports **WhatsApp**, **Telegram**, and **Slack** simultaneously from a single process.
@@ -8,12 +8,24 @@ A bot that connects to Claude AI via two modes:
 - **CLI mode** — Uses the Claude Code CLI (`claude`). No API key needed if you have a Claude subscription.
 - **API mode** — Uses the Anthropic API directly. Requires an API key. Works in Docker.
 
-## Quick Start
+## Install
+
+```bash
+# npm (auto-installs Python deps on first run)
+npm install -g telechat
+telechat
+
+# pip
+pip install telechat
+telechat
+```
+
+## Quick Start (from source)
 
 ```bash
 # Clone
-git clone https://github.com/r2st/telegram-claude_bot.git
-cd telegram-claude_bot
+git clone https://github.com/telechatai/telechat.git
+cd telechat
 
 # Install
 ./scripts/install.sh
@@ -226,7 +238,7 @@ ANTHROPIC_API_KEY=sk-ant-...
 ```bash
 # Set CLAUDE_MODE=api in .env
 docker compose up -d
-docker logs -f claude-telegram-bot
+docker logs -f telechat
 ```
 
 ---
