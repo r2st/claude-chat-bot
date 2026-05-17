@@ -37,7 +37,7 @@ telechat --help       # Show help
 ## Python users
 
 ```bash
-pip install telechat
+pip install telechatai
 telechat
 ```
 

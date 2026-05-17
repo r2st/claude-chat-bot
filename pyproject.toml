@@ -3,7 +3,7 @@ requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "telechat"
+name = "telechatai"
 version = "1.0.0"
 description = "Claude AI on your phone/desktop — personal, self-hosted messenger bot for Telegram, WhatsApp, and Slack"
 readme = "README.md"

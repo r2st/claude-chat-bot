@@ -5,7 +5,7 @@ const { existsSync, readFileSync, writeFileSync } = require("fs");
 const path = require("path");
 const readline = require("readline");
 
-const PYPI_PACKAGE = "telechat";
+const PYPI_PACKAGE = "telechatai";
 const NPM_VERSION = require("../package.json").version;
 const ENV_FILE = path.join(process.cwd(), ".env");
 
