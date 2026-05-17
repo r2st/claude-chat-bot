@@ -11,13 +11,23 @@ const fs = require("fs");
 const PYPI_PACKAGE = "telechatai";
 const NPM_VERSION = require("../package.json").version;
 
-// ─── Workdir management ─────────────────────────────────────────────────────
-// Persistent config at ~/.telechat/config.json stores the working directory.
-// All commands auto-cd there so users can run `telechat` from anywhere.
+// ─── Data home & working directory ──────────────────────────────────────────
+//
+// DATA HOME (~/.telechat/) — fixed location for all runtime/meta files:
+//   .env, bot.log, bot.err, .telechat.pid, bot.db, config.json
+// Always used, never prompted. Lets you run `telechat` from anywhere.
+//
+// WORKING DIRECTORY (CLAUDE_CLI_WORK_DIR in .env) — the directory Claude CLI
+// can read/write when answering messages. Separate concept; chosen at init.
 
-const CONFIG_DIR = path.join(require("os").homedir(), ".telechat");
-const CONFIG_FILE = path.join(CONFIG_DIR, "config.json");
-const DEFAULT_WORKDIR = path.join(require("os").homedir(), "telechat");
+const DATA_HOME = path.join(require("os").homedir(), ".telechat");
+const CONFIG_FILE = path.join(DATA_HOME, "config.json");
+const ENV_FILE = path.join(DATA_HOME, ".env");
+
+function ensureDataHome() {
+  if (!existsSync(DATA_HOME)) fs.mkdirSync(DATA_HOME, { recursive: true });
+  return DATA_HOME;
+}
 
 function loadConfig() {
   try {
@@ -28,46 +38,21 @@ function loadConfig() {
 }
 
 function saveConfig(config) {
-  if (!existsSync(CONFIG_DIR)) fs.mkdirSync(CONFIG_DIR, { recursive: true });
+  ensureDataHome();
   writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2) + "\n");
 }
 
-function getWorkdir() {
+// The Claude working directory (what Claude CLI can access)
+function getClaudeWorkdir() {
   const config = loadConfig();
-  if (config.workdir && existsSync(config.workdir)) return config.workdir;
-  // Fallback: if cwd has a .env or .telechat.pid, use it (backwards compat)
-  if (existsSync(path.join(process.cwd(), ".env")) || existsSync(path.join(process.cwd(), ".telechat.pid"))) {
-    return process.cwd();
-  }
-  return null;
+  return config.claudeWorkdir || null;
 }
 
-function setWorkdir(dir) {
+function setClaudeWorkdir(dir) {
   const config = loadConfig();
-  config.workdir = dir;
+  config.claudeWorkdir = dir;
   saveConfig(config);
 }
-
-function ensureWorkdir(dir) {
-  if (!existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  return dir;
-}
-
-// Resolve workdir — used by all commands
-function resolveWorkdir() {
-  const wd = getWorkdir();
-  if (wd) {
-    process.chdir(wd);
-    return wd;
-  }
-  return null;
-}
-
-const ENV_FILE = (() => {
-  const wd = getWorkdir();
-  if (wd) return path.join(wd, ".env");
-  return path.join(process.cwd(), ".env");
-})();
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -178,34 +163,27 @@ function setEnvVar(envFile, key, value) {
   writeFileSync(envFile, lines.join("\n"));
 }
 
-async function chooseWorkdir() {
-  const current = getWorkdir();
+// Choose the Claude working directory — the folder Claude CLI can read/write
+// when answering messages. Defaults to the current directory.
+async function chooseClaudeWorkdir() {
+  const current = getClaudeWorkdir();
+  const cwd = process.cwd();
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 
-  console.log(`\n  ── Working Directory ──`);
-  console.log(`  telechat stores .env, logs, and data in a working directory.`);
-  if (current) {
-    console.log(`  Current: ${current}\n`);
-    const keep = await ask(rl, `  Keep this directory? (Enter = keep, or type a new path): `);
-    if (!keep) {
-      rl.close();
-      return current;
-    }
-    const dir = keep.replace(/^~/, require("os").homedir());
-    ensureWorkdir(dir);
-    setWorkdir(dir);
-    rl.close();
-    console.log(`  ✓ Working directory: ${dir}`);
-    return dir;
-  }
+  console.log(`\n  ── Claude Working Directory ──`);
+  console.log(`  The folder Claude can read/write when answering your messages.`);
+  console.log(`  (Config, logs, and .env are stored separately in ${DATA_HOME})\n`);
 
-  console.log(`  Suggested: ${DEFAULT_WORKDIR}\n`);
-  const choice = await ask(rl, `  Working directory (Enter = ${DEFAULT_WORKDIR}): `);
+  const dflt = current || cwd;
+  const choice = await ask(rl, `  Working directory (Enter = ${dflt}, or type a path): `);
   rl.close();
-  const dir = choice ? choice.replace(/^~/, require("os").homedir()) : DEFAULT_WORKDIR;
-  ensureWorkdir(dir);
-  setWorkdir(dir);
-  console.log(`  ✓ Working directory: ${dir}`);
+
+  const dir = choice ? choice.replace(/^~/, require("os").homedir()) : dflt;
+  if (!existsSync(dir)) {
+    try { fs.mkdirSync(dir, { recursive: true }); } catch {}
+  }
+  setClaudeWorkdir(dir);
+  console.log(`  ✓ Claude working directory: ${dir}`);
   return dir;
 }
 
@@ -606,13 +584,9 @@ function checkAndFixIssues() {
 
 // ─── Service management ──────────────────────────────────────────────────────
 
-function _wdPath(file) {
-  const wd = getWorkdir();
-  return path.join(wd || process.cwd(), file);
-}
-const PID_FILE = _wdPath(".telechat.pid");
-const LOG_FILE = _wdPath("bot.log");
-const ERR_FILE = _wdPath("bot.err");
+const PID_FILE = path.join(DATA_HOME, ".telechat.pid");
+const LOG_FILE = path.join(DATA_HOME, "bot.log");
+const ERR_FILE = path.join(DATA_HOME, "bot.err");
 
 function getRunningPid() {
   try {
@@ -650,16 +624,19 @@ function stopService() {
 }
 
 function startService(python, debug) {
-  const cwd = process.cwd();
+  ensureDataHome();
   const out = require("fs").openSync(LOG_FILE, "a");
   const err = require("fs").openSync(ERR_FILE, "a");
   const env = { ...process.env };
   if (debug) env.TELECHAT_DEBUG = "1";
+  // Tell the Python backend where the data home is so it loads the right .env
+  env.TELECHAT_HOME = DATA_HOME;
 
-  const child = spawn(python, ["-m", "telechat_pkg.main"], {
+  // Run from DATA_HOME so bot.log/bot.db/.env all resolve there
+  const child = spawn(python, ["-m", "telechat_pkg.main", "start"], {
     detached: true,
     stdio: ["ignore", out, err],
-    cwd,
+    cwd: DATA_HOME,
     env,
   });
 
@@ -682,20 +659,21 @@ function printTips() {
     telechat logs         Tail the bot log
     telechat env          Show config (tokens masked)
     telechat clean        Remove .env (clear credentials)
-    telechat init         AI-guided setup (recommended)
+    telechat init         Claude-assisted setup (recommended)
     telechat setup        Manual setup wizard
-    telechat workdir      Show/change working directory
+    telechat workdir      Show/set Claude working directory
     telechat update       Update to latest version
 
   Tips:
 
-    • Bot runs in background — closes terminal won't stop it
-    • Edit .env anytime, then: telechat restart
-    • Bot data is stored in bot.db (SQLite)${!hasClaude ? `
+    • Bot runs in background — closing the terminal won't stop it
+    • Config & data live in ~/.telechat/ (.env, logs, bot.db)
+    • Run telechat from any directory — it always finds ~/.telechat
+    • Edit config: telechat env, then telechat restart${!hasClaude ? `
 
   Free Claude access (no API key needed):
     npm i -g @anthropic-ai/claude-code && claude auth login
-    Then: telechat setup → choose CLI mode` : ""}
+    Then: telechat init → choose CLI mode` : ""}
 
   Docs: https://github.com/telechatai/telechat
 `);
@@ -712,19 +690,22 @@ async function main() {
     console.log(`telechat ${NPM_VERSION} — Claude AI messenger bot (Telegram, WhatsApp, Slack)
 
 Usage:
-  telechat [start]       Start bot (shows setup guide if no .env)
+  telechat [start]       Start bot (program-assisted, no Claude needed)
   telechat stop          Stop the bot
   telechat restart       Restart the bot
-  telechat status        Check status, uptime, health, workdir
+  telechat status        Show status, uptime, health, paths
   telechat logs          Tail the bot log
-  telechat env           Show environment variables (tokens masked)
-  telechat clean         Remove .env file (all credentials)
-  telechat init          AI-guided setup (opens browser, validates tokens)
-  telechat setup         Manual setup wizard (no Claude CLI needed)
-  telechat workdir       Show/set working directory
+  telechat env           Show config (tokens masked)
+  telechat clean         Remove .env (clear credentials)
+  telechat init          Claude-assisted setup (opens browser, validates)
+  telechat setup         Manual setup wizard (no Claude needed)
+  telechat workdir       Show/set Claude working directory
   telechat update        Update to latest version
   telechat --debug       Start with verbose logging
   telechat --version     Show version
+
+  Data home: ~/.telechat/  (.env, logs, bot.db, config)
+  Run telechat from any directory.
 
 Docs: https://github.com/telechatai/telechat`);
     process.exit(0);
@@ -735,24 +716,27 @@ Docs: https://github.com/telechatai/telechat`);
     process.exit(0);
   }
 
-  // ── Workdir ──
-  if (cmd === "workdir" || cmd === "dir" || cmd === "home") {
+  // ── Workdir (Claude working directory) ──
+  if (cmd === "workdir" || cmd === "dir") {
     const subcmd = args.find((a) => !a.startsWith("-") && a !== cmd);
     if (subcmd) {
-      // telechat workdir /path/to/dir — set directly
       const dir = subcmd.replace(/^~/, require("os").homedir());
-      ensureWorkdir(dir);
-      setWorkdir(dir);
-      console.log(`  ✓ Working directory set to: ${dir}`);
+      if (!existsSync(dir)) {
+        try { fs.mkdirSync(dir, { recursive: true }); } catch {}
+      }
+      setClaudeWorkdir(dir);
+      // Also update CLAUDE_CLI_WORK_DIR in .env if it exists
+      if (existsSync(ENV_FILE)) setEnvVar(ENV_FILE, "CLAUDE_CLI_WORK_DIR", dir);
+      console.log(`  ✓ Claude working directory set to: ${dir}`);
+      if (getRunningPid()) console.log(`  Run 'telechat restart' to apply.`);
     } else {
-      const wd = getWorkdir();
+      const wd = getClaudeWorkdir();
+      console.log(`  Data home  : ${DATA_HOME}  (.env, logs, db, config)`);
       if (wd) {
-        console.log(`  Working directory: ${wd}`);
-        console.log(`  Change: telechat workdir /new/path`);
+        console.log(`  Claude dir : ${wd}  (what Claude can access)`);
+        console.log(`  Change     : telechat workdir /new/path`);
       } else {
-        console.log(`  No working directory set.`);
-        console.log(`  Set one: telechat workdir ~/telechat`);
-        console.log(`  Or run: telechat init`);
+        console.log(`  Claude dir : not set (run 'telechat init')`);
       }
     }
     process.exit(0);
@@ -835,15 +819,16 @@ Docs: https://github.com/telechatai/telechat`);
       process.exit(1);
     }
 
-    // Choose working directory first
-    const workdir = await chooseWorkdir();
-    process.chdir(workdir);
+    // Data home holds .env/logs/db; ask only for the Claude working directory
+    ensureDataHome();
+    const claudeWorkdir = await chooseClaudeWorkdir();
 
-    const envFile = path.join(workdir, ".env");
+    const envFile = ENV_FILE;
     const existingEnv = existsSync(envFile) ? fs.readFileSync(envFile, "utf8") : null;
 
     const systemPrompt = `You are telechat's setup agent. Configure ${envFile} silently and autonomously.
-Working directory: ${workdir}
+Data home: ${DATA_HOME} (this is where .env, logs, and the database live)
+Claude working directory (CLAUDE_CLI_WORK_DIR): ${claudeWorkdir}
 
 ${existingEnv ? `Current .env:\n${existingEnv}\nPreserve existing values.` : "No .env exists. Create from scratch."}
 
@@ -993,11 +978,11 @@ FLOW:
      - Telegram + WhatsApp → BOT_MODE=telegram,whatsapp
      - All three → BOT_MODE=all
    - Add these defaults if not already present:
-     CLAUDE_CLI_WORK_DIR=/Users/dev
-     CLAUDE_CLI_ADD_DIRS=/Users/dev/projects
+     CLAUDE_CLI_WORK_DIR=${claudeWorkdir}
+     CLAUDE_CLI_ADD_DIRS=${claudeWorkdir}
      CLAUDE_CLI_PERMISSION_MODE=bypassPermissions
      CLAUDE_TIMEOUT=300
-   - Write .env file.
+   - Write .env file to ${envFile} (the data home, NOT the working directory).
    - Print a clean summary:
      "
      ── Setup Complete ──
@@ -1039,24 +1024,27 @@ FLOW:
 
   // ── Status ──
   if (cmd === "status") {
-    const wd = getWorkdir();
     const pid = getRunningPid();
+    const claudeWd = getClaudeWorkdir();
 
     console.log("");
-    console.log(`  Working dir : ${wd || process.cwd()}`);
+    console.log(`  Data home   : ${DATA_HOME}`);
     console.log(`  Status      : ${pid ? `✓ running (PID ${pid})` : "✗ not running"}`);
 
-    if (wd && existsSync(path.join(wd, ".env"))) {
-      const envContent = fs.readFileSync(path.join(wd, ".env"), "utf8");
+    if (existsSync(ENV_FILE)) {
+      const envContent = fs.readFileSync(ENV_FILE, "utf8");
       const platforms = [];
       if (envContent.includes("TELEGRAM_BOT_TOKEN=")) platforms.push("Telegram");
       if (envContent.includes("GREEN_API_INSTANCE_ID=")) platforms.push("WhatsApp");
       if (envContent.includes("SLACK_BOT_TOKEN=")) platforms.push("Slack");
       if (platforms.length) console.log(`  Platforms   : ${platforms.join(", ")}`);
 
-      // Claude mode
       const modeMatch = envContent.match(/CLAUDE_MODE=(\w+)/);
       if (modeMatch) console.log(`  Claude      : ${modeMatch[1]} mode`);
+      const wdMatch = envContent.match(/CLAUDE_CLI_WORK_DIR=(.+)/);
+      if (wdMatch) console.log(`  Claude dir  : ${wdMatch[1].trim()}`);
+    } else if (claudeWd) {
+      console.log(`  Claude dir  : ${claudeWd}`);
     }
 
     if (pid) {
@@ -1161,32 +1149,28 @@ FLOW:
       console.log("  ✓ Python backend installed");
     }
 
-    // Try to resolve workdir
-    const wd = getWorkdir();
-    const envFile = wd ? path.join(wd, ".env") : ENV_FILE;
-    if (wd) process.chdir(wd);
+    ensureDataHome();
+    const envFile = ENV_FILE;
 
     // No .env — guide the user
     if (!existsSync(envFile)) {
-      const wdInfo = wd ? `  Working directory: ${wd}\n` : "";
       console.log(`
-${wdInfo}  No .env configuration found. You need to set up your bot first.
+  Data home: ${DATA_HOME}
 
-  Choose a setup method:
+  No .env configuration found. Set up your bot first:
 
     telechat init     AI-guided setup (recommended)
-                      Claude CLI walks you through each platform,
+                      Claude walks you through each platform,
                       opens the right pages, validates tokens.
                       Requires: npm i -g @anthropic-ai/claude-code
 
     telechat setup    Manual setup wizard
-                      Step-by-step prompts without Claude CLI.
+                      Step-by-step prompts without Claude.
 
   Quick start (Telegram only):
     1. Message @BotFather on Telegram → /newbot → copy token
-    2. Create .env file:${wd ? `\n       cd ${wd}` : ""}
-       echo "TELEGRAM_BOT_TOKEN=your_token_here" > .env
-       echo "CLAUDE_MODE=cli" >> .env
+    2. echo "TELEGRAM_BOT_TOKEN=your_token_here" > ${envFile}
+       echo "CLAUDE_MODE=cli" >> ${envFile}
     3. telechat start
 `);
       process.exit(1);

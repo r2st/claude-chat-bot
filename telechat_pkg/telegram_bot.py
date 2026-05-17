@@ -1712,8 +1712,30 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ─── Upload directory for persistent file storage ─────────────────────────────
 
-UPLOAD_DIR = Path(cc.CLAUDE_WORK_DIR) / "telegram_uploads"
-UPLOAD_DIR.mkdir(exist_ok=True)
+def _resolve_upload_dir() -> Path:
+    """Upload dir under CLAUDE_WORK_DIR, falling back to the data home.
+
+    Handles unconfigured/placeholder paths (e.g. /Users/you) gracefully
+    instead of crashing at import time.
+    """
+    candidates = [
+        Path(cc.CLAUDE_WORK_DIR) / "telegram_uploads",
+        Path(os.path.expanduser("~")) / ".telechat" / "telegram_uploads",
+    ]
+    for d in candidates:
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+            return d
+        except OSError:
+            continue
+    # Last resort: temp dir
+    import tempfile
+    d = Path(tempfile.gettempdir()) / "telechat_uploads"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+UPLOAD_DIR = _resolve_upload_dir()
 
 
 def _upload_path(uid: int, suffix: str, prefix: str = "") -> Path:

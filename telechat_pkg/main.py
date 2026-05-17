@@ -36,12 +36,23 @@ import sys
 _CONFIG_FILE = os.path.join(os.path.expanduser("~"), ".telechat", "config.json")
 
 
+_DATA_HOME = os.path.join(os.path.expanduser("~"), ".telechat")
+
+
 def _resolve_workdir() -> str | None:
-    """Read ~/.telechat/config.json and chdir to the saved workdir."""
+    """Chdir to the data home (~/.telechat) so .env, logs, db resolve there.
+
+    Priority: TELECHAT_HOME env var → ~/.telechat → legacy config.workdir.
+    """
+    home = os.environ.get("TELECHAT_HOME") or _DATA_HOME
+    if os.path.isdir(home):
+        os.chdir(home)
+        return home
+    # Legacy fallback: config.json may carry an old workdir
     try:
         with open(_CONFIG_FILE) as f:
             cfg = json.load(f)
-        wd = cfg.get("workdir")
+        wd = cfg.get("workdir") or cfg.get("claudeWorkdir")
         if wd and os.path.isdir(wd):
             os.chdir(wd)
             return wd
@@ -72,15 +83,20 @@ def _save_workdir(wd: str) -> None:
 # ─── .env helpers ─────────────────────────────────────────────────────────────
 
 def _find_env_file() -> str:
-    """Return path to .env: configured workdir → cwd → package dir."""
+    """Return path to .env. Data home (~/.telechat) is authoritative.
+
+    Order: $TELECHAT_HOME/.env → ~/.telechat/.env → cwd/.env.
+    The editable-install package dir is intentionally NOT used — it would
+    pick up the placeholder .env.example template.
+    """
+    home = os.environ.get("TELECHAT_HOME") or _DATA_HOME
+    home_env = os.path.join(home, ".env")
+    if os.path.isfile(home_env):
+        return home_env
     cwd_env = os.path.join(os.getcwd(), ".env")
     if os.path.isfile(cwd_env):
         return cwd_env
-    pkg_dir = os.path.dirname(os.path.abspath(__file__))
-    proj_env = os.path.join(os.path.dirname(pkg_dir), ".env")
-    if os.path.isfile(proj_env):
-        return proj_env
-    return cwd_env  # default location for creation
+    return home_env  # default creation location = data home
 
 
 def _has_any_platform(env: dict[str, str]) -> bool:
