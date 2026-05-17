@@ -14,6 +14,8 @@ Set BOT_MODE in your .env to one or more platforms (comma-separated):
 Legacy alias: BOT_MODE=both → telegram,whatsapp
 """
 
+from __future__ import annotations
+
 import asyncio
 import logging
 import logging.handlers

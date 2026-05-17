@@ -2,6 +2,7 @@
 Telegram adapter — wraps claude_core for the Telegram Bot API.
 Run via main.py with BOT_MODE=telegram or BOT_MODE=both.
 """
+from __future__ import annotations
 
 import asyncio
 import itertools

@@ -3,6 +3,7 @@ Shared Claude invocation + conversation DB + rate limiting.
 
 Used by both telegram_bot.py and whatsapp_bot.py.
 """
+from __future__ import annotations
 
 import asyncio
 import json
