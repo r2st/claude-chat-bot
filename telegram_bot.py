@@ -5,6 +5,7 @@ Run via main.py with BOT_MODE=telegram or BOT_MODE=both.
 
 import asyncio
 import itertools
+import json
 import logging
 import os
 import re
@@ -575,6 +576,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/permissions — change CLI permission mode\n"
         "/verbose — set verbosity (0/1/2)\n"
         "/usage — show usage stats\n"
+        "/watchdog — self-healing status\n"
         "/mode — show current settings\n"
         "/id — show your Telegram user ID"
     )
@@ -1021,6 +1023,56 @@ async def cmd_usage(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"Output tokens: `{u['output']:,}`",
         parse_mode="Markdown",
     )
+
+
+async def cmd_watchdog(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Show watchdog status and recent auto-fixes."""
+    state_file = Path(cc.CLAUDE_WORK_DIR) / "projects/claude-chat-bot/.watchdog_state.json"
+    if not state_file.exists():
+        state_file = Path(__file__).parent / ".watchdog_state.json"
+    if not state_file.exists():
+        await update.message.reply_text("Watchdog state not found. Is the watchdog service running?")
+        return
+
+    try:
+        data = json.loads(state_file.read_text())
+    except Exception:
+        await update.message.reply_text("Could not read watchdog state.")
+        return
+
+    fixes = data.get("fix_attempts", [])
+    cooldowns = data.get("cooldowns", {})
+    fixes_hour = data.get("fixes_this_hour", [])
+
+    # Recent fixes (last 5)
+    recent = fixes[-5:] if fixes else []
+    lines = ["*🔧 Watchdog Status*\n"]
+
+    now = time.time()
+    active_cooldowns = sum(1 for t in cooldowns.values() if now - t < 1800)
+    hour_count = sum(1 for t in fixes_hour if now - t < 3600)
+    lines.append(f"Fixes this hour: `{hour_count}/3`")
+    lines.append(f"Active cooldowns: `{active_cooldowns}`")
+    lines.append(f"Total fixes: `{len(fixes)}`\n")
+
+    if recent:
+        lines.append("*Recent fixes:*")
+        for f in reversed(recent):
+            age = int(now - f["timestamp"])
+            if age < 60:
+                ago = f"{age}s ago"
+            elif age < 3600:
+                ago = f"{age // 60}m ago"
+            else:
+                ago = f"{age // 3600}h ago"
+
+            status = "✅" if f.get("success") else "↩️" if f.get("reverted") else "❌"
+            desc = f.get("description", "")[:60]
+            lines.append(f"  {status} `{f['fingerprint'][:8]}` — {ago}")
+            if desc:
+                lines.append(f"     _{desc}_")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 async def cmd_model(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1679,6 +1731,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("verbose",     cmd_verbose))
     app.add_handler(CommandHandler("permissions", cmd_permissions))
     app.add_handler(CommandHandler("usage",       cmd_usage))
+    app.add_handler(CommandHandler("watchdog",    cmd_watchdog))
     app.add_handler(CommandHandler("id",          cmd_id))
     app.add_handler(CallbackQueryHandler(handle_callback, pattern=r"^tg:"))
     app.add_handler(MessageHandler(filters.PHOTO,              handle_photo))
