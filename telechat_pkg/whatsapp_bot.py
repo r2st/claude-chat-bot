@@ -142,6 +142,7 @@ HELP_TEXT = """*Claude Bot Commands*
 
 *Stats:*
 !usage — Usage statistics
+!id — Show your WhatsApp number
 
 _Just type normally to chat with Claude._"""
 
@@ -284,6 +285,10 @@ def _handle_command(chat_id: str, sender: str, text: str) -> bool:
             f"Total tokens: {usage['input'] + usage['output']:,}"
         )
         send_message(chat_id, msg)
+
+    elif cmd == "!id":
+        number = sender.split("@")[0]
+        send_message(chat_id, f"📱 Your WhatsApp number: *{number}*\n\nAdd it to WHATSAPP_ALLOWED_NUMBERS in .env to whitelist yourself.")
 
     elif cmd == "!verbose":
         current = _verbose.get(sender, False)
@@ -535,8 +540,12 @@ def _process(notification: dict) -> None:
         return
 
     if not _allowed(sender):
+        number = sender.split("@")[0]
+        if text.strip().lower() == "!id":
+            send_message(chat_id, f"📱 Your WhatsApp number: *{number}*\n\nAdd it to WHATSAPP_ALLOWED_NUMBERS in .env to whitelist yourself.")
+            return
         log.warning("Rejected message from %s", sender)
-        send_message(chat_id, "⛔ Sorry, you're not on the allowed list.")
+        send_message(chat_id, f"⛔ Not on the allowed list.\nYour number: *{number}*\n\nAdd it to WHATSAPP_ALLOWED_NUMBERS in .env")
         return
 
     # Handle commands synchronously (fast, no Claude call)

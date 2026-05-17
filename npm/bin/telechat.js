@@ -157,6 +157,27 @@ function spin(msg) {
 
 async function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
+function setEnvVar(envFile, key, value) {
+  if (!existsSync(envFile)) {
+    writeFileSync(envFile, `${key}=${value}\n`);
+    return;
+  }
+  const lines = fs.readFileSync(envFile, "utf8").split("\n");
+  let found = false;
+  for (let i = 0; i < lines.length; i++) {
+    const trimmed = lines[i].trim();
+    if (trimmed.startsWith("#") || !trimmed.includes("=")) continue;
+    const k = trimmed.split("=")[0].trim();
+    if (k === key) {
+      lines[i] = `${key}=${value}`;
+      found = true;
+      break;
+    }
+  }
+  if (!found) lines.push(`${key}=${value}`);
+  writeFileSync(envFile, lines.join("\n"));
+}
+
 async function chooseWorkdir() {
   const current = getWorkdir();
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
@@ -411,8 +432,10 @@ async function setup() {
 
     // If we didn't auto-detect the phone, ask manually
     if (env.GREEN_API_INSTANCE_ID && !env.WHATSAPP_ALLOWED_NUMBERS) {
-      const waNum = await ask(rl, "  Your WhatsApp number (without +, e.g. 919876543210, blank=allow all): ");
-      if (waNum) env.WHATSAPP_ALLOWED_NUMBERS = waNum;
+      console.log("\n  Who should be allowed to message the bot?");
+      console.log("  Tip: send !id to the bot after starting to discover your number.\n");
+      const waNum = await ask(rl, "  WhatsApp number(s) to allow (without +, comma-sep, blank=allow all): ");
+      if (waNum) env.WHATSAPP_ALLOWED_NUMBERS = waNum.replace(/[\s+\-()]/g, "");
     }
   }
 
@@ -1194,6 +1217,40 @@ ${wdInfo}  No .env configuration found. You need to set up your bot first.
   Run 'telechat init' or 'telechat setup' to configure.
 `);
       process.exit(1);
+    }
+
+    // ── WhatsApp: prompt for allowed numbers if not set ──
+    if (hasWhatsApp && !envVars.WHATSAPP_ALLOWED_NUMBERS) {
+      console.log(`\n  ⚠ WhatsApp access control not configured.`);
+      console.log(`    Without WHATSAPP_ALLOWED_NUMBERS, anyone can message your bot.\n`);
+
+      // Try auto-detect from Green API
+      let autoNumber = null;
+      try {
+        const settings = await getGreenApiSettings(envVars.GREEN_API_INSTANCE_ID, envVars.GREEN_API_TOKEN);
+        if (settings?.wid) autoNumber = settings.wid.split("@")[0];
+      } catch {}
+
+      const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+      let nums = "";
+      if (autoNumber) {
+        nums = await ask(rl, `  Your WhatsApp number: ${autoNumber}\n  Restrict access to this number? (Y/n/other number): `, "y");
+        if (nums.toLowerCase() === "y" || nums === "") nums = autoNumber;
+        else if (nums.toLowerCase() === "n") nums = "";
+      } else {
+        console.log(`  Tip: send !id to the bot to discover your WhatsApp number.\n`);
+        nums = await ask(rl, `  WhatsApp number(s) to allow (without +, comma-sep, enter=allow all): `);
+      }
+      rl.close();
+
+      if (nums) {
+        const clean = nums.replace(/[\s+\-()]/g, "");
+        setEnvVar(envFile, "WHATSAPP_ALLOWED_NUMBERS", clean);
+        envVars.WHATSAPP_ALLOWED_NUMBERS = clean;
+        console.log(`  ✓ WHATSAPP_ALLOWED_NUMBERS=${clean}\n`);
+      } else {
+        console.log(`  → Allowing all numbers (you can change later: telechat init)\n`);
+      }
     }
 
     // Check if already running

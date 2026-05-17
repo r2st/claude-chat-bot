@@ -34,7 +34,7 @@ PLATFORM = "telegram"
 
 # ─── Telegram-specific config ───────────────────────────────────────────────────
 
-TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 
 ALLOWED_USER_IDS: set[int] = set()
 _raw = os.getenv("TELEGRAM_ALLOWED_USER_IDS", "")
@@ -1830,6 +1830,11 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ─── Entry point ─────────────────────────────────────────────────────────────────
 
 def build_app() -> Application:
+    if not TOKEN:
+        raise RuntimeError(
+            "TELEGRAM_BOT_TOKEN is not set. "
+            "Run `telechat` to launch the setup wizard, or set it in your .env file."
+        )
     cc.init_db()
 
     # Initialize health monitoring
