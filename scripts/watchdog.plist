@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.claude.watchdog</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/python3.11</string>
+        <string>/Users/dev/projects/claude-chat-bot/watchdog.py</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/dev/projects/claude-chat-bot</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>WATCHDOG_ENABLED</key>
+        <string>true</string>
+        <key>WATCHDOG_DRY_RUN</key>
+        <string>true</string>
+        <key>WATCHDOG_SCAN_INTERVAL</key>
+        <string>30</string>
+        <key>WATCHDOG_MAX_FIXES_HOUR</key>
+        <string>3</string>
+        <key>WATCHDOG_CLAUDE_MODEL</key>
+        <string>sonnet</string>
+        <key>WATCHDOG_BOT_SERVICE</key>
+        <string>com.claude.chat-bot</string>
+        <key>PATH</key>
+        <string>/Users/dev/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/dev/projects/claude-chat-bot/watchdog.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/dev/projects/claude-chat-bot/watchdog.log</string>
+</dict>
+</plist>
