@@ -1745,7 +1745,7 @@ async def run_telegram():
     app = build_app()
     await app.initialize()
     await app.start()
-    await app.updater.start_polling()
+    await app.updater.start_polling(drop_pending_updates=True)
     log.info("Telegram bot is running.")
     try:
         while True:

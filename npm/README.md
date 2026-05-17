@@ -4,19 +4,18 @@
 
 ## Quick Start
 
-One command to install, configure, and start:
+One command — installs, checks your environment, fixes issues, and runs setup:
 
 ```bash
-npm install -g telechat
-telechat
+npx telechat
 ```
 
-The interactive wizard walks you through:
-1. Platform selection (Telegram, WhatsApp, Slack, or any combination)
-2. Token/credential setup with step-by-step instructions
-3. Claude mode selection (CLI with subscription or API with key)
-4. Automatic Python package installation
-5. Bot startup
+That's it. The wizard handles everything:
+1. Checks Python, installs dependencies, fixes PATH issues
+2. Platform selection (Telegram, WhatsApp, Slack, or any combination)
+3. Token/credential setup with validation
+4. Claude mode selection (CLI = free, API = pay-per-token)
+5. Starts the bot
 
 ## Requirements
 
@@ -27,11 +26,11 @@ The interactive wizard walks you through:
 ## Commands
 
 ```bash
-telechat              # Start bot (runs setup wizard if first time)
+npx telechat          # Install + setup + start (first time)
+telechat              # Start bot (runs setup if no .env)
 telechat setup        # Re-run setup wizard
-telechat start        # Start without setup
-telechat --version    # Show version
-telechat --help       # Show help
+telechat update       # Update to latest version
+telechat --help       # Show all options
 ```
 
 ## Python users

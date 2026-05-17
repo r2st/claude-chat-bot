@@ -4,12 +4,26 @@ Run via main.py with BOT_MODE=whatsapp or BOT_MODE=both.
 
 Each user runs their own instance against their own Green API credentials
 (personal free-tier account, QR-scanned to their WhatsApp number).
+
+Interactive commands (send any of these):
+  !help       — Show available commands
+  !reset      — Clear conversation history
+  !mode       — Show current mode and model
+  !model X    — Switch model (haiku/sonnet/opus)
+  !sessions   — List sessions
+  !new NAME   — Create new session
+  !switch N   — Switch to session N
+  !usage      — Show usage statistics
+  !verbose    — Toggle verbose mode (show tool activity)
 """
 
+import asyncio
+import json
 import logging
 import os
 import threading
 import time
+from pathlib import Path
 from typing import Optional
 
 import requests
@@ -37,9 +51,22 @@ ALLOWED_NUMBERS: list[str] = [
     if n.strip()
 ]
 
-# ─── Per-chat concurrency guards ────────────────────────────────────────────────
+# ─── Per-user state ─────────────────────────────────────────────────────────────
 
 _locks: dict[str, threading.Lock] = {}
+_verbose: dict[str, bool] = {}  # user → verbose mode
+_user_model: dict[str, str] = {}  # user → model override
+_browse_cwd: dict[str, Path] = {}  # user → current browse directory
+_browse_items: dict[str, list[Path]] = {}  # user → last listed items (for !cd N)
+
+BROWSE_ROOT = Path(cc.CLAUDE_WORK_DIR)
+BROWSE_PAGE_SIZE = 15
+
+TOOL_ICONS = {
+    "Read": "📖", "Edit": "✏️", "Write": "📝", "Bash": "💻",
+    "Grep": "🔍", "Glob": "📂", "WebSearch": "🌐", "WebFetch": "🌐",
+    "TodoRead": "📋", "TodoWrite": "📋", "Agent": "🤖",
+}
 
 
 def _lock_for(chat_id: str) -> threading.Lock:
@@ -66,7 +93,12 @@ def receive_notification() -> Optional[dict]:
 
 
 def delete_notification(receipt_id: int) -> None:
-    _api("DELETE", f"deleteNotification/{receipt_id}")
+    url = f"{BASE_URL}/deleteNotification/{API_TOKEN}/{receipt_id}"
+    try:
+        r = requests.request("DELETE", url, timeout=30)
+        r.raise_for_status()
+    except requests.RequestException as exc:
+        log.error("Green API DELETE deleteNotification → %s", exc)
 
 
 def send_message(chat_id: str, text: str) -> None:
@@ -82,39 +114,312 @@ def send_typing(chat_id: str) -> None:
 def _allowed(sender: str) -> bool:
     if not ALLOWED_NUMBERS:
         return True
-    number = sender.split("@")[0]   # "14155552671@c.us" → "14155552671"
+    number = sender.split("@")[0]
     return number in ALLOWED_NUMBERS
 
 
-# ─── Message handling ───────────────────────────────────────────────────────────
+# ─── Command handling ───────────────────────────────────────────────────────────
+
+HELP_TEXT = """*Claude Bot Commands*
+
+*Chat:*
+!reset — Clear conversation history
+!model <name> — Switch model (haiku/sonnet/opus)
+!mode — Show current mode/model
+!verbose — Toggle tool activity messages
+
+*Browse files:*
+!browse — Browse project folders
+!cd <n> — Enter folder #n
+!up — Go to parent folder
+!view <n> — View file #n
+!ask — Ask Claude about current folder
+
+*Sessions:*
+!sessions — List your sessions
+!new <name> — Create new session
+!switch <n> — Switch to session #n
+
+*Stats:*
+!usage — Usage statistics
+
+_Just type normally to chat with Claude._"""
+
+
+def _format_browse(sender: str, directory: Path, page: int = 0) -> str:
+    """Build a text listing of a directory for WhatsApp."""
+    try:
+        entries = sorted(directory.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+    except PermissionError:
+        return "⛔ Permission denied."
+
+    dirs = [e for e in entries if e.is_dir() and not e.name.startswith(".")]
+    files = [e for e in entries if e.is_file() and not e.name.startswith(".")]
+    all_items = dirs + files
+
+    total_pages = max(1, (len(all_items) + BROWSE_PAGE_SIZE - 1) // BROWSE_PAGE_SIZE)
+    page = min(page, total_pages - 1)
+    start = page * BROWSE_PAGE_SIZE
+    page_items = all_items[start:start + BROWSE_PAGE_SIZE]
+
+    # Store items for !cd N / !view N
+    _browse_items[sender] = page_items
+    _browse_cwd[sender] = directory
+
+    try:
+        rel = directory.relative_to(BROWSE_ROOT)
+    except ValueError:
+        rel = directory
+    header = f"📂 *{rel or '.'}/*\n_{len(dirs)} folders, {len(files)} files_"
+    if total_pages > 1:
+        header += f" — page {page + 1}/{total_pages}"
+
+    lines = [header, ""]
+    for i, item in enumerate(page_items, start + 1):
+        if item.is_dir():
+            lines.append(f"  {i}. 📁 {item.name}/")
+        else:
+            size = item.stat().st_size
+            if size < 1024:
+                sz = f"{size}B"
+            elif size < 1024 * 1024:
+                sz = f"{size // 1024}KB"
+            else:
+                sz = f"{size // (1024*1024)}MB"
+            lines.append(f"  {i}. 📄 {item.name} ({sz})")
+
+    lines.append("")
+    nav = []
+    if directory != BROWSE_ROOT:
+        nav.append("!up — parent")
+    if page > 0:
+        nav.append(f"!page {page} — prev")
+    if page < total_pages - 1:
+        nav.append(f"!page {page + 2} — next")
+    nav.append("!cd <n> — enter folder")
+    nav.append("!view <n> — view file")
+    nav.append("!ask — ask Claude")
+    lines.append("_" + " | ".join(nav[:3]) + "_")
+    if len(nav) > 3:
+        lines.append("_" + " | ".join(nav[3:]) + "_")
+
+    return "\n".join(lines)
+
+
+def _handle_command(chat_id: str, sender: str, text: str) -> bool:
+    """Handle ! commands. Returns True if it was a command."""
+    lower = text.lower().strip()
+    if not lower.startswith("!"):
+        return False
+
+    parts = lower.split(None, 1)
+    cmd = parts[0]
+    arg = parts[1] if len(parts) > 1 else ""
+
+    if cmd == "!help":
+        send_message(chat_id, HELP_TEXT)
+
+    elif cmd == "!reset":
+        cc.clear_history(PLATFORM, sender)
+        cc.clear_session(PLATFORM, sender)
+        send_message(chat_id, "🔄 Conversation reset. Starting fresh!")
+
+    elif cmd == "!mode":
+        model = _user_model.get(sender, cc.CLAUDE_MODEL)
+        verbose = "on" if _verbose.get(sender) else "off"
+        sess = cc._session_mgr.get_or_create_active(PLATFORM, sender)
+        msg = (
+            f"*Mode:* {cc.CLAUDE_MODE}\n"
+            f"*Model:* {model}\n"
+            f"*Session:* {sess.name}\n"
+            f"*Verbose:* {verbose}\n"
+            f"*Timeout:* {cc.CLAUDE_TIMEOUT}s"
+        )
+        send_message(chat_id, msg)
+
+    elif cmd == "!model":
+        valid = ("haiku", "sonnet", "opus")
+        if arg not in valid:
+            send_message(chat_id, f"Usage: !model <{'|'.join(valid)}>")
+        else:
+            _user_model[sender] = arg
+            send_message(chat_id, f"✅ Model switched to *{arg}*")
+
+    elif cmd == "!sessions":
+        sessions = cc._session_mgr.get_all(PLATFORM, sender)
+        active_idx = cc._session_mgr.get_active_index(PLATFORM, sender)
+        if not sessions:
+            send_message(chat_id, "No sessions. Send a message to start one.")
+        else:
+            lines = ["*Your sessions:*\n"]
+            for i, s in enumerate(sessions):
+                marker = " 👈" if i == active_idx else ""
+                lines.append(f"{i+1}. {s.name} ({s.age_str()}){marker}")
+            lines.append("\n_!switch <n> to change, !new <name> to create_")
+            send_message(chat_id, "\n".join(lines))
+
+    elif cmd == "!new":
+        name = arg or f"session-{int(time.time()) % 10000}"
+        sess = cc._session_mgr.create(PLATFORM, sender, name)
+        send_message(chat_id, f"✅ Created session *{sess.name}*")
+
+    elif cmd == "!switch":
+        try:
+            idx = int(arg) - 1
+            sess = cc._session_mgr.switch_to(PLATFORM, sender, idx)
+            if sess:
+                send_message(chat_id, f"✅ Switched to *{sess.name}*")
+            else:
+                send_message(chat_id, "❌ Invalid session number. Use !sessions to see the list.")
+        except ValueError:
+            send_message(chat_id, "Usage: !switch <number>")
+
+    elif cmd == "!usage":
+        usage = cc.get_usage(PLATFORM, sender)
+        msg = (
+            f"*Usage Stats*\n\n"
+            f"Messages: {usage['messages']}\n"
+            f"Input tokens: {usage['input']:,}\n"
+            f"Output tokens: {usage['output']:,}\n"
+            f"Total tokens: {usage['input'] + usage['output']:,}"
+        )
+        send_message(chat_id, msg)
+
+    elif cmd == "!verbose":
+        current = _verbose.get(sender, False)
+        _verbose[sender] = not current
+        state = "on" if not current else "off"
+        send_message(chat_id, f"🔧 Verbose mode: *{state}*\n{'Tool activity will be shown.' if not current else 'Quiet mode.'}")
+
+    elif cmd == "!browse":
+        if arg:
+            target = Path(arg).expanduser()
+            if not target.is_absolute():
+                target = BROWSE_ROOT / target
+        else:
+            target = _browse_cwd.get(sender, BROWSE_ROOT)
+        if target.is_dir():
+            send_message(chat_id, _format_browse(sender, target))
+        else:
+            send_message(chat_id, f"❌ Not a directory: {target}")
+
+    elif cmd == "!cd":
+        if not arg:
+            send_message(chat_id, "Usage: !cd <number>")
+        else:
+            try:
+                idx = int(arg) - 1
+                items = _browse_items.get(sender, [])
+                if 0 <= idx < len(items) and items[idx].is_dir():
+                    send_message(chat_id, _format_browse(sender, items[idx]))
+                elif 0 <= idx < len(items):
+                    send_message(chat_id, f"❌ #{arg} is a file, not a folder. Use !view {arg}")
+                else:
+                    send_message(chat_id, f"❌ Invalid number. Use !browse to see the list.")
+            except ValueError:
+                # Treat as path
+                target = Path(arg).expanduser()
+                if not target.is_absolute():
+                    cwd = _browse_cwd.get(sender, BROWSE_ROOT)
+                    target = cwd / arg
+                if target.is_dir():
+                    send_message(chat_id, _format_browse(sender, target))
+                else:
+                    send_message(chat_id, f"❌ Not a directory: {target}")
+
+    elif cmd == "!up":
+        cwd = _browse_cwd.get(sender, BROWSE_ROOT)
+        parent = cwd.parent
+        if parent.is_dir() and str(parent).startswith(str(BROWSE_ROOT.parent)):
+            send_message(chat_id, _format_browse(sender, parent))
+        else:
+            send_message(chat_id, "📂 Already at the top level.")
+
+    elif cmd == "!page":
+        try:
+            page = int(arg) - 1
+            cwd = _browse_cwd.get(sender, BROWSE_ROOT)
+            send_message(chat_id, _format_browse(sender, cwd, page))
+        except ValueError:
+            send_message(chat_id, "Usage: !page <number>")
+
+    elif cmd == "!view":
+        try:
+            idx = int(arg) - 1
+            items = _browse_items.get(sender, [])
+            if 0 <= idx < len(items) and items[idx].is_file():
+                fpath = items[idx]
+                try:
+                    content = fpath.read_text(errors="replace")[:3000]
+                    rel = fpath.relative_to(BROWSE_ROOT) if str(fpath).startswith(str(BROWSE_ROOT)) else fpath
+                    msg = f"📄 *{rel}*\n```\n{content}\n```"
+                    send_message(chat_id, msg)
+                except Exception as e:
+                    send_message(chat_id, f"❌ Cannot read file: {e}")
+            elif 0 <= idx < len(items):
+                send_message(chat_id, f"❌ #{arg} is a folder. Use !cd {arg}")
+            else:
+                send_message(chat_id, "❌ Invalid number. Use !browse to see the list.")
+        except ValueError:
+            send_message(chat_id, "Usage: !view <number>")
+
+    elif cmd == "!ask":
+        cwd = _browse_cwd.get(sender, BROWSE_ROOT)
+        try:
+            rel = cwd.relative_to(BROWSE_ROOT)
+        except ValueError:
+            rel = cwd
+        prompt = f"Describe what's in the folder {cwd} — what is this project/directory about? List the key files and their purposes."
+        # This goes through Claude, so return False to let _handle process it
+        # But we need to inject the prompt. Use a thread directly.
+        threading.Thread(target=_handle, args=(chat_id, sender, prompt), daemon=True).start()
+
+    else:
+        send_message(chat_id, f"Unknown command: {cmd}\nType !help for available commands.")
+
+    return True
+
+
+# ─── Message handling with progress ────────────────────────────────────────────
 
 def _handle(chat_id: str, sender: str, text: str) -> None:
     """Runs in a background thread per chat."""
     lock = _lock_for(chat_id)
     if not lock.acquire(blocking=False):
-        send_message(chat_id, "⏳ Still processing your previous message…")
+        send_message(chat_id, "⏳ Still working on your previous message…")
         return
 
     try:
         if not cc.check_rate_limit(f"wa:{sender}"):
             send_message(
                 chat_id,
-                f"Rate limit: max {cc.RATE_LIMIT_REQUESTS} messages per {cc.RATE_LIMIT_WINDOW}s.",
+                f"⚠️ Rate limit: max {cc.RATE_LIMIT_REQUESTS} messages per {cc.RATE_LIMIT_WINDOW}s.",
             )
             return
 
         send_typing(chat_id)
         log.info("← WA [%s] %s", chat_id, text[:120])
 
+        model = _user_model.get(sender, cc.CLAUDE_MODEL)
+        verbose = _verbose.get(sender, False)
         history = cc.load_history(PLATFORM, sender)
 
-        if cc.CLAUDE_MODE == "api":
-            reply, stats = cc.ask_claude_api(text, history)
-        else:
-            reply, stats = cc.ask_claude_sync(text, history)
+        # Use async path for streaming progress
+        loop = asyncio.new_event_loop()
+        try:
+            reply, stats = loop.run_until_complete(
+                _ask_with_progress(chat_id, sender, text, history, model, verbose)
+            )
+        finally:
+            loop.close()
 
         cc.save_turn(PLATFORM, sender, text, reply)
         cc.track_usage(PLATFORM, sender, stats.get("input_tokens", 0), stats.get("output_tokens", 0))
+
+        # Track tools used
+        tools_used = stats.get("tools_used", [])
+        if tools_used:
+            cc.track_tool_usage(PLATFORM, sender, tools_used)
 
         log.info("→ WA [%s] %s", chat_id, reply[:120])
 
@@ -124,12 +429,78 @@ def _handle(chat_id: str, sender: str, text: str) -> None:
             send_message(chat_id, reply[i : i + chunk])
             if i + chunk < len(reply):
                 time.sleep(0.5)
+
+        # Show stats footer for verbose users
+        if verbose and stats:
+            in_tok = stats.get("input_tokens", 0)
+            out_tok = stats.get("output_tokens", 0)
+            duration = stats.get("duration", 0)
+            footer_parts = []
+            if in_tok or out_tok:
+                footer_parts.append(f"tokens: {in_tok}→{out_tok}")
+            if duration:
+                footer_parts.append(f"time: {duration:.1f}s")
+            if tools_used:
+                footer_parts.append(f"tools: {len(tools_used)}")
+            if footer_parts:
+                send_message(chat_id, f"_📊 {' | '.join(footer_parts)}_")
+
     except Exception as exc:
         log.exception("Error in _handle")
-        send_message(chat_id, f"[Error] {exc}")
+        send_message(chat_id, f"❌ Error: {exc}")
     finally:
         lock.release()
 
+
+async def _ask_with_progress(
+    chat_id: str, sender: str, text: str,
+    history: list[dict], model: str, verbose: bool
+) -> tuple[str, dict]:
+    """Call Claude async with progress updates sent to WhatsApp."""
+    tools_used: list[str] = []
+    last_progress_time = [0.0]
+    start_time = time.time()
+
+    async def on_progress(tool_name: str, detail: str = ""):
+        tools_used.append(tool_name)
+        now = time.time()
+        # Rate-limit progress messages (max 1 every 3 seconds)
+        if verbose and now - last_progress_time[0] >= 3.0:
+            last_progress_time[0] = now
+            icon = TOOL_ICONS.get(tool_name, "⚙️")
+            msg = f"{icon} _{tool_name}_"
+            if detail:
+                msg += f": {detail[:60]}"
+            send_message(chat_id, msg)
+
+    # Send initial thinking indicator
+    elapsed_before_reply = [False]
+
+    async def _send_thinking_after_delay():
+        await asyncio.sleep(5)
+        if not elapsed_before_reply[0]:
+            send_message(chat_id, "🧠 _Thinking…_")
+
+    thinking_task = asyncio.create_task(_send_thinking_after_delay())
+
+    try:
+        reply, stats = await cc.ask_claude_async(
+            text, history,
+            model=model,
+            on_progress=on_progress,
+            platform=PLATFORM,
+            user_id=sender,
+        )
+    finally:
+        elapsed_before_reply[0] = True
+        thinking_task.cancel()
+
+    stats["tools_used"] = tools_used
+    stats["duration"] = time.time() - start_time
+    return reply, stats
+
+
+# ─── Notification processing ───────────────────────────────────────────────────
 
 def _process(notification: dict) -> None:
     receipt_id = notification.get("receiptId")
@@ -140,23 +511,36 @@ def _process(notification: dict) -> None:
         return
 
     msg_data = body.get("messageData", {})
-    if msg_data.get("typeMessage") != "textMessage":
+    msg_type = msg_data.get("typeMessage", "")
+    if msg_type not in ("textMessage", "extendedTextMessage", "quotedMessage"):
         delete_notification(receipt_id)
         return
 
     sender_data = body.get("senderData", {})
     chat_id = sender_data.get("chatId", "")
     sender  = sender_data.get("sender", chat_id)
-    text    = msg_data.get("textMessageData", {}).get("textMessage", "").strip()
 
-    delete_notification(receipt_id)   # ACK before processing → no re-delivery
+    text = ""
+    if msg_type == "textMessage":
+        text = msg_data.get("textMessageData", {}).get("textMessage", "")
+    elif msg_type == "extendedTextMessage":
+        text = msg_data.get("extendedTextMessageData", {}).get("text", "")
+    elif msg_type == "quotedMessage":
+        text = msg_data.get("extendedTextMessageData", {}).get("text", "")
+    text = text.strip()
+
+    delete_notification(receipt_id)
 
     if not text:
         return
 
     if not _allowed(sender):
         log.warning("Rejected message from %s", sender)
-        send_message(chat_id, "Sorry, you're not on the allowed list.")
+        send_message(chat_id, "⛔ Sorry, you're not on the allowed list.")
+        return
+
+    # Handle commands synchronously (fast, no Claude call)
+    if _handle_command(chat_id, sender, text):
         return
 
     threading.Thread(target=_handle, args=(chat_id, sender, text), daemon=True).start()

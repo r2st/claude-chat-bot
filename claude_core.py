@@ -3,6 +3,7 @@ Shared Claude invocation + conversation DB + rate limiting.
 
 Used by both telegram_bot.py and whatsapp_bot.py.
 """
+from __future__ import annotations
 
 import asyncio
 import json
@@ -53,27 +54,28 @@ def _get_conn() -> sqlite3.Connection:
     return _local.conn
 
 
-# ─── Async write queue (non-blocking DB writes) ────────────────────────────────
+# ─── Thread-safe write queue (non-blocking DB writes) ─────────────────────────
 
-_write_queue: asyncio.Queue | None = None
-_write_task: asyncio.Task | None = None
+import queue as _queue_mod
+
+_write_queue: _queue_mod.Queue | None = None
+_writer_thread: threading.Thread | None = None
 
 
-async def _db_writer():
-    """Background task that drains the write queue and batches DB writes."""
+def _db_writer():
+    """Background thread that drains the write queue and batches DB writes."""
     while True:
         ops = []
-        # Wait for first item
-        op = await _write_queue.get()
-        ops.append(op)
-        # Drain any queued items (batch)
+        try:
+            op = _write_queue.get(timeout=1.0)
+            ops.append(op)
+        except _queue_mod.Empty:
+            continue
         while not _write_queue.empty():
             try:
                 ops.append(_write_queue.get_nowait())
-            except asyncio.QueueEmpty:
+            except _queue_mod.Empty:
                 break
-
-        # Execute batch
         try:
             conn = _get_conn()
             for sql, params in ops:
@@ -84,27 +86,23 @@ async def _db_writer():
 
 
 def _ensure_writer():
-    """Start the async DB writer if not already running."""
-    global _write_queue, _write_task
+    """Start the DB writer thread if not already running."""
+    global _write_queue, _writer_thread
     if _write_queue is None:
-        _write_queue = asyncio.Queue(maxsize=1000)
-    if _write_task is None or _write_task.done():
-        try:
-            loop = asyncio.get_running_loop()
-            _write_task = loop.create_task(_db_writer())
-        except RuntimeError:
-            pass
+        _write_queue = _queue_mod.Queue(maxsize=1000)
+    if _writer_thread is None or not _writer_thread.is_alive():
+        _writer_thread = threading.Thread(target=_db_writer, daemon=True)
+        _writer_thread.start()
 
 
 def _enqueue_write(sql: str, params: tuple):
-    """Enqueue a non-blocking DB write. Falls back to sync if no loop."""
+    """Enqueue a non-blocking DB write. Falls back to sync if full."""
     if _write_queue is not None:
         try:
             _write_queue.put_nowait((sql, params))
             return
-        except (asyncio.QueueFull, Exception):
+        except _queue_mod.Full:
             pass
-    # Fallback: sync write
     conn = _get_conn()
     conn.execute(sql, params)
     conn.commit()

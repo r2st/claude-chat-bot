@@ -25,6 +25,8 @@ from telegram.ext import (
 )
 
 from . import claude_core as cc
+from . import feedback as fb
+from . import health
 
 log = logging.getLogger(__name__)
 
@@ -572,6 +574,9 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/switch — switch to another session\n"
         "/browse — browse project folders interactively\n"
         "/reset — clear conversation history\n"
+        "/rate — rate last response (1-5)\n"
+        "/feedback — submit text feedback\n"
+        "/quality — view quality metrics\n"
         "/model — switch Claude model\n"
         "/engine — switch engine (cli/sdk/api)\n"
         "/permissions — change CLI permission mode\n"
@@ -1076,6 +1081,112 @@ async def cmd_watchdog(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
+async def cmd_rate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Rate the last response. Usage: /rate 1-5"""
+    uid = update.effective_user.id
+    if not ctx.args:
+        await update.message.reply_text(
+            "Rate the last response:\n"
+            "`/rate 5` — Excellent\n"
+            "`/rate 4` — Good\n"
+            "`/rate 3` — OK\n"
+            "`/rate 2` — Poor\n"
+            "`/rate 1` — Bad\n\n"
+            "Or use `/feedback <text>` for detailed feedback.",
+            parse_mode="Markdown",
+        )
+        return
+
+    try:
+        rating = int(ctx.args[0])
+        if not 1 <= rating <= 5:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("Rating must be 1-5.")
+        return
+
+    # Get last response for context
+    history = cc.load_history(PLATFORM, str(uid))
+    last_response = ""
+    if history:
+        for msg in reversed(history):
+            if msg["role"] == "assistant":
+                last_response = msg["content"]
+                break
+
+    fb.save_feedback(
+        platform=PLATFORM,
+        user_id=str(uid),
+        rating=rating,
+        response_preview=last_response[:500],
+    )
+
+    # Run quality evaluation on the last exchange
+    if last_response and rating >= 4:
+        fb.append_learning(
+            f"User rated response {rating}/5. Response style was well-received.",
+            source="user_rating",
+            category="quality",
+        )
+
+    emoji = ["", "😟", "😐", "🙂", "👍", "🌟"][rating]
+    stats = fb.get_feedback_stats(PLATFORM, str(uid))
+    await update.message.reply_text(
+        f"{emoji} Rated {rating}/5 — thanks!\n"
+        f"_Your avg: {stats['avg_rating']}/5 across {stats['total_ratings']} ratings_",
+        parse_mode="Markdown",
+    )
+
+
+async def cmd_feedback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Submit text feedback. Usage: /feedback <your feedback>"""
+    uid = update.effective_user.id
+    text = " ".join(ctx.args).strip() if ctx.args else ""
+    if not text:
+        await update.message.reply_text("Usage: `/feedback <your feedback text>`", parse_mode="Markdown")
+        return
+
+    fb.save_feedback(
+        platform=PLATFORM,
+        user_id=str(uid),
+        text_feedback=text,
+    )
+    await update.message.reply_text("📝 Feedback recorded — thank you!")
+
+
+async def cmd_quality(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Show quality metrics and feedback stats."""
+    uid = update.effective_user.id
+    stats = fb.get_feedback_stats(PLATFORM, str(uid))
+    trend = fb.get_quality_trend(PLATFORM, str(uid))
+
+    lines = ["*📊 Quality Metrics*\n"]
+    lines.append(f"Ratings: `{stats['total_ratings']}`")
+    lines.append(f"Average: `{stats['avg_rating']}/5`")
+    lines.append(f"Satisfaction: `{stats['satisfaction_pct']}%`")
+
+    if trend:
+        recent_avg = sum(trend[-10:]) / len(trend[-10:]) if trend else 0
+        lines.append(f"\nRecent quality score: `{recent_avg:.0%}`")
+        # Simple trend indicator
+        if len(trend) >= 5:
+            early = sum(trend[:len(trend)//2]) / (len(trend)//2)
+            late = sum(trend[len(trend)//2:]) / (len(trend) - len(trend)//2)
+            if late > early + 0.05:
+                lines.append("Trend: 📈 Improving")
+            elif late < early - 0.05:
+                lines.append("Trend: 📉 Declining")
+            else:
+                lines.append("Trend: ➡️ Stable")
+
+    # Health status
+    h = health.get_health()
+    lines.append(f"\n*🏥 System Health:* `{h['status']}`")
+    lines.append(f"Uptime: `{h['uptime_seconds'] // 3600}h {(h['uptime_seconds'] % 3600) // 60}m`")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
 async def cmd_model(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if cc.CLAUDE_MODE == "api":
         await update.message.reply_text(f"API mode uses model `{cc.CLAUDE_API_MODEL}`.", parse_mode="Markdown")
@@ -1452,6 +1563,18 @@ async def _run_task(update: Update, ctx: ContextTypes.DEFAULT_TYPE, uid: int, us
         cc.track_tool_usage(PLATFORM, str(uid), stats.get("tools_used", []))
         cc.track_cost(PLATFORM, str(uid), stats.get("input_tokens", 0), stats.get("output_tokens", 0), stats.get("cost_usd", 0))
 
+        # Auto quality evaluation (non-blocking)
+        try:
+            scores = fb.evaluate_response(user_text, reply, stats)
+            fb.save_quality_score(PLATFORM, str(uid), "composite", scores["composite"], reply[:200])
+            # Report health based on quality
+            if scores["composite"] >= 0.6:
+                health.report_healthy("claude_quality")
+            else:
+                health.report_unhealthy("claude_quality", f"Low quality score: {scores['composite']}")
+        except Exception:
+            pass
+
         # Build header with completion stats
         v = _verbose(uid)
         if is_timeout:
@@ -1709,6 +1832,12 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 def build_app() -> Application:
     cc.init_db()
 
+    # Initialize health monitoring
+    health.register_component("telegram")
+    health.register_component("claude_quality")
+    health.register_component("database", check_fn=lambda: cc._get_conn().execute("SELECT 1").fetchone() is not None)
+    health.start_health_server()
+
     import ssl
     from telegram.request import HTTPXRequest
     req = HTTPXRequest(
@@ -1733,6 +1862,9 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("permissions", cmd_permissions))
     app.add_handler(CommandHandler("usage",       cmd_usage))
     app.add_handler(CommandHandler("watchdog",    cmd_watchdog))
+    app.add_handler(CommandHandler("rate",        cmd_rate))
+    app.add_handler(CommandHandler("feedback",    cmd_feedback))
+    app.add_handler(CommandHandler("quality",     cmd_quality))
     app.add_handler(CommandHandler("id",          cmd_id))
     app.add_handler(CallbackQueryHandler(handle_callback, pattern=r"^tg:"))
     app.add_handler(MessageHandler(filters.PHOTO,              handle_photo))
@@ -1746,7 +1878,9 @@ async def run_telegram():
     app = build_app()
     await app.initialize()
     await app.start()
-    await app.updater.start_polling()
+    await app.updater.start_polling(drop_pending_updates=True)
+    health.report_healthy("telegram")
+    health.watchdog.start()
     log.info("Telegram bot is running.")
     try:
         while True:

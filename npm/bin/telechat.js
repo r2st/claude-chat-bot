@@ -416,48 +416,544 @@ function installPyPkg(python) {
   }
 }
 
+// ─── Health checks ───────────────────────────────────────────────────────────
+
+function checkAndFixIssues() {
+  console.log(`
+┌─────────────────────────────────────────────────┐
+│       telechat ${NPM_VERSION} — checking environment…       │
+└─────────────────────────────────────────────────┘
+`);
+
+  let issues = 0;
+
+  // 1. Python check
+  const python = findPython();
+  if (!python) {
+    console.log("  ✗ Python 3.9+ not found");
+    console.log("    Fix: install from https://python.org/downloads\n");
+    process.exit(1);
+  }
+  const pyVer = execSync(`${python} --version`, { encoding: "utf8" }).trim();
+  console.log(`  ✓ ${pyVer}`);
+
+  // 2. Install/update Python package
+  if (!isPyPkgInstalled(python)) {
+    const s = spin("Installing Python backend...");
+    if (installPyPkg(python)) {
+      s.ok("Python backend installed");
+    } else {
+      s.fail("Could not install Python backend");
+      console.log(`    Fix: ${python} -m pip install ${PYPI_PACKAGE}\n`);
+      issues++;
+    }
+  } else {
+    // Silently upgrade
+    try {
+      execSync(`${python} -m pip install --upgrade ${PYPI_PACKAGE}`, { stdio: "ignore" });
+    } catch {}
+    console.log("  ✓ Python backend up to date");
+  }
+
+  // 3. Check if telechat is globally accessible
+  try {
+    execSync("telechat --version", { stdio: "ignore" });
+    console.log("  ✓ telechat command available globally");
+  } catch {
+    // Not in PATH — fix it
+    console.log("  ⚠ telechat not in PATH — installing globally...");
+    try {
+      execSync("npm install -g telechat", { stdio: "ignore" });
+      console.log("  ✓ Fixed: telechat installed globally");
+    } catch {
+      // Try to fix npm prefix to match current node
+      const nodeBin = path.dirname(process.execPath);
+      try {
+        execSync(`npm config set prefix "${path.dirname(nodeBin)}"`, { stdio: "ignore" });
+        execSync("npm install -g telechat", { stdio: "ignore" });
+        console.log("  ✓ Fixed: npm prefix corrected, telechat installed");
+      } catch {
+        console.log("  ⚠ Could not auto-fix. After setup, run:");
+        console.log(`    export PATH="${nodeBin}:$PATH"`);
+        issues++;
+      }
+    }
+  }
+
+  // 4. Claude CLI check
+  if (claudeCliInstalled()) {
+    console.log("  ✓ Claude CLI available");
+  } else {
+    console.log("  ℹ Claude CLI not found (optional — needed for free CLI mode)");
+  }
+
+  console.log("");
+  return { python, issues };
+}
+
+// ─── Service management ──────────────────────────────────────────────────────
+
+const PID_FILE = path.join(process.cwd(), ".telechat.pid");
+const LOG_FILE = path.join(process.cwd(), "bot.log");
+const ERR_FILE = path.join(process.cwd(), "bot.err");
+
+function getRunningPid() {
+  try {
+    const pid = parseInt(require("fs").readFileSync(PID_FILE, "utf8").trim(), 10);
+    // Check if process is actually running
+    process.kill(pid, 0);
+    return pid;
+  } catch {
+    // Clean up stale pid file
+    try { require("fs").unlinkSync(PID_FILE); } catch {}
+    return null;
+  }
+}
+
+function stopService() {
+  const pid = getRunningPid();
+  if (!pid) {
+    console.log("  telechat is not running.");
+    return false;
+  }
+  try {
+    process.kill(pid, "SIGTERM");
+    // Wait briefly for it to die
+    for (let i = 0; i < 10; i++) {
+      try { process.kill(pid, 0); } catch { break; }
+      execSync("sleep 0.3", { stdio: "ignore" });
+    }
+    try { require("fs").unlinkSync(PID_FILE); } catch {}
+    console.log(`  ✓ telechat stopped (PID ${pid})`);
+    return true;
+  } catch {
+    console.log(`  ✗ Failed to stop PID ${pid}`);
+    return false;
+  }
+}
+
+function startService(python, debug) {
+  const cwd = process.cwd();
+  const out = require("fs").openSync(LOG_FILE, "a");
+  const err = require("fs").openSync(ERR_FILE, "a");
+  const env = { ...process.env };
+  if (debug) env.TELECHAT_DEBUG = "1";
+
+  const child = spawn(python, ["-m", "telechat_pkg.main"], {
+    detached: true,
+    stdio: ["ignore", out, err],
+    cwd,
+    env,
+  });
+
+  child.unref();
+  writeFileSync(PID_FILE, String(child.pid));
+  return child.pid;
+}
+
+// ─── Tips ────────────────────────────────────────────────────────────────────
+
+function printTips() {
+  const hasClaude = claudeCliInstalled();
+  console.log(`
+  Commands:
+
+    telechat              Start bot as background service
+    telechat stop         Stop the bot
+    telechat restart      Restart the bot
+    telechat status       Check if bot is running
+    telechat logs         Tail the bot log
+    telechat env           Show environment variables
+    telechat env clean     Remove .env (clear credentials)
+    telechat init         AI-guided setup (Claude CLI)
+    telechat setup        Manual setup wizard
+    telechat update       Update to latest version
+
+  Tips:
+
+    • Bot runs in background — closes terminal won't stop it
+    • Edit .env anytime, then: telechat restart
+    • Bot data is stored in bot.db (SQLite)${!hasClaude ? `
+
+  Free Claude access (no API key needed):
+    npm i -g @anthropic-ai/claude-code && claude auth login
+    Then: telechat setup → choose CLI mode` : ""}
+
+  Docs: https://github.com/telechatai/telechat
+`);
+}
+
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 async function main() {
   const args = process.argv.slice(2);
-  const cmd = args[0];
+  const debug = args.includes("--debug") || args.includes("-d");
+  const cmd = args.find((a) => !a.startsWith("-"));
 
-  if (cmd === "--help" || cmd === "-h") {
+  if (args.includes("--help") || args.includes("-h")) {
     console.log(`telechat ${NPM_VERSION} — Claude AI messenger bot (Telegram, WhatsApp, Slack)
 
 Usage:
-  telechat              Start the bot (runs setup wizard if no .env found)
-  telechat setup        Interactive setup wizard
-  telechat start        Start the bot (skip setup)
-  telechat --version    Show version
+  telechat               Start bot as background service
+  telechat stop          Stop the bot
+  telechat restart       Restart the bot
+  telechat status        Check if running
+  telechat logs          Tail the bot log
+  telechat env           Show environment variables
+  telechat env clean     Remove .env file (all credentials)
+  telechat init          AI-guided setup (uses Claude CLI)
+  telechat setup         Manual setup wizard
+  telechat update        Update to latest version
+  telechat --debug       Start with verbose logging
+  telechat --version     Show version
 
 Docs: https://github.com/telechatai/telechat`);
     process.exit(0);
   }
 
-  if (cmd === "--version" || cmd === "-v") {
+  if (args.includes("--version") || args.includes("-v")) {
     console.log(`telechat ${NPM_VERSION}`);
     process.exit(0);
   }
 
+  // ── Env / Clean ──
+  if (cmd === "clean" || cmd === "clear" || cmd === "reset") {
+    // Top-level alias: telechat clean → telechat env clean
+    if (!existsSync(ENV_FILE)) {
+      console.log("  No .env file found — nothing to clean.");
+      process.exit(0);
+    }
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    const confirm = await ask(rl, "  Delete .env file? This removes all credentials. (y/N): ");
+    rl.close();
+    if (confirm.toLowerCase() === "y") {
+      require("fs").unlinkSync(ENV_FILE);
+      console.log("  ✓ .env deleted. Run 'telechat setup' to reconfigure.");
+      if (getRunningPid()) {
+        console.log("  ⚠ Bot is still running with old config. Run 'telechat stop' to stop it.");
+      }
+    } else {
+      console.log("  Cancelled.");
+    }
+    process.exit(0);
+  }
+
+  if (cmd === "env") {
+    const subcmd = args.find((a) => !a.startsWith("-") && a !== "env");
+    if (subcmd === "clean" || subcmd === "clear" || subcmd === "reset") {
+      if (!existsSync(ENV_FILE)) {
+        console.log("  No .env file found — nothing to clean.");
+        process.exit(0);
+      }
+      const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+      const confirm = await ask(rl, "  Delete .env file? This removes all credentials. (y/N): ");
+      rl.close();
+      if (confirm.toLowerCase() === "y") {
+        require("fs").unlinkSync(ENV_FILE);
+        console.log("  ✓ .env deleted. Run 'telechat setup' to reconfigure.");
+        if (getRunningPid()) {
+          console.log("  ⚠ Bot is still running with old config. Run 'telechat stop' to stop it.");
+        }
+      } else {
+        console.log("  Cancelled.");
+      }
+      process.exit(0);
+    }
+    // Default: show env
+    if (!existsSync(ENV_FILE)) {
+      console.log("  No .env file found. Run 'telechat setup' to create one.");
+      process.exit(0);
+    }
+    const content = require("fs").readFileSync(ENV_FILE, "utf8");
+    console.log("\n  .env contents:\n");
+    for (const line of content.split("\n")) {
+      if (!line.trim() || line.startsWith("#")) {
+        if (line.trim()) console.log(`  ${line}`);
+        continue;
+      }
+      const eq = line.indexOf("=");
+      if (eq === -1) { console.log(`  ${line}`); continue; }
+      const key = line.slice(0, eq);
+      const val = line.slice(eq + 1);
+      // Mask sensitive values
+      const sensitive = /TOKEN|KEY|SECRET|PASSWORD/i.test(key);
+      const display = sensitive && val.length > 8
+        ? val.slice(0, 4) + "…" + val.slice(-4)
+        : val;
+      console.log(`  ${key}=${display}`);
+    }
+    console.log("");
+    process.exit(0);
+  }
+
+  // ── Init (Claude-guided setup) ──
+  if (cmd === "init") {
+    if (!claudeCliInstalled()) {
+      console.error("  ✗ Claude CLI required. Install: npm i -g @anthropic-ai/claude-code && claude auth login");
+      process.exit(1);
+    }
+
+    const fs = require("fs");
+    const existingEnv = existsSync(ENV_FILE) ? fs.readFileSync(ENV_FILE, "utf8") : null;
+
+    const systemPrompt = `You are telechat's setup agent. Configure ${ENV_FILE} silently and autonomously.
+
+${existingEnv ? `Current .env:\n${existingEnv}\nPreserve existing values.` : "No .env exists. Create from scratch."}
+
+BEHAVIOR:
+- Output ONLY when you need user input or to confirm success.
+- Go through ALL platforms: Telegram → WhatsApp → Slack. User says "skip" to skip one.
+- Validate every token/credential via curl before saving.
+- Use Bash tool to run "open <url>" to open URLs in the user's default browser.
+- Use Bash tool with curl to validate tokens/credentials.
+- Read and write files directly with your tools.
+- IMPORTANT: If a platform is ALREADY configured in .env (token exists), validate it silently with curl first. If valid, print "✓ [Platform] already configured: @username / +number / team-name. Keep it? (yes/reconfigure)" and WAIT for user response. If user says yes/Enter, skip to the next platform. If user says reconfigure, proceed with full setup. Do NOT open any URLs or run setup steps for already-configured platforms unless the user says reconfigure.
+- NEVER open URLs or run bash commands without telling the user what you're doing first.
+- Between platforms, print a short separator like "── WhatsApp ──" to keep things organized.
+
+FLOW:
+
+1. TELEGRAM
+   First check: if TELEGRAM_BOT_TOKEN exists in .env, validate it with curl. If valid, print:
+   "── Telegram ──
+    ✓ Already configured: @bot_username (Bot Name)
+    Keep current config? (Enter = keep, 'reconfigure' = set up fresh)"
+   Wait for response. If Enter/yes/keep, skip to WhatsApp. If reconfigure, continue below.
+
+   If NOT configured or user wants to reconfigure:
+   Print: "── Telegram ──"
+
+   Step A — Login:
+   - Telegram Web is already open (Node opened it before you started).
+   - Print these exact instructions:
+     "Telegram Web is open in your browser. To log in:
+      1. Open Telegram on your phone
+      2. Go to Settings → Devices → Link Desktop Device
+      3. Point your phone camera at the QR code on screen
+      Once logged in, type 'done' here."
+   - Wait for user to type done/ok/yes.
+
+   Step B — Create bot:
+   - Run bash: open "https://web.telegram.org/k/#@BotFather"
+   - Print exactly:
+     "BotFather opened in Telegram Web.
+      1. Type /newbot and send it
+      2. Enter a display name for your bot (e.g. 'My Claude Bot')
+      3. Enter a username ending in 'bot' (e.g. 'my_claude_bot')
+      4. BotFather will reply with a token like: 123456789:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw
+      5. Copy the FULL token and paste it here:"
+   - Wait for user to paste token.
+   - Validate: curl -s "https://api.telegram.org/bot<TOKEN>/getMe"
+   - If invalid, say "✗ Invalid token. Make sure you copied the full token from BotFather (including the colon). Try again:" and re-ask.
+   - If valid, print: "✓ Bot verified: @username" and save TELEGRAM_BOT_TOKEN.
+
+   Step C — Get user ID:
+   - Run bash: open "https://web.telegram.org/k/#@userinfobot"
+   - Print exactly:
+     "userinfobot opened in Telegram Web.
+      1. Send any message to it (e.g. 'hi')
+      2. It will reply with your info including 'Id: 123456789'
+      3. Copy ONLY the numeric ID and paste it here
+      (or press Enter to allow all users to use the bot):"
+   - Save TELEGRAM_ALLOWED_USER_IDS.
+
+2. WHATSAPP
+   First check: if GREEN_API_INSTANCE_ID and GREEN_API_TOKEN exist in .env, validate with curl. If valid, print:
+   "── WhatsApp ──
+    ✓ Already configured: instance <id>, status: <stateInstance>
+    Keep current config? (Enter = keep, 'reconfigure' = set up fresh)"
+   Wait for response. If Enter/yes/keep, skip to Slack. If reconfigure, continue below.
+
+   If NOT configured or user wants to reconfigure:
+   Print: "── WhatsApp ──"
+   - Run bash: open "https://console.green-api.com"
+   - Print exactly:
+     "Green API console opened.
+      1. Sign up with Google/GitHub/email (free Developer plan)
+      2. After login you'll see your instance dashboard
+      3. Find idInstance (a number like 7107621928) — shown at the top of your instance
+      4. Find apiTokenInstance (a long hex string) — shown below the idInstance
+      5. To link your WhatsApp phone:
+         • Click your instance → look for the QR code section
+         • On your phone: open WhatsApp → Settings → Linked Devices → Link a Device
+         • Scan the QR code with your phone camera
+      Paste your idInstance (or type 'skip'):"
+   - Then ask: "Paste your apiTokenInstance:"
+   - Validate: curl -s "https://api.green-api.com/waInstance{id}/getStateInstance/{token}"
+   - If invalid, say "✗ Invalid credentials. Double-check both values from the Green API dashboard. Try again." and re-ask both.
+   - Save GREEN_API_INSTANCE_ID, GREEN_API_TOKEN.
+   - Try to get phone: curl -s "https://api.green-api.com/waInstance{id}/getSettings/{token}" and extract wid field (format: "14155953988@c.us" → extract number before @).
+   - If got phone, save WHATSAPP_ALLOWED_NUMBERS and print "✓ WhatsApp linked to +<number>". Otherwise ask: "Enter your WhatsApp number without + (e.g. 919876543210), or press Enter to allow all:"
+
+3. SLACK
+   First check: if SLACK_BOT_TOKEN exists in .env, validate with curl (auth.test). If valid, print:
+   "── Slack ──
+    ✓ Already configured: team <team>, bot user <user>
+    Keep current config? (Enter = keep, 'reconfigure' = set up fresh)"
+   Wait for response. If Enter/yes/keep, skip to Finalize. If reconfigure, continue below.
+
+   If NOT configured or user wants to reconfigure:
+   Print: "── Slack ──"
+   - Run bash: open "https://api.slack.com/apps"
+   - Print exactly:
+     "Slack API console opened. Follow these steps:
+
+      Step 1 — Create App:
+      • Click 'Create New App' → 'From scratch'
+      • Enter a name (e.g. 'TeleChat') and select your workspace
+
+      Step 2 — Enable Socket Mode:
+      • Left sidebar → 'Socket Mode' → toggle ON
+      • Create an App-Level Token: name it 'telechat', add scope 'connections:write'
+      • Copy the token (starts with xapp-...) — you'll need this
+
+      Step 3 — Bot Permissions:
+      • Left sidebar → 'OAuth & Permissions'
+      • Scroll to 'Scopes' → 'Bot Token Scopes' → add these:
+        chat:write, channels:history, im:history, im:write, app_mentions:read, reactions:write
+
+      Step 4 — Event Subscriptions:
+      • Left sidebar → 'Event Subscriptions' → toggle ON
+      • Under 'Subscribe to bot events' add: message.im, message.channels, app_mention
+
+      Step 5 — Install:
+      • Left sidebar → 'Install App' → 'Install to Workspace' → Allow
+
+      Step 6 — Copy Bot Token:
+      • After install, go to 'OAuth & Permissions'
+      • Copy 'Bot User OAuth Token' (starts with xoxb-...)
+      • ⚠ NOT the 'User OAuth Token' — that one starts with xoxp- and won't work
+
+      Paste your Bot Token (xoxb-...) or type 'skip':"
+   - If user pastes a token NOT starting with xoxb-, say: "✗ That's not a bot token. Go to OAuth & Permissions → copy 'Bot User OAuth Token' (starts with xoxb-...). The 'User OAuth Token' (xoxp-/xoxe-) won't work. Try again:"
+   - Validate: curl -s -H "Authorization: Bearer xoxb-..." "https://slack.com/api/auth.test"
+   - If valid, print "✓ Slack bot verified: team <team>, user <bot_user>"
+   - Then ask: "Paste your App-Level Token (xapp-...):"
+   - Save SLACK_BOT_TOKEN, SLACK_APP_TOKEN.
+   - Ask: "Paste your Slack member ID to restrict access (find it: click your profile pic → 'Profile' → ⋮ → 'Copy member ID'), or press Enter to allow all:"
+   - Save SLACK_ALLOWED_USER_IDS.
+
+4. FINALIZE
+   Print: "── Finalize ──"
+   - Set CLAUDE_MODE=cli (default, since Claude CLI is available).
+   - Set BOT_MODE based on which platforms were configured (skip empty ones).
+   - Add defaults: CLAUDE_CLI_WORK_DIR=/Users/dev, CLAUDE_CLI_ADD_DIRS=/Users/dev/projects, CLAUDE_CLI_PERMISSION_MODE=bypassPermissions, CLAUDE_TIMEOUT=300
+   - Write .env file.
+   - Print a clean summary:
+     "
+     ── Setup Complete ──
+     Telegram : ✓ @bot_username (or ✗ skipped)
+     WhatsApp : ✓ +14155953988 (or ✗ skipped)
+     Slack    : ✓ team-name (or ✗ skipped)
+     Claude   : CLI mode
+
+     Run 'telechat start' to launch your bot."`;
+
+    // Only open Telegram Web if not already configured
+    if (!existingEnv || !existingEnv.includes("TELEGRAM_BOT_TOKEN=")) {
+      openUrl("https://web.telegram.org/k/");
+    }
+
+    const child = spawn("claude", [
+      "--system-prompt", systemPrompt,
+      "--verbose", "0",
+      existingEnv
+        ? "Check existing config. For each platform with valid credentials, ask the user if they want to keep or reconfigure. For unconfigured platforms, run the full setup."
+        : "Start Telegram setup. Telegram Web is already open in the browser for QR code login. Print the login instructions and wait for the user to confirm.",
+    ], {
+      stdio: "inherit",
+      cwd: process.cwd(),
+    });
+
+    child.on("exit", (code) => process.exit(code || 0));
+    return;
+  }
+
+  // ── Stop ──
+  if (cmd === "stop") {
+    stopService();
+    process.exit(0);
+  }
+
+  // ── Status ──
+  if (cmd === "status") {
+    const pid = getRunningPid();
+    if (pid) {
+      console.log(`  ✓ telechat is running (PID ${pid})`);
+    } else {
+      console.log("  ✗ telechat is not running");
+    }
+    process.exit(0);
+  }
+
+  // ── Logs ──
+  if (cmd === "logs") {
+    if (!existsSync(LOG_FILE)) {
+      console.log("  No log file found. Start the bot first.");
+      process.exit(1);
+    }
+    const tail = spawn("tail", ["-f", LOG_FILE], { stdio: "inherit" });
+    tail.on("exit", (code) => process.exit(code || 0));
+    return;
+  }
+
+  // ── Restart ──
+  if (cmd === "restart") {
+    const python = findPython();
+    if (!python) {
+      console.error("Error: Python 3.9+ required.");
+      process.exit(1);
+    }
+    stopService();
+    await sleep(1000);
+    if (!existsSync(ENV_FILE)) {
+      console.error("  No .env found. Run: telechat setup");
+      process.exit(1);
+    }
+    const pid = startService(python, debug);
+    console.log(`  ✓ telechat restarted (PID ${pid})`);
+    console.log(`    Logs: telechat logs`);
+    process.exit(0);
+  }
+
+  // ── Update ──
+  if (cmd === "update") {
+    const python = findPython();
+    if (!python) {
+      console.error("Error: Python 3.9+ required.");
+      process.exit(1);
+    }
+    console.log("  Updating telechat...");
+    if (!installPyPkg(python)) process.exit(1);
+    console.log("  ✓ Updated to latest version.");
+    // Restart if running
+    if (getRunningPid()) {
+      stopService();
+      await sleep(1000);
+      const pid = startService(python, debug);
+      console.log(`  ✓ Restarted with new version (PID ${pid})`);
+    }
+    process.exit(0);
+  }
+
+  // ── First run or explicit setup ──
+  if (cmd === "setup" || (!cmd && !existsSync(ENV_FILE))) {
+    const { python } = checkAndFixIssues();
+    await setup();
+    printTips();
+    if (cmd === "setup") process.exit(0);
+    // After first-time setup, start as service
+    const pid = startService(python, debug);
+    console.log(`  ✓ telechat started (PID ${pid})`);
+    console.log(`    Logs: telechat logs`);
+    process.exit(0);
+  }
+
+  // ── Normal start (as background service) ──
   const python = findPython();
   if (!python) {
-    console.error("Error: Python 3.9+ is required.\nInstall from https://python.org");
+    console.error("Error: Python 3.9+ required.\nInstall from https://python.org");
     process.exit(1);
-  }
-
-  if (cmd === "setup" || (!cmd && !existsSync(ENV_FILE))) {
-    await setup();
-    if (!isPyPkgInstalled(python)) {
-      if (!installPyPkg(python)) process.exit(1);
-    }
-    console.log("\n✓ Ready! Starting telechat...\n");
-  }
-
-  if (cmd === "--install") {
-    if (!installPyPkg(python)) process.exit(1);
-    console.log("Done.");
-    process.exit(0);
   }
 
   if (!isPyPkgInstalled(python)) {
@@ -465,20 +961,28 @@ Docs: https://github.com/telechatai/telechat`);
   }
 
   if (!existsSync(ENV_FILE)) {
-    console.error("No .env file found. Run: telechat setup");
+    console.error("No .env found. Run: telechat setup");
     process.exit(1);
   }
 
-  const child = spawn(python, ["-m", "telechat_pkg.main"], {
-    stdio: "inherit",
-    cwd: process.cwd(),
-  });
+  // Check if already running
+  const existingPid = getRunningPid();
+  if (existingPid) {
+    console.log(`  telechat is already running (PID ${existingPid})`);
+    console.log(`  Use 'telechat restart' to restart, or 'telechat logs' to view output.`);
+    process.exit(0);
+  }
 
-  child.on("exit", (code) => process.exit(code || 0));
-  child.on("error", (err) => {
-    console.error("Failed to start:", err.message);
-    process.exit(1);
-  });
+  // Stop any orphan processes
+  try {
+    execSync("pkill -f 'telechat_pkg.main'", { stdio: "ignore" });
+    await sleep(1000);
+  } catch {}
+
+  const pid = startService(python, debug);
+  console.log(`  ✓ telechat started (PID ${pid})`);
+  console.log(`    Logs: telechat logs`);
+  process.exit(0);
 }
 
 main();
