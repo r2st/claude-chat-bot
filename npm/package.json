@@ -1,6 +1,6 @@
 {
   "name": "telechat",
-  "version": "1.0.14",
+  "version": "1.0.16",
   "description": "Claude AI on your phone/desktop — personal, self-hosted messenger bot for Telegram, WhatsApp, and Slack",
   "keywords": [
     "claude",
