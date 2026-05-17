@@ -17,6 +17,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import logging.handlers
 import os
 import re
 import subprocess
@@ -573,7 +574,12 @@ def main():
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
-        handlers=[logging.StreamHandler()],
+        handlers=[
+            logging.StreamHandler(),
+            logging.handlers.RotatingFileHandler(
+                "watchdog.log", maxBytes=5_000_000, backupCount=3
+            ),
+        ],
     )
 
     if not ENABLED:

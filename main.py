@@ -16,6 +16,7 @@ Legacy alias: BOT_MODE=both → telegram,whatsapp
 
 import asyncio
 import logging
+import logging.handlers
 import os
 import threading
 
@@ -28,7 +29,9 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler("bot.log"),
+        logging.handlers.RotatingFileHandler(
+            "bot.log", maxBytes=5_000_000, backupCount=3
+        ),
     ],
 )
 log = logging.getLogger(__name__)
