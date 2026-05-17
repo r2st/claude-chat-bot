@@ -420,7 +420,7 @@ async def attempt_fix(
             _git("branch", "-D", branch)
             return attempt
 
-        # Step 2: Check if any files were modified
+        # Step 2: Check if any files were modified (only allow .py files)
         rc, diff = _git("diff", "--name-only")
         if not diff.strip():
             log.info("No files changed — skipping")
@@ -429,6 +429,20 @@ async def attempt_fix(
             return attempt
 
         changed_files = diff.strip().split("\n")
+        non_py = [f for f in changed_files if not f.endswith(".py")]
+        if non_py:
+            log.warning("Discarding non-.py changes: %s", non_py)
+            for f in non_py:
+                _git("checkout", "--", f)
+            # Re-check
+            rc, diff = _git("diff", "--name-only")
+            if not diff.strip():
+                log.info("No .py files changed — skipping")
+                _git("checkout", original_branch)
+                _git("branch", "-D", branch)
+                return attempt
+            changed_files = diff.strip().split("\n")
+
         log.info("Files changed: %s", ", ".join(changed_files))
 
         # Step 3: Validate Python syntax
@@ -559,10 +573,7 @@ def main():
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
-        handlers=[
-            logging.StreamHandler(),
-            logging.FileHandler(str(WATCHDOG_LOG)),
-        ],
+        handlers=[logging.StreamHandler()],
     )
 
     if not ENABLED:
