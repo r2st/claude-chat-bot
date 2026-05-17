@@ -16,7 +16,7 @@
         <key>WATCHDOG_ENABLED</key>
         <string>true</string>
         <key>WATCHDOG_DRY_RUN</key>
-        <string>true</string>
+        <string>false</string>
         <key>WATCHDOG_SCAN_INTERVAL</key>
         <string>30</string>
         <key>WATCHDOG_MAX_FIXES_HOUR</key>
@@ -33,8 +33,8 @@
     <key>KeepAlive</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>/Users/dev/projects/claude-chat-bot/watchdog.log</string>
+    <string>/dev/null</string>
     <key>StandardErrorPath</key>
-    <string>/Users/dev/projects/claude-chat-bot/watchdog.log</string>
+    <string>/Users/dev/projects/claude-chat-bot/watchdog.err</string>
 </dict>
 </plist>
