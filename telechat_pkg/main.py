@@ -21,16 +21,58 @@ Legacy alias: BOT_MODE=both → telegram,whatsapp
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import signal
 import sys
 
 
+# ─── Workdir resolution ───────────────────────────────────────────────────────
+# The npm CLI stores the chosen working directory in ~/.telechat/config.json.
+# Resolve and chdir there so the pip-installed `telechat` behaves identically
+# regardless of which directory the user runs it from.
+
+_CONFIG_FILE = os.path.join(os.path.expanduser("~"), ".telechat", "config.json")
+
+
+def _resolve_workdir() -> str | None:
+    """Read ~/.telechat/config.json and chdir to the saved workdir."""
+    try:
+        with open(_CONFIG_FILE) as f:
+            cfg = json.load(f)
+        wd = cfg.get("workdir")
+        if wd and os.path.isdir(wd):
+            os.chdir(wd)
+            return wd
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _save_workdir(wd: str) -> None:
+    """Persist workdir to ~/.telechat/config.json (shared with npm CLI)."""
+    try:
+        os.makedirs(os.path.dirname(_CONFIG_FILE), exist_ok=True)
+        cfg = {}
+        if os.path.isfile(_CONFIG_FILE):
+            try:
+                with open(_CONFIG_FILE) as f:
+                    cfg = json.load(f)
+            except ValueError:
+                cfg = {}
+        cfg["workdir"] = wd
+        with open(_CONFIG_FILE, "w") as f:
+            json.dump(cfg, f, indent=2)
+            f.write("\n")
+    except OSError:
+        pass
+
+
 # ─── .env helpers ─────────────────────────────────────────────────────────────
 
 def _find_env_file() -> str:
-    """Return path to .env, searching cwd then package dir."""
+    """Return path to .env: configured workdir → cwd → package dir."""
     cwd_env = os.path.join(os.getcwd(), ".env")
     if os.path.isfile(cwd_env):
         return cwd_env
@@ -39,6 +81,33 @@ def _find_env_file() -> str:
     if os.path.isfile(proj_env):
         return proj_env
     return cwd_env  # default location for creation
+
+
+def _has_any_platform(env: dict[str, str]) -> bool:
+    """True if at least one platform has credentials configured."""
+    return bool(
+        env.get("TELEGRAM_BOT_TOKEN")
+        or (env.get("GREEN_API_INSTANCE_ID") and env.get("GREEN_API_TOKEN"))
+        or (env.get("SLACK_BOT_TOKEN") and env.get("SLACK_APP_TOKEN"))
+    )
+
+
+def _print_setup_guidance() -> None:
+    """Friendly guidance when no usable .env is found (no traceback)."""
+    print()
+    print("  telechat is not configured yet — no platform credentials found.")
+    print()
+    print("  Set it up with one of:")
+    print()
+    print("    telechat init     AI-guided setup (recommended)")
+    print("                      Opens browser, validates tokens automatically.")
+    print()
+    print("    telechat setup    Manual step-by-step wizard")
+    print()
+    print("  Quick start (Telegram only):")
+    print("    1. Message @BotFather on Telegram → /newbot → copy the token")
+    print("    2. telechat init   (or create a .env with TELEGRAM_BOT_TOKEN=...)")
+    print()
 
 
 def _read_env(path: str) -> dict[str, str]:
@@ -253,6 +322,9 @@ def _cmd_init() -> None:
             if key:
                 _set_env_var(env_path, "ANTHROPIC_API_KEY", key)
 
+    # Persist the directory containing .env as the workdir (shared with npm CLI)
+    _save_workdir(os.path.dirname(os.path.abspath(env_path)))
+
     print(f"\nDone! Config saved to {env_path}")
     print("Run 'telechat' or 'telechat start' to launch the bot.")
 
@@ -399,6 +471,14 @@ def _cmd_start() -> None:
     except KeyboardInterrupt:
         print("\nShutting down…")
         os._exit(0)
+    except RuntimeError as e:
+        # Missing token or similar misconfiguration — clean message, no traceback
+        msg = str(e)
+        if "TOKEN" in msg or "not set" in msg:
+            print(f"\n  ✗ Configuration error: {msg}")
+            _print_setup_guidance()
+            sys.exit(1)
+        raise
 
 
 # ─── CLI entry point ─────────────────────────────────────────────────────────
@@ -417,15 +497,25 @@ def _sigint_handler(sig, frame):
 
 
 def cli_entry():
-    """Entry point for `pip install telechat` → `telechat` command."""
+    """Entry point for `pip install telechatai` → `telechat` command."""
     signal.signal(signal.SIGINT, _sigint_handler)
 
     args = sys.argv[1:]
     cmd = args[0] if args else "start"
 
+    # Resolve the working directory saved by `telechat init` (npm CLI shares
+    # this config). Ensures the pip-installed entry point behaves the same
+    # no matter which directory it's invoked from.
+    _resolve_workdir()
+
     if cmd == "init":
         _cmd_init()
     elif cmd in ("start", "run"):
+        # Pre-flight: no usable config → guidance, not a traceback
+        env = _read_env(_find_env_file())
+        if not _has_any_platform(env):
+            _print_setup_guidance()
+            sys.exit(1)
         _cmd_start()
     elif cmd in ("-h", "--help", "help"):
         print("Usage: telechat [command]")
