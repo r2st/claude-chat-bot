@@ -558,14 +558,14 @@ function printTips() {
   console.log(`
   Commands:
 
-    telechat              Start bot as background service
+    telechat [start]      Start bot as background service
     telechat stop         Stop the bot
     telechat restart      Restart the bot
-    telechat status       Check if bot is running
+    telechat status       Check status, uptime, health
     telechat logs         Tail the bot log
-    telechat env           Show environment variables
-    telechat env clean     Remove .env (clear credentials)
-    telechat init         AI-guided setup (Claude CLI)
+    telechat env          Show config (tokens masked)
+    telechat clean        Remove .env (clear credentials)
+    telechat init         AI-guided setup (recommended)
     telechat setup        Manual setup wizard
     telechat update       Update to latest version
 
@@ -594,15 +594,16 @@ async function main() {
     console.log(`telechat ${NPM_VERSION} — Claude AI messenger bot (Telegram, WhatsApp, Slack)
 
 Usage:
-  telechat               Start bot as background service
+  telechat [start]       Start bot (shows setup guide if no .env)
   telechat stop          Stop the bot
   telechat restart       Restart the bot
-  telechat status        Check if running
+  telechat status        Check status, uptime, and health
   telechat logs          Tail the bot log
-  telechat env           Show environment variables
+  telechat env           Show environment variables (tokens masked)
   telechat env clean     Remove .env file (all credentials)
-  telechat init          AI-guided setup (uses Claude CLI)
-  telechat setup         Manual setup wizard
+  telechat clean         Same as env clean
+  telechat init          AI-guided setup (opens browser, validates tokens)
+  telechat setup         Manual setup wizard (no Claude CLI needed)
   telechat update        Update to latest version
   telechat --debug       Start with verbose logging
   telechat --version     Show version
@@ -835,19 +836,34 @@ FLOW:
 
 4. FINALIZE
    Print: "── Finalize ──"
-   - Set CLAUDE_MODE=cli (default, since Claude CLI is available).
-   - Set BOT_MODE based on which platforms were configured (skip empty ones).
-   - Add defaults: CLAUDE_CLI_WORK_DIR=/Users/dev, CLAUDE_CLI_ADD_DIRS=/Users/dev/projects, CLAUDE_CLI_PERMISSION_MODE=bypassPermissions, CLAUDE_TIMEOUT=300
+   - If CLAUDE_MODE is already set in .env, keep it. Otherwise ask:
+     "How should telechat connect to Claude?
+      1. CLI mode (free — uses your Claude CLI subscription)
+      2. API mode (pay-per-token — needs ANTHROPIC_API_KEY)
+      Choose (1/2, default=1):"
+   - If API mode, ask for ANTHROPIC_API_KEY.
+   - Set BOT_MODE based on which platforms have tokens configured. Examples:
+     - Only Telegram → BOT_MODE=telegram
+     - Telegram + WhatsApp → BOT_MODE=telegram,whatsapp
+     - All three → BOT_MODE=all
+   - Add these defaults if not already present:
+     CLAUDE_CLI_WORK_DIR=/Users/dev
+     CLAUDE_CLI_ADD_DIRS=/Users/dev/projects
+     CLAUDE_CLI_PERMISSION_MODE=bypassPermissions
+     CLAUDE_TIMEOUT=300
    - Write .env file.
    - Print a clean summary:
      "
      ── Setup Complete ──
-     Telegram : ✓ @bot_username (or ✗ skipped)
-     WhatsApp : ✓ +14155953988 (or ✗ skipped)
-     Slack    : ✓ team-name (or ✗ skipped)
-     Claude   : CLI mode
+     Telegram : ✓ @bot_username (or ── skipped)
+     WhatsApp : ✓ +14155953988 (or ── skipped)
+     Slack    : ✓ team-name (or ── skipped)
+     Claude   : CLI mode (or API mode)
+     BOT_MODE : telegram,whatsapp (whatever was configured)
 
-     Run 'telechat start' to launch your bot."`;
+     Starting bot..."
+   - Then run bash: telechat start
+   - This will start the bot and show the startup summary with security warnings.`;
 
     // Only open Telegram Web if not already configured
     if (!existingEnv || !existingEnv.includes("TELEGRAM_BOT_TOKEN=")) {
@@ -858,7 +874,7 @@ FLOW:
       "--system-prompt", systemPrompt,
       "--verbose", "0",
       existingEnv
-        ? "Check existing config. For each platform with valid credentials, ask the user if they want to keep or reconfigure. For unconfigured platforms, run the full setup."
+        ? "Check existing config. For each platform with valid credentials, ask the user if they want to keep or reconfigure. For unconfigured platforms, run the full setup. At the end, ask about Claude mode if not set."
         : "Start Telegram setup. Telegram Web is already open in the browser for QR code login. Print the login instructions and wait for the user to confirm.",
     ], {
       stdio: "inherit",
@@ -880,8 +896,39 @@ FLOW:
     const pid = getRunningPid();
     if (pid) {
       console.log(`  ✓ telechat is running (PID ${pid})`);
+
+      // Show platform info from .env
+      if (existsSync(ENV_FILE)) {
+        const envContent = require("fs").readFileSync(ENV_FILE, "utf8");
+        const platforms = [];
+        if (envContent.includes("TELEGRAM_BOT_TOKEN=")) platforms.push("Telegram");
+        if (envContent.includes("GREEN_API_INSTANCE_ID=")) platforms.push("WhatsApp");
+        if (envContent.includes("SLACK_BOT_TOKEN=")) platforms.push("Slack");
+        if (platforms.length) console.log(`    Platforms: ${platforms.join(", ")}`);
+      }
+
+      // Try health check
+      try {
+        const health = execSync("curl -s http://localhost:8484/health", { encoding: "utf8", timeout: 3000 });
+        const h = JSON.parse(health);
+        if (h.uptime_seconds) {
+          const hrs = Math.floor(h.uptime_seconds / 3600);
+          const mins = Math.floor((h.uptime_seconds % 3600) / 60);
+          console.log(`    Uptime: ${hrs}h ${mins}m`);
+        }
+        if (h.components) {
+          const statuses = [];
+          for (const [name, info] of Object.entries(h.components)) {
+            if (info.healthy !== undefined) {
+              statuses.push(`${name}: ${info.healthy ? "✓" : "✗"}`);
+            }
+          }
+          if (statuses.length) console.log(`    Health: ${statuses.join(", ")}`);
+        }
+      } catch {}
     } else {
       console.log("  ✗ telechat is not running");
+      console.log("    Start: telechat start");
     }
     process.exit(0);
   }
@@ -936,53 +983,141 @@ FLOW:
     process.exit(0);
   }
 
-  // ── First run or explicit setup ──
-  if (cmd === "setup" || (!cmd && !existsSync(ENV_FILE))) {
+  // ── Setup (manual wizard) ──
+  if (cmd === "setup") {
     const { python } = checkAndFixIssues();
     await setup();
     printTips();
-    if (cmd === "setup") process.exit(0);
-    // After first-time setup, start as service
+    process.exit(0);
+  }
+
+  // ── Normal start (default command or explicit 'start') ──
+  if (cmd === "start" || !cmd) {
+    const python = findPython();
+    if (!python) {
+      console.error("  ✗ Python 3.9+ required.\n    Install from https://python.org/downloads");
+      process.exit(1);
+    }
+
+    if (!isPyPkgInstalled(python)) {
+      console.log("  Installing Python backend...");
+      if (!installPyPkg(python)) process.exit(1);
+      console.log("  ✓ Python backend installed");
+    }
+
+    // No .env — guide the user
+    if (!existsSync(ENV_FILE)) {
+      console.log(`
+  No .env configuration found. You need to set up your bot first.
+
+  Choose a setup method:
+
+    telechat init     AI-guided setup (recommended)
+                      Claude CLI walks you through each platform,
+                      opens the right pages, validates tokens.
+                      Requires: npm i -g @anthropic-ai/claude-code
+
+    telechat setup    Manual setup wizard
+                      Step-by-step prompts without Claude CLI.
+
+  Quick start (Telegram only):
+    1. Message @BotFather on Telegram → /newbot → copy token
+    2. Create .env file:
+       echo "TELEGRAM_BOT_TOKEN=your_token_here" > .env
+       echo "CLAUDE_MODE=cli" >> .env
+    3. telechat start
+`);
+      process.exit(1);
+    }
+
+    // Validate .env has at least one platform configured
+    const envContent = require("fs").readFileSync(ENV_FILE, "utf8");
+    const envVars = {};
+    for (const line of envContent.split("\n")) {
+      if (!line.trim() || line.startsWith("#")) continue;
+      const eq = line.indexOf("=");
+      if (eq > 0) envVars[line.slice(0, eq).trim()] = line.slice(eq + 1).trim();
+    }
+
+    const hasTelegram = !!envVars.TELEGRAM_BOT_TOKEN;
+    const hasWhatsApp = !!envVars.GREEN_API_INSTANCE_ID && !!envVars.GREEN_API_TOKEN;
+    const hasSlack = !!envVars.SLACK_BOT_TOKEN && !!envVars.SLACK_APP_TOKEN;
+
+    if (!hasTelegram && !hasWhatsApp && !hasSlack) {
+      console.log(`
+  .env exists but no platform credentials found.
+
+  Need at least one of:
+    • TELEGRAM_BOT_TOKEN       (Telegram)
+    • GREEN_API_INSTANCE_ID    (WhatsApp)
+    • SLACK_BOT_TOKEN          (Slack)
+
+  Run 'telechat init' or 'telechat setup' to configure.
+`);
+      process.exit(1);
+    }
+
+    // Check if already running
+    const existingPid = getRunningPid();
+    if (existingPid) {
+      console.log(`  telechat is already running (PID ${existingPid})`);
+      // Show what's running
+      const platforms = [];
+      if (hasTelegram) platforms.push("Telegram");
+      if (hasWhatsApp) platforms.push("WhatsApp");
+      if (hasSlack) platforms.push("Slack");
+      console.log(`  Platforms: ${platforms.join(", ")}`);
+      console.log(`\n  Commands:`);
+      console.log(`    telechat logs       View live logs`);
+      console.log(`    telechat status     Check health`);
+      console.log(`    telechat restart    Restart with current config`);
+      console.log(`    telechat stop       Stop the bot`);
+      process.exit(0);
+    }
+
+    // Stop any orphan processes
+    try {
+      execSync("pkill -f 'telechat_pkg.main'", { stdio: "ignore" });
+      await sleep(1000);
+    } catch {}
+
     const pid = startService(python, debug);
+
+    // Show startup summary
+    const platforms = [];
+    if (hasTelegram) platforms.push("Telegram");
+    if (hasWhatsApp) platforms.push("WhatsApp");
+    if (hasSlack) platforms.push("Slack");
+    const claudeMode = envVars.CLAUDE_MODE || "cli";
+
     console.log(`  ✓ telechat started (PID ${pid})`);
-    console.log(`    Logs: telechat logs`);
+    console.log(`    Platforms : ${platforms.join(", ")}`);
+    console.log(`    Claude    : ${claudeMode} mode`);
+    if (debug) console.log(`    Debug     : ON`);
+    console.log(`    Logs      : telechat logs`);
+
+    // Warn about missing access control
+    const warnings = [];
+    if (hasTelegram && !envVars.TELEGRAM_ALLOWED_USER_IDS)
+      warnings.push("Telegram: no user restriction (anyone can message your bot)");
+    if (hasWhatsApp && !envVars.WHATSAPP_ALLOWED_NUMBERS)
+      warnings.push("WhatsApp: no number restriction (anyone can message your bot)");
+    if (hasSlack && !envVars.SLACK_ALLOWED_USER_IDS)
+      warnings.push("Slack: no user restriction (anyone in workspace can use the bot)");
+
+    if (warnings.length) {
+      console.log(`\n  ⚠ Security:`);
+      for (const w of warnings) console.log(`    • ${w}`);
+      console.log(`    Fix: telechat init → reconfigure, or edit .env manually`);
+    }
+
     process.exit(0);
   }
 
-  // ── Normal start (as background service) ──
-  const python = findPython();
-  if (!python) {
-    console.error("Error: Python 3.9+ required.\nInstall from https://python.org");
-    process.exit(1);
-  }
-
-  if (!isPyPkgInstalled(python)) {
-    if (!installPyPkg(python)) process.exit(1);
-  }
-
-  if (!existsSync(ENV_FILE)) {
-    console.error("No .env found. Run: telechat setup");
-    process.exit(1);
-  }
-
-  // Check if already running
-  const existingPid = getRunningPid();
-  if (existingPid) {
-    console.log(`  telechat is already running (PID ${existingPid})`);
-    console.log(`  Use 'telechat restart' to restart, or 'telechat logs' to view output.`);
-    process.exit(0);
-  }
-
-  // Stop any orphan processes
-  try {
-    execSync("pkill -f 'telechat_pkg.main'", { stdio: "ignore" });
-    await sleep(1000);
-  } catch {}
-
-  const pid = startService(python, debug);
-  console.log(`  ✓ telechat started (PID ${pid})`);
-  console.log(`    Logs: telechat logs`);
-  process.exit(0);
+  // Unknown command
+  console.log(`  Unknown command: ${cmd}`);
+  console.log(`  Run 'telechat --help' for available commands.`);
+  process.exit(1);
 }
 
 main();
