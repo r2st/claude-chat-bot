@@ -1,10 +1,9 @@
 #!/usr/bin/env node
 
 const { execSync, spawn } = require("child_process");
-const { existsSync } = require("fs");
-const path = require("path");
 
 const PYPI_PACKAGE = "telechat";
+const NPM_VERSION = require("../package.json").version;
 
 function findPython() {
   for (const cmd of ["python3", "python"]) {
@@ -29,8 +28,7 @@ function main() {
   const args = process.argv.slice(2);
 
   if (args[0] === "--help" || args[0] === "-h") {
-    console.log(`
-telechat — Claude AI messenger bot (Telegram, WhatsApp, Slack)
+    console.log(`telechat ${NPM_VERSION} — Claude AI messenger bot (Telegram, WhatsApp, Slack)
 
 Usage:
   telechat              Start the bot (reads .env in current directory)
@@ -41,8 +39,12 @@ Requirements:
   - Python 3.9+
   - A .env file with your bot tokens (see README)
 
-Docs: https://github.com/telechatai/telechat
-`);
+Docs: https://github.com/telechatai/telechat`);
+    process.exit(0);
+  }
+
+  if (args[0] === "--version" || args[0] === "-v") {
+    console.log(`telechat ${NPM_VERSION}`);
     process.exit(0);
   }
 
@@ -54,32 +56,29 @@ Docs: https://github.com/telechatai/telechat
   }
 
   if (args[0] === "--install" || !isInstalled(python)) {
-    console.log(`Installing ${PYPI_PACKAGE} from PyPI...`);
+    if (!isInstalled(python)) {
+      console.log(`Python package not found. Installing ${PYPI_PACKAGE} from PyPI...`);
+    } else {
+      console.log(`Upgrading ${PYPI_PACKAGE}...`);
+    }
     try {
       execSync(`${python} -m pip install --upgrade ${PYPI_PACKAGE}`, {
         stdio: "inherit",
       });
-    } catch (e) {
-      console.error("Failed to install. Try: pip install telechat");
+    } catch {
+      console.error(
+        `\nFailed to install from PyPI. You can install manually:\n` +
+        `  ${python} -m pip install ${PYPI_PACKAGE}\n\n` +
+        `Or clone and run from source:\n` +
+        `  git clone https://github.com/telechatai/telechat.git\n` +
+        `  cd telechat && ./scripts/install.sh && ./scripts/start.sh`
+      );
       process.exit(1);
     }
     if (args[0] === "--install") {
       console.log("Done.");
       process.exit(0);
     }
-  }
-
-  if (args[0] === "--version") {
-    try {
-      const version = execSync(
-        `${python} -c "from telechat_pkg import __version__; print(__version__)"`,
-        { encoding: "utf8" }
-      ).trim();
-      console.log(`telechat ${version}`);
-    } catch {
-      console.log("telechat (version unknown)");
-    }
-    process.exit(0);
   }
 
   const child = spawn(python, ["-m", "telechat_pkg.main"], {
