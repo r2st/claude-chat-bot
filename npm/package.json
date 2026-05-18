@@ -21,7 +21,9 @@
     "telechat": "./bin/telechat.js"
   },
   "scripts": {
-    "test": "bash ../tests/e2e-install.sh"
+    "test": "bash ../tests/e2e-install.sh",
+    "test:platforms": "bash ../tests/e2e-platforms.sh",
+    "test:all": "bash ../tests/e2e-install.sh && bash ../tests/e2e-platforms.sh"
   },
   "files": [
     "bin/",
