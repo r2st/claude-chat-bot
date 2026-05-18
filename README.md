@@ -11,48 +11,37 @@ A bot that connects to Claude AI via two modes:
 ## Install
 
 ```bash
-# npm (recommended — handles everything)
-npx telechat
+npm install -g telechat
+telechat init
+```
 
+That's it. `telechat init` walks you through each platform interactively using Claude CLI — it opens the right pages, grabs your tokens, validates everything, and writes your config.
+
+Requires: [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) (`npm install -g @anthropic-ai/claude-code && claude auth login`)
+
+### Alternative installs
+
+```bash
 # pip
 pip install telechatai
-python -m telechat_pkg.main
-```
+telechat init
 
-## Quick Start
-
-### Option A: AI-guided setup (recommended)
-
-```bash
+# npx (no global install)
 npx telechat init
+
+# From source
+git clone https://github.com/telechatai/telechat.git
+cd telechat && pip install -e .
+telechat init
 ```
 
-Claude CLI walks you through each platform interactively:
-- Opens Telegram Web for QR login → navigates to @BotFather and @userinfobot
-- Opens Green API console for WhatsApp credentials
-- Opens Slack API console with step-by-step instructions
-- Validates every token before saving
-- Detects existing config and asks to keep or reconfigure
-
-Requires: `npm install -g @anthropic-ai/claude-code && claude auth login`
-
-### Option B: Manual setup
+### Manual setup (no Claude CLI)
 
 ```bash
-npx telechat setup
+telechat setup
 ```
 
 Step-by-step wizard with prompts. Works without Claude CLI.
-
-### Option C: From source
-
-```bash
-git clone https://github.com/telechatai/telechat.git
-cd telechat
-./scripts/install.sh
-nano .env
-./scripts/start.sh
-```
 
 ## Commands
 
@@ -284,16 +273,60 @@ docker logs -f telechat
 
 ## Telegram commands
 
+**Core**
 | Command | Description |
 |---------|-------------|
 | `/start` | Welcome message |
 | `/reset` | Clear conversation history |
 | `/mode` | Show current mode and model |
 | `/model` | Switch model (haiku / sonnet / opus) |
-| `/verbose` | Set output verbosity: 0 quiet · 1 normal · 2 detailed |
+| `/engine` | Switch between CLI and API mode |
+| `/settings` | View all current settings |
+| `/verbose` | Set output verbosity |
 | `/permissions` | Change CLI permission mode |
 | `/usage` | Show usage statistics |
+| `/budget` | Set daily/monthly cost limits |
 | `/id` | Show your Telegram user ID |
+
+**Sessions**
+| Command | Description |
+|---------|-------------|
+| `/sessions` | List all sessions |
+| `/new` | Create a new session |
+| `/switch` | Switch to another session |
+| `/rename` | Rename a session |
+| `/pin` | Pin/unpin a session |
+| `/archive` | Archive a session |
+| `/resume` | Resume a Claude CLI session |
+| `/fork` | Fork current session into a new one |
+
+**Memory**
+| Command | Description |
+|---------|-------------|
+| `/remember` | Save a memory |
+| `/recall` | Search memories |
+| `/memories` | List all memories |
+| `/forget` | Delete a memory |
+| `/editmem` | Edit a memory |
+| `/exportmem` | Export memories as JSON |
+| `/importmem` | Import memories from JSON |
+
+**Tools**
+| Command | Description |
+|---------|-------------|
+| `/code` | Start a coding task |
+| `/project` | Set working project directory |
+| `/plan` | Multi-step planning agent |
+| `/search` | Web search |
+| `/fetch` | Fetch and summarize a URL |
+| `/web` | Browse a webpage |
+| `/kb` | Knowledge base (upload/search docs) |
+| `/imagine` | Generate an image |
+| `/tts` | Text-to-speech |
+| `/music` | Generate music |
+| `/video` | Generate video |
+| `/poll` | Create a poll |
+| `/schedule` | Schedule a task |
 
 ---
 
@@ -306,16 +339,33 @@ Just send a message. There are no slash commands — WhatsApp is intentionally k
 ## Project structure
 
 ```
-├── main.py            Entry point — reads BOT_MODE, starts adapters
-├── claude_core.py     Shared: Claude CLI/API, SQLite history, rate limiting
-├── telegram_bot.py    Telegram adapter
-├── whatsapp_bot.py    WhatsApp adapter (Green API polling)
-├── slack_bot.py       Slack adapter (Socket Mode)
+├── telechat_pkg/
+│   ├── main.py              Entry point — reads BOT_MODE, starts adapters
+│   ├── claude_core.py       Claude CLI/API invocation layer
+│   ├── store.py             SQLite persistence, sessions, history
+│   ├── telegram_bot.py      Telegram adapter
+│   ├── whatsapp_bot.py      WhatsApp adapter (Green API polling)
+│   ├── slack_bot.py         Slack adapter (Socket Mode)
+│   ├── memory.py            Per-user memory with FTS5 search
+│   ├── session_manager.py   Multi-session conversation management
+│   ├── knowledge_base.py    Document store with chunking and search
+│   ├── cost_budget.py       Usage tracking and budget alerts
+│   ├── coder.py             Chat-based coding agent (/code, /project)
+│   ├── two_agent.py         Multi-step planning agent
+│   ├── smart_router.py      Model routing by query complexity
+│   ├── health.py            Health checks and circuit breaker
+│   ├── web_fetch.py         URL content extraction (Jina / raw)
+│   ├── link_understanding.py  Auto-detect and fetch URLs in messages
+│   ├── tts.py               Text-to-speech via OpenAI
+│   ├── image_gen.py         Image generation
+│   ├── music_gen.py         Music generation
+│   ├── video_gen.py         Video generation
+│   └── ...
 ├── scripts/
-│   ├── install.sh
-│   ├── start.sh
-│   └── service.sh
-├── Dockerfile         (API mode only)
+│   ├── watchdog.py          Auto-restart and self-healing
+│   └── publish.sh           PyPI + npm release script
+├── npm/bin/telechat.js      CLI entry point
+├── Dockerfile               (API mode only)
 ├── docker-compose.yml
 ├── requirements.txt
 └── .env.example
@@ -326,16 +376,25 @@ Just send a message. There are no slash commands — WhatsApp is intentionally k
 ## Features
 
 - **Three platforms** — Telegram, WhatsApp, and Slack from one process (`BOT_MODE=all`)
+- **One-command setup** — `npm install -g telechat && telechat init`
 - **Background service** — runs detached, survives terminal close
 - **AI-guided setup** — `telechat init` uses Claude CLI for interactive configuration
 - **Dual Claude mode** — CLI (free with Claude subscription) or API
+- **Coding agent** — `/code` and `/project` for end-to-end development tasks
+- **Memory system** — per-user memories with FTS5 search, remembered across sessions
+- **Multi-session conversations** — create, switch, pin, archive named sessions
+- **Knowledge base** — upload documents, search with full-text and semantic matching
+- **Two-agent planning** — multi-step task execution with progress updates
+- **Smart model routing** — auto-selects haiku / sonnet / opus by query complexity
+- **Cost tracking & budgets** — daily/monthly limits with alerts
+- **Web fetch & link understanding** — auto-extracts content from URLs in messages
+- **Media generation** — TTS, image, music, and video generation
+- **Health monitoring** — HTTP health endpoint, circuit breakers, auto-recovery watchdog
+- **Image & file analysis** — Telegram photos + documents
 - **Typing indicator** — shows "typing…" while Claude processes
-- **Image & file analysis** — Telegram only (photos + documents)
 - **Model switching** — haiku / sonnet / opus from Telegram inline buttons
-- **Verbose mode** — see what tools Claude is using
 - **Rate limiting** — configurable per-user throttling
-- **Persistent history** — SQLite, keyed per platform+user; survives restarts
-- **Usage tracking** — per-user message and token statistics
+- **Persistent history** — SQLite with WAL mode, async writes, history caching
 - **Markdown rendering** — formatted responses with plain-text fallback
 
 ---
@@ -354,7 +413,7 @@ Just send a message. There are no slash commands — WhatsApp is intentionally k
 
 | Symptom | Fix |
 |---------|-----|
-| `telechat: command not found` | Use `npx telechat` or run `npm install -g telechat` |
+| `telechat: command not found` | Run `npm install -g telechat` or use `npx telechat` |
 | Bot not responding | Check `telechat status` and `telechat logs` |
 | Telegram 409 conflict | Another instance is running — `telechat stop` then `telechat start` |
 | WhatsApp: no replies | Check instance status in Green API console — must be `authorized` |
