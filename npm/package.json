@@ -20,6 +20,9 @@
   "bin": {
     "telechat": "./bin/telechat.js"
   },
+  "scripts": {
+    "test": "bash ../tests/e2e-install.sh"
+  },
   "files": [
     "bin/",
     "README.md",
