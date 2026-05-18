@@ -569,11 +569,14 @@ async def ask_claude_async(
     platform: str = "",
     user_id: str = "",
     resume_session_id: str = "",
+    work_dir: str = "",
 ) -> tuple[str, dict]:
     """Async Claude CLI call with streaming progress. Returns (reply_text, stats_dict).
 
     on_progress(tool_name: str) is called whenever Claude starts using a tool.
     on_text(partial_text: str) is called when text content is received.
+    work_dir overrides the working directory (e.g. the coding agent's
+    per-user project dir); defaults to CLAUDE_WORK_DIR.
     """
     # Try to resume existing session (skips project re-indexing)
     session_id = resume_session_id or (get_session_id(platform, user_id) if platform else None)
@@ -602,7 +605,16 @@ async def ask_claude_async(
             "--dangerously-skip-permissions",
         ]
 
-    for d in [x.strip() for x in add_dirs.split(",") if x.strip()]:
+    # Inject a custom system prompt only when explicitly overridden (e.g. the
+    # coding agent). Normal chat passes the default and is unaffected.
+    if system and system != CLAUDE_SYSTEM:
+        cmd += ["--append-system-prompt", system]
+
+    run_dir = work_dir or CLAUDE_WORK_DIR
+    extra_dirs = [x.strip() for x in add_dirs.split(",") if x.strip()]
+    if work_dir and work_dir not in extra_dirs:
+        extra_dirs.append(work_dir)
+    for d in extra_dirs:
         cmd += ["--add-dir", d]
 
     # Use 10MB buffer limit — Claude can produce very large JSON lines
@@ -611,7 +623,7 @@ async def ask_claude_async(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
-        cwd=CLAUDE_WORK_DIR,
+        cwd=run_dir,
         limit=10 * 1024 * 1024,
     )
 

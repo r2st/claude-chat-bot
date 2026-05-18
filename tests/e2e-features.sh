@@ -142,6 +142,57 @@ PY
   printf '%s' "$out" | grep -q '^PASS' && ok "real Claude CLI round-trip returns expected reply" || { bad "Claude brain round-trip"; printf '%s\n' "$out" | tail -5 | sed 's/^/      /'; }
 fi
 
+# ── 4b. Coding agent (project store + real end-to-end file creation) ─────────
+echo "[4b] Coding agent"
+out="$(DB_PATH="$TMP/cg.db" PYTHONPATH="$REPO_ROOT" "$PY" - <<PY 2>&1
+from telechat_pkg import coder
+ok, msg = coder.set_project("telegram", "cg_user", "$TMP")
+assert ok, f"set_project failed: {msg}"
+assert coder.get_project("telegram", "cg_user") == "$TMP", "get_project mismatch"
+ok2, _ = coder.set_project("telegram", "cg_user", "/no/such/dir/xyz")
+assert not ok2, "set_project should reject a non-directory"
+p = coder.build_task_prompt("add a flag", "$TMP")
+assert "$TMP" in p and "EXPLORE" in p, "task prompt malformed"
+coder.clear_project("telegram", "cg_user")
+assert coder.get_project("telegram", "cg_user") is None, "clear_project failed"
+print("PASS")
+PY
+)"
+printf '%s' "$out" | grep -q '^PASS' && ok "project store: set/get/reject/clear" || { bad "coding agent project store"; printf '%s\n' "$out" | tail -4 | sed 's/^/      /'; }
+
+if ! command -v claude >/dev/null 2>&1; then
+  skip "end-to-end coding run (claude CLI not installed)"
+else
+  PROJ="$TMP/proj"; mkdir -p "$PROJ"
+  out="$(DB_PATH="$TMP/cg2.db" PYTHONPATH="$REPO_ROOT" "$PY" - <<PY 2>&1
+import asyncio
+import telechat_pkg.claude_core as cc
+from telechat_pkg import coder
+prompt = coder.build_task_prompt(
+    "Create a file named DONE.txt containing exactly the text READY. "
+    "No other files.",
+    "$PROJ",
+)
+reply, stats = asyncio.get_event_loop().run_until_complete(
+    cc.ask_claude_async(
+        prompt, [],
+        system=coder.CODER_SYSTEM,
+        perm_mode="bypassPermissions",
+        timeout=120,
+        work_dir="$PROJ",
+    )
+)
+print("reply:", (reply or "")[:80].replace(chr(10), " "))
+PY
+)"
+  if [ -f "$PROJ/DONE.txt" ] && grep -q "READY" "$PROJ/DONE.txt"; then
+    ok "agent created DONE.txt with correct content in the project dir"
+  else
+    bad "coding agent did not produce the expected file"
+    printf '%s\n' "$out" | tail -4 | sed 's/^/      /'
+  fi
+fi
+
 # ── 5. Health endpoint (read-only probe of whatever is on :8484) ──────────────
 echo "[5] Health endpoint"
 hp="${HEALTH_PORT:-8484}"

@@ -2,6 +2,7 @@
 Telegram adapter — wraps claude_core for the Telegram Bot API.
 Run via main.py with BOT_MODE=telegram or BOT_MODE=both.
 """
+from __future__ import annotations
 
 import asyncio
 import itertools
@@ -24,6 +25,7 @@ from telegram.ext import (
 )
 
 from . import claude_core as cc
+from . import coder
 from .memory import MemoryStore
 
 log = logging.getLogger(__name__)
@@ -573,7 +575,11 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/new <name> — create a new session\n"
         "/switch — switch to another session\n"
         "/browse — browse project folders interactively\n"
-        "/reset — clear conversation history\n"
+        "/reset — clear conversation history\n\n"
+        "Coding agent (end-to-end development):\n"
+        "/project <path> — set the repo to work in\n"
+        "/code <task> — plan, implement, test & report\n\n"
+        "Settings:\n"
         "/model — switch Claude model\n"
         "/engine — switch engine (cli/sdk/api)\n"
         "/permissions — change CLI permission mode\n"
@@ -1187,6 +1193,141 @@ async def cmd_verbose(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# ─── Coding agent ───────────────────────────────────────────────────────────────
+
+CODER_TIMEOUT = int(os.getenv("CODER_TIMEOUT", "1800"))  # coding tasks run long
+
+
+async def cmd_project(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Show or set the per-user project directory for the coding agent."""
+    uid = update.effective_user.id
+    if not _allowed(uid):
+        return
+    arg = " ".join(ctx.args).strip() if ctx.args else ""
+    if not arg:
+        cur = coder.get_project(PLATFORM, str(uid))
+        if cur:
+            await update.message.reply_text(
+                f"📁 Project directory:\n`{cur}`\n\n"
+                f"Use `/code <task>` to develop here, or `/project <path>` to change it.",
+                parse_mode="Markdown",
+            )
+        else:
+            await update.message.reply_text(
+                "No project directory set.\n\n"
+                "Set one with `/project /path/to/repo`, then use `/code <task>`.",
+                parse_mode="Markdown",
+            )
+        return
+    ok, msg = coder.set_project(PLATFORM, str(uid), arg)
+    if ok:
+        await update.message.reply_text(
+            f"✓ Project set to:\n`{msg}`\n\nNow use `/code <task>`.",
+            parse_mode="Markdown",
+        )
+    else:
+        await update.message.reply_text(f"✗ {msg}")
+
+
+async def cmd_code(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Run the autonomous coding agent on a task in the user's project dir."""
+    uid = update.effective_user.id
+    if not _allowed(uid):
+        return
+
+    task_text = " ".join(ctx.args).strip() if ctx.args else ""
+    if not task_text:
+        await update.message.reply_text(
+            "Usage: `/code <what to build or fix>`\n\n"
+            "Example: `/code add a --json flag to the export command and test it`\n\n"
+            "Set the target repo first with `/project /path/to/repo`.",
+            parse_mode="Markdown",
+        )
+        return
+
+    project_dir = coder.get_project(PLATFORM, str(uid))
+    if not project_dir:
+        await update.message.reply_text(
+            "No project directory set. Run `/project /path/to/repo` first.",
+            parse_mode="Markdown",
+        )
+        return
+    if not os.path.isdir(project_dir):
+        await update.message.reply_text(
+            f"Project directory no longer exists:\n`{project_dir}`\n\n"
+            f"Set a new one with `/project <path>`.",
+            parse_mode="Markdown",
+        )
+        return
+
+    placeholder = await update.message.reply_text(
+        f"🛠 Coding agent starting in `{os.path.basename(project_dir)}`…",
+        parse_mode="Markdown",
+    )
+    stop = asyncio.Event()
+    typing_task = asyncio.create_task(_typing_loop(update.effective_chat.id, ctx, stop))
+
+    task = TaskSession(placeholder, uid, task_text)
+    task.chat_id = update.effective_chat.id
+    task.bot = ctx.bot
+    task.start_heartbeat()
+    _task_registry.register(task)
+
+    async def _on_progress(tool_name: str, detail: str = ""):
+        await task.on_tool(tool_name, detail)
+
+    async def _on_text(chunk: str):
+        await task.on_text(chunk)
+
+    def _is_cancelled() -> bool:
+        return task.cancelled
+
+    try:
+        prompt = coder.build_task_prompt(task_text, project_dir)
+        reply, stats = await cc.ask_claude_async(
+            prompt,
+            [],  # fresh agentic context — not the chat session
+            model=_model(uid),
+            system=coder.CODER_SYSTEM,
+            add_dirs=cc.CLAUDE_ADD_DIRS,
+            perm_mode="bypassPermissions",
+            timeout=CODER_TIMEOUT,
+            on_progress=_on_progress,
+            on_text=_on_text,
+            is_cancelled=_is_cancelled,
+            work_dir=project_dir,
+        )
+
+        if task.cancelled:
+            await placeholder.edit_text(
+                f"⏹ Coding task cancelled after {task._elapsed()}.", reply_markup=None
+            )
+            return
+
+        await task.stop()
+
+        if not reply or not reply.strip():
+            reply = "(Coding agent finished without a summary — check the repo for changes.)"
+
+        cc.track_usage(PLATFORM, str(uid),
+                       stats.get("input_tokens", 0), stats.get("output_tokens", 0))
+        cc.track_tool_usage(PLATFORM, str(uid), stats.get("tools_used", []))
+
+        header = f"🛠 *Coding agent* · `{os.path.basename(project_dir)}` · {task._elapsed()}\n\n"
+        await _send_paginated(update, uid, task_text, header + reply, placeholder)
+    except Exception as e:
+        log.exception("Coding agent failed for uid=%s", uid)
+        try:
+            await placeholder.edit_text(f"✗ Coding agent error: {e}", reply_markup=None)
+        except Exception:
+            pass
+    finally:
+        stop.set()
+        typing_task.cancel()
+        await task.stop()
+        _task_registry.unregister(task.task_id)
+
+
 # ─── Callback buttons ───────────────────────────────────────────────────────────
 
 async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1790,6 +1931,8 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("model",       cmd_model))
     app.add_handler(CommandHandler("engine",      cmd_engine))
     app.add_handler(CommandHandler("verbose",     cmd_verbose))
+    app.add_handler(CommandHandler("project",     cmd_project))
+    app.add_handler(CommandHandler("code",        cmd_code))
     app.add_handler(CommandHandler("permissions", cmd_permissions))
     app.add_handler(CommandHandler("usage",       cmd_usage))
     app.add_handler(CommandHandler("watchdog",    cmd_watchdog))

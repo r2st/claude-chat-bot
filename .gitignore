@@ -5,3 +5,7 @@ venv/
 *.log
 *.db
 .claude/
+
+# coding-agent runtime state
+telechat_pkg/coder_projects.json
+coder_projects.json
