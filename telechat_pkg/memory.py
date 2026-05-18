@@ -15,6 +15,8 @@ Usage:
     mem.forget("telegram", "123", "<uuid>")
 """
 
+from __future__ import annotations
+
 import json
 import sqlite3
 import threading
@@ -22,6 +24,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Optional
 
 
 @dataclass
@@ -42,7 +45,7 @@ class SearchResult(Memory):
 
 
 class MemoryStore:
-    def __init__(self, db_path: str | None = None):
+    def __init__(self, db_path: Optional[str] = None):
         if db_path is None:
             db_path = str(Path(__file__).parent / "bot.db")
         self._db_path = db_path
@@ -121,6 +124,8 @@ class MemoryStore:
         except sqlite3.OperationalError:
             return False
 
+    _MEMORY_FIELDS = frozenset(Memory.__dataclass_fields__)
+
     def _parse_row(self, row: sqlite3.Row) -> Memory:
         return Memory(
             id=row["id"],
@@ -132,6 +137,12 @@ class MemoryStore:
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
+
+    def _row_to_search_result(self, row: sqlite3.Row, score: float) -> SearchResult:
+        d = {k: row[k] for k in self._MEMORY_FIELDS if k != "tags"}
+        d["tags"] = json.loads(row["tags"]) if row["tags"] else []
+        d["score"] = score
+        return SearchResult(**d)
 
     # ── CRUD ──────────────────────────────────────────────────────────────
 
@@ -192,9 +203,7 @@ class MemoryStore:
                     LIMIT ?""",
                 [platform, user_id, *tag_params, limit],
             ).fetchall()
-            return [SearchResult(**{**dict(r), "score": 0.0,
-                                    "tags": json.loads(r["tags"]) if r["tags"] else []})
-                    for r in rows]
+            return [self._row_to_search_result(r, 0.0) for r in rows]
 
         # Try FTS5 search first
         if self._has_fts():
@@ -211,9 +220,7 @@ class MemoryStore:
                         LIMIT ?""",
                     [fts_query, platform, user_id, *tag_params, limit],
                 ).fetchall()
-                return [SearchResult(**{**dict(r), "score": r["rank"],
-                                        "tags": json.loads(r["tags"]) if r["tags"] else []})
-                        for r in rows]
+                return [self._row_to_search_result(r, r["rank"]) for r in rows]
             except sqlite3.OperationalError:
                 pass
 
@@ -227,9 +234,7 @@ class MemoryStore:
                 LIMIT ?""",
             [platform, user_id, query, *tag_params, limit],
         ).fetchall()
-        return [SearchResult(**{**dict(r), "score": 0.0,
-                                "tags": json.loads(r["tags"]) if r["tags"] else []})
-                for r in rows]
+        return [self._row_to_search_result(r, 0.0) for r in rows]
 
     def forget(self, platform: str, user_id: str, memory_id: str) -> bool:
         result = self._conn().execute(

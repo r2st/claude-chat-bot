@@ -4,7 +4,6 @@ Slack adapter — uses Socket Mode (no webhook, no public URL).
 Each developer creates their own Slack app and runs this locally.
 Works on corporate networks — pure outbound WebSocket.
 
-
 Setup (one-time, ~5 min):
   1. Go to https://api.slack.com/apps → Create New App → From scratch
   2. Settings → Socket Mode → Enable → Create App-Level Token
@@ -35,8 +34,8 @@ log = logging.getLogger(__name__)
 
 PLATFORM = "slack"
 
-SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN", "")   # xoxb-...
-SLACK_APP_TOKEN = os.getenv("SLACK_APP_TOKEN", "")   # xapp-...
+SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]   # xoxb-...
+SLACK_APP_TOKEN = os.environ["SLACK_APP_TOKEN"]    # xapp-...
 
 ALLOWED_SLACK_USERS: list[str] = [
     u.strip()
@@ -744,11 +743,6 @@ def handle_dm(client, event, say):
 # ─── Entry point ─────────────────────────────────────────────────────────────────
 
 def run_slack() -> None:
-    if not SLACK_BOT_TOKEN or not SLACK_APP_TOKEN:
-        raise RuntimeError(
-            "SLACK_BOT_TOKEN and SLACK_APP_TOKEN are not set. "
-            "Set them in your .env file."
-        )
     cc.init_db()
     log.info("Slack bot starting (Socket Mode)…")
     log.info("Model: %s | Claude mode: %s", cc.CLAUDE_MODEL, cc.CLAUDE_MODE)

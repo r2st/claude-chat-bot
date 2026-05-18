@@ -16,6 +16,7 @@ Interactive commands (send any of these):
   !usage      — Show usage statistics
   !verbose    — Toggle verbose mode (show tool activity)
 """
+from __future__ import annotations
 
 import asyncio
 import json

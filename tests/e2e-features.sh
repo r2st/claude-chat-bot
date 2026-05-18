@@ -193,6 +193,49 @@ PY
   fi
 fi
 
+# ── 4c. Memory store round-trip ──────────────────────────────────────────────
+echo "[4c] Memory store (remember / recall / forget)"
+out="$(DB_PATH="$TMP/mem.db" PYTHONPATH="$REPO_ROOT" "$PY" - <<PY 2>&1
+from memory import MemoryStore
+ms = MemoryStore("$TMP/mem.db")
+m = ms.remember("tg", "e2e_u", "prefers dark mode", tags=["pref"], importance=0.8)
+assert m.id and m.content == "prefers dark mode" and m.importance == 0.8
+results = ms.recall("tg", "e2e_u", "dark mode")
+assert any("dark" in r.content for r in results), f"recall failed: {results}"
+ms.update("tg", "e2e_u", m.id, content="prefers light mode")
+mems = ms.list_memories("tg", "e2e_u")
+assert any("light" in x.content for x in mems), "update failed"
+assert ms.forget("tg", "e2e_u", m.id)
+assert ms.stats("tg", "e2e_u")["total"] == 0, "forget failed"
+assert ms.recall("slack", "e2e_u", "light") == [], "platform isolation failed"
+print("PASS")
+PY
+)"
+printf '%s' "$out" | grep -q '^PASS' && ok "remember → recall → update → forget → isolation" || { bad "memory store round-trip"; printf '%s\n' "$out" | tail -4 | sed 's/^/      /'; }
+
+# ── 4d. Session manager ─────────────────────────────────────────────────────
+echo "[4d] Session manager"
+out="$(DB_PATH="$TMP/sess.db" PYTHONPATH="$REPO_ROOT" "$PY" - <<'PY' 2>&1
+import telechat_pkg.claude_core as cc
+cc.init_db()
+P, U = "telegram", "e2e_sess"
+s = cc._session_mgr.get_or_create_active(P, U)
+assert s.name == "default", f"expected default, got {s.name}"
+s2 = cc._session_mgr.create(P, U, "work")
+assert s2.name == "work"
+all_s = cc._session_mgr.get_all(P, U)
+assert len(all_s) == 2, f"expected 2 sessions, got {len(all_s)}"
+switched = cc._session_mgr.switch_to(P, U, 1)
+assert switched and switched.name == "work", f"switch failed: {switched}"
+deleted = cc._session_mgr.delete(P, U, 1)
+assert deleted, "delete failed"
+remaining = cc._session_mgr.get_all(P, U)
+assert len(remaining) == 1, f"expected 1 after delete, got {len(remaining)}"
+print("PASS")
+PY
+)"
+printf '%s' "$out" | grep -q '^PASS' && ok "create → list → switch → delete" || { bad "session manager"; printf '%s\n' "$out" | tail -4 | sed 's/^/      /'; }
+
 # ── 5. Health endpoint (read-only probe of whatever is on :8484) ──────────────
 echo "[5] Health endpoint"
 hp="${HEALTH_PORT:-8484}"
