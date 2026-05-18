@@ -1,6 +1,6 @@
 {
   "name": "telechat",
-  "version": "1.0.17",
+  "version": "1.0.18",
   "description": "Claude AI on your phone/desktop — personal, self-hosted messenger bot for Telegram, WhatsApp, and Slack",
   "keywords": [
     "claude",
@@ -23,7 +23,8 @@
   "scripts": {
     "test": "bash ../tests/e2e-install.sh",
     "test:platforms": "bash ../tests/e2e-platforms.sh",
-    "test:all": "bash ../tests/e2e-install.sh && bash ../tests/e2e-platforms.sh"
+    "test:features": "bash ../tests/e2e-features.sh",
+    "test:all": "bash ../tests/run-all.sh"
   },
   "files": [
     "bin/",

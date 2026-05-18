@@ -366,7 +366,11 @@ def _cmd_start() -> None:
 
     from dotenv import load_dotenv
 
-    load_dotenv()
+    # Load the resolved .env explicitly. Bare load_dotenv() searches upward
+    # from the package directory (wrong for pip installs) — it would never
+    # find ~/.telechat/.env. Always pass the data-home path.
+    _env_path = _find_env_file()
+    load_dotenv(_env_path, override=True)
 
     _debug = os.getenv("TELECHAT_DEBUG", "").lower() in ("1", "true", "yes")
     _log_level = logging.DEBUG if _debug else logging.INFO
