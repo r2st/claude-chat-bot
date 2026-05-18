@@ -7,16 +7,18 @@ Run:
 """
 
 import os
+import sqlite3
 import tempfile
 import threading
 import time
+import unittest.mock
 
 import pytest
 
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "test-token")
 os.environ.setdefault("ANTHROPIC_API_KEY", "test-api-key")
 
-from memory import MemoryStore
+from telechat_pkg.memory import MemoryStore
 
 
 @pytest.fixture
@@ -426,3 +428,44 @@ class TestDataIntegrity:
         mems = store.list_memories("tg", "u1")
         assert mems[0].content == "new"
         assert mems[1].content == "old"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 9. LIKE fallback when FTS unavailable
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class TestLikeFallback:
+    def test_recall_without_fts_uses_like(self, store):
+        store.remember("tg", "u1", "python is great")
+        with unittest.mock.patch.object(store, "_has_fts", return_value=False):
+            results = store.recall("tg", "u1", "python")
+        assert len(results) >= 1
+        assert any("python" in r.content for r in results)
+
+    def test_recall_without_fts_no_match(self, store):
+        store.remember("tg", "u1", "java is okay")
+        with unittest.mock.patch.object(store, "_has_fts", return_value=False):
+            results = store.recall("tg", "u1", "python")
+        assert len(results) == 0
+
+    def test_recall_without_fts_with_tags(self, store):
+        store.remember("tg", "u1", "tagged content", tags=["lang"])
+        store.remember("tg", "u1", "untagged content")
+        with unittest.mock.patch.object(store, "_has_fts", return_value=False):
+            results = store.recall("tg", "u1", "content", tags=["lang"])
+        assert len(results) == 1
+        assert results[0].content == "tagged content"
+
+    def test_has_fts_returns_false_when_fts_broken(self, store):
+        mock_conn = unittest.mock.MagicMock()
+        mock_conn.execute.side_effect = sqlite3.OperationalError("no such table")
+        with unittest.mock.patch.object(store, "_conn", return_value=mock_conn):
+            assert store._has_fts() is False
+
+    def test_recall_without_fts_respects_limit(self, store):
+        for i in range(10):
+            store.remember("tg", "u1", f"item number {i}")
+        with unittest.mock.patch.object(store, "_has_fts", return_value=False):
+            results = store.recall("tg", "u1", "item", limit=3)
+        assert len(results) <= 3

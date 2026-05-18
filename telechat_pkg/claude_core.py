@@ -1,7 +1,8 @@
 """
-Shared Claude invocation + conversation DB + rate limiting.
+Claude invocation layer — CLI, API, and SDK clients.
 
-Used by both telegram_bot.py and whatsapp_bot.py.
+Config constants and all store/session functions are re-exported here
+so existing ``import claude_core as cc`` keeps working.
 """
 from __future__ import annotations
 
@@ -9,16 +10,50 @@ import asyncio
 import json
 import logging
 import os
-import sqlite3
 import subprocess
-import threading
-import time
-from pathlib import Path
 from typing import Optional
+
+from . import store as _store
+
+from .store import (  # noqa: F401 — re-export for backward compat
+    DB_PATH,
+    RATE_LIMIT_REQUESTS,
+    RATE_LIMIT_WINDOW,
+    UserSession,
+    SessionManager,
+    _session_mgr,
+    _get_conn,
+    _db_writer,
+    _ensure_writer,
+    _enqueue_write,
+    _cache_key,
+    _invalidate_history,
+    check_rate_limit,
+    init_db,
+    load_history,
+    save_turn,
+    clear_history,
+    track_usage,
+    get_usage,
+    track_tool_usage,
+    track_cost,
+    get_session_id,
+    set_session_id,
+    clear_session,
+    get_history,
+)
+
+
+def __getattr__(name):
+    """Delegate lookups for mutable store globals (e.g. _write_queue, _writer_thread, _history_cache)."""
+    try:
+        return getattr(_store, name)
+    except AttributeError:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 log = logging.getLogger(__name__)
 
-# ─── Config (read once; adapters may override per-user) ────────────────────────
+# ─── Config ──────────────────────────────────────────────────────────────────────
 
 CLAUDE_MODEL      = os.getenv("CLAUDE_MODEL", "sonnet")
 CLAUDE_SYSTEM     = os.getenv(
@@ -34,484 +69,8 @@ CLAUDE_API_MODEL  = os.getenv("CLAUDE_API_MODEL", "claude-sonnet-4-20250514")
 CLAUDE_MAX_TOKENS = int(os.getenv("MAX_TOKENS", "4096"))
 CLAUDE_PERM_MODE  = os.getenv("CLAUDE_CLI_PERMISSION_MODE", "auto")
 
-RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "20"))
-RATE_LIMIT_WINDOW   = int(os.getenv("RATE_LIMIT_WINDOW", "60"))
 
-DB_PATH = os.getenv("DB_PATH", str(Path(__file__).parent / "bot.db"))
-
-# ─── Connection pool (thread-local SQLite) ──────────────────────────────────────
-
-_local = threading.local()
-
-
-def _get_conn() -> sqlite3.Connection:
-    """Get a thread-local SQLite connection (reused across calls)."""
-    if not hasattr(_local, "conn") or _local.conn is None:
-        _local.conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-        _local.conn.execute("PRAGMA journal_mode=WAL")
-        _local.conn.execute("PRAGMA synchronous=NORMAL")
-        _local.conn.execute("PRAGMA cache_size=-8000")  # 8MB cache
-    return _local.conn
-
-
-# ─── Thread-safe write queue (non-blocking DB writes) ─────────────────────────
-
-import queue as _queue_mod
-
-_write_queue: _queue_mod.Queue | None = None
-_writer_thread: threading.Thread | None = None
-
-
-def _db_writer():
-    """Background thread that drains the write queue and batches DB writes."""
-    while True:
-        ops = []
-        try:
-            op = _write_queue.get(timeout=1.0)
-            ops.append(op)
-        except _queue_mod.Empty:
-            continue
-        # Drain queued items
-        while not _write_queue.empty():
-            try:
-                ops.append(_write_queue.get_nowait())
-            except _queue_mod.Empty:
-                break
-        try:
-            conn = _get_conn()
-            for sql, params in ops:
-                conn.execute(sql, params)
-            conn.commit()
-        except Exception as e:
-            log.error("db_writer batch error: %s", e)
-
-
-def _ensure_writer():
-    """Start the DB writer thread if not already running."""
-    global _write_queue, _writer_thread
-    if _write_queue is None:
-        _write_queue = _queue_mod.Queue(maxsize=1000)
-    if _writer_thread is None or not _writer_thread.is_alive():
-        _writer_thread = threading.Thread(target=_db_writer, daemon=True)
-        _writer_thread.start()
-
-
-def _enqueue_write(sql: str, params: tuple):
-    """Enqueue a non-blocking DB write. Falls back to sync if full."""
-    if _write_queue is not None:
-        try:
-            _write_queue.put_nowait((sql, params))
-            return
-        except _queue_mod.Full:
-            pass
-    conn = _get_conn()
-    conn.execute(sql, params)
-    conn.commit()
-
-
-# ─── History cache (avoid repeated DB reads for same user) ──────────────────────
-
-_history_cache: dict[str, tuple[float, list[dict]]] = {}
-_HISTORY_TTL = 5.0  # seconds
-
-
-def _cache_key(platform: str, user_id: str) -> str:
-    return f"{platform}:{user_id}"
-
-
-def _invalidate_history(platform: str, user_id: str):
-    _history_cache.pop(_cache_key(platform, user_id), None)
-
-
-# ─── Rate limiting ──────────────────────────────────────────────────────────────
-
-_rate_state: dict[str, list[float]] = {}
-
-
-def check_rate_limit(key: str) -> bool:
-    """Return True if the request is allowed, False if rate-limited."""
-    now = time.time()
-    bucket = _rate_state.setdefault(key, [])
-    _rate_state[key] = [t for t in bucket if now - t < RATE_LIMIT_WINDOW]
-    if len(_rate_state[key]) >= RATE_LIMIT_REQUESTS:
-        return False
-    _rate_state[key].append(now)
-    return True
-
-
-# ─── SQLite conversation store ──────────────────────────────────────────────────
-
-def init_db() -> None:
-    _ensure_writer()
-    conn = _get_conn()
-
-    # Migrate from old schema (no platform column) if needed
-    cols = {row[1] for row in conn.execute("PRAGMA table_info(conversations)").fetchall()}
-    if cols and "platform" not in cols:
-        log.info("Migrating database to multi-platform schema…")
-        conn.execute("ALTER TABLE conversations RENAME TO _conv_old")
-        conn.execute("""
-            CREATE TABLE conversations (
-                platform TEXT NOT NULL, user_id TEXT NOT NULL,
-                role TEXT NOT NULL, content TEXT NOT NULL,
-                ts REAL NOT NULL, PRIMARY KEY (platform, user_id, ts))
-        """)
-        conn.execute("""
-            INSERT INTO conversations (platform, user_id, role, content, ts)
-            SELECT 'telegram', CAST(user_id AS TEXT), role, content, timestamp FROM _conv_old
-        """)
-        conn.execute("DROP TABLE _conv_old")
-
-        conn.execute("ALTER TABLE usage RENAME TO _usage_old")
-        conn.execute("""
-            CREATE TABLE usage (
-                platform TEXT NOT NULL, user_id TEXT NOT NULL,
-                message_count INTEGER DEFAULT 0, input_tokens INTEGER DEFAULT 0,
-                output_tokens INTEGER DEFAULT 0, PRIMARY KEY (platform, user_id))
-        """)
-        conn.execute("""
-            INSERT INTO usage (platform, user_id, message_count, input_tokens, output_tokens)
-            SELECT 'telegram', CAST(user_id AS TEXT), message_count, total_input_tokens, total_output_tokens FROM _usage_old
-        """)
-        conn.execute("DROP TABLE _usage_old")
-        conn.commit()
-        log.info("Database migration complete.")
-    else:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS conversations (
-                platform  TEXT NOT NULL, user_id TEXT NOT NULL,
-                role TEXT NOT NULL, content TEXT NOT NULL,
-                ts REAL NOT NULL, PRIMARY KEY (platform, user_id, ts))
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS usage (
-                platform TEXT NOT NULL, user_id TEXT NOT NULL,
-                message_count INTEGER DEFAULT 0, input_tokens INTEGER DEFAULT 0,
-                output_tokens INTEGER DEFAULT 0, PRIMARY KEY (platform, user_id))
-        """)
-        conn.commit()
-
-    # Enhanced tables: tool_usage, cost_tracking, sessions
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS tool_usage (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            platform TEXT NOT NULL,
-            user_id TEXT NOT NULL,
-            tool_name TEXT NOT NULL,
-            success INTEGER DEFAULT 1,
-            ts REAL NOT NULL)
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS cost_tracking (
-            platform TEXT NOT NULL,
-            user_id TEXT NOT NULL,
-            date TEXT NOT NULL,
-            requests INTEGER DEFAULT 0,
-            input_tokens INTEGER DEFAULT 0,
-            output_tokens INTEGER DEFAULT 0,
-            cost_usd REAL DEFAULT 0,
-            PRIMARY KEY (platform, user_id, date))
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS sessions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            platform TEXT NOT NULL,
-            user_id TEXT NOT NULL,
-            session_id TEXT,
-            engine TEXT DEFAULT 'cli',
-            model TEXT,
-            started_at REAL NOT NULL,
-            ended_at REAL,
-            total_cost_usd REAL DEFAULT 0,
-            num_turns INTEGER DEFAULT 0)
-    """)
-
-    # Self-improving system tables
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS feedback (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            platform TEXT NOT NULL,
-            user_id TEXT NOT NULL,
-            rating INTEGER,
-            reaction TEXT,
-            text_feedback TEXT,
-            message_ts REAL,
-            response_preview TEXT,
-            ts REAL NOT NULL)
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS quality_scores (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            platform TEXT NOT NULL,
-            user_id TEXT NOT NULL,
-            evaluator TEXT NOT NULL,
-            score REAL NOT NULL,
-            response_preview TEXT,
-            metadata TEXT,
-            ts REAL NOT NULL)
-    """)
-    conn.commit()
-
-
-def load_history(platform: str, user_id: str, limit: int = 20, session_name: str = "") -> list[dict]:
-    # Use session-qualified user_id for isolation
-    effective_uid = f"{user_id}:{session_name}" if session_name else user_id
-
-    # Check cache first
-    key = _cache_key(platform, effective_uid)
-    cached = _history_cache.get(key)
-    if cached and (time.time() - cached[0]) < _HISTORY_TTL:
-        return cached[1]
-
-    conn = _get_conn()
-    rows = conn.execute(
-        """SELECT role, content FROM conversations
-           WHERE platform=? AND user_id=?
-           ORDER BY ts DESC LIMIT ?""",
-        (platform, effective_uid, limit),
-    ).fetchall()
-    result = [{"role": r[0], "content": r[1]} for r in reversed(rows)]
-    _history_cache[key] = (time.time(), result)
-    return result
-
-
-def save_turn(platform: str, user_id: str, user_text: str, reply: str, session_name: str = "") -> None:
-    effective_uid = f"{user_id}:{session_name}" if session_name else user_id
-    now = time.time()
-    conn = _get_conn()
-    conn.execute(
-        "INSERT OR IGNORE INTO conversations (platform,user_id,role,content,ts) VALUES (?,?,?,?,?)",
-        (platform, effective_uid, "user", user_text, now),
-    )
-    conn.execute(
-        "INSERT OR IGNORE INTO conversations (platform,user_id,role,content,ts) VALUES (?,?,?,?,?)",
-        (platform, effective_uid, "assistant", reply, now + 0.001),
-    )
-    # Keep last 20 messages per user per platform
-    count = conn.execute(
-        "SELECT COUNT(*) FROM conversations WHERE platform=? AND user_id=?",
-        (platform, effective_uid),
-    ).fetchone()[0]
-    if count > 20:
-        conn.execute(
-            """DELETE FROM conversations WHERE platform=? AND user_id=? AND ts IN (
-               SELECT ts FROM conversations WHERE platform=? AND user_id=?
-               ORDER BY ts LIMIT ?)""",
-            (platform, effective_uid, platform, effective_uid, count - 20),
-        )
-    conn.commit()
-    _invalidate_history(platform, effective_uid)
-
-
-def clear_history(platform: str, user_id: str, session_name: str = "") -> None:
-    effective_uid = f"{user_id}:{session_name}" if session_name else user_id
-    conn = _get_conn()
-    conn.execute(
-        "DELETE FROM conversations WHERE platform=? AND user_id=?",
-        (platform, effective_uid),
-    )
-    conn.commit()
-    _invalidate_history(platform, effective_uid)
-
-
-def track_usage(platform: str, user_id: str, in_tok: int = 0, out_tok: int = 0) -> None:
-    _enqueue_write(
-        """INSERT INTO usage (platform, user_id, message_count, input_tokens, output_tokens)
-           VALUES (?,?,1,?,?)
-           ON CONFLICT(platform,user_id) DO UPDATE SET
-               message_count = message_count + 1,
-               input_tokens  = input_tokens  + excluded.input_tokens,
-               output_tokens = output_tokens + excluded.output_tokens""",
-        (platform, user_id, in_tok, out_tok),
-    )
-
-
-def get_usage(platform: str, user_id: str) -> dict:
-    conn = _get_conn()
-    row = conn.execute(
-        "SELECT message_count, input_tokens, output_tokens FROM usage WHERE platform=? AND user_id=?",
-        (platform, user_id),
-    ).fetchone()
-    return {"messages": row[0], "input": row[1], "output": row[2]} if row else {"messages": 0, "input": 0, "output": 0}
-
-
-def track_tool_usage(platform: str, user_id: str, tools: list[str]) -> None:
-    """Record tool usage for analytics (non-blocking)."""
-    if not tools:
-        return
-    now = time.time()
-    for tool in tools:
-        _enqueue_write(
-            "INSERT INTO tool_usage (platform, user_id, tool_name, ts) VALUES (?,?,?,?)",
-            (platform, user_id, tool, now),
-        )
-
-
-def track_cost(platform: str, user_id: str, in_tok: int, out_tok: int, cost_usd: float) -> None:
-    """Track daily cost for analytics (non-blocking)."""
-    from datetime import date
-    today = date.today().isoformat()
-    _enqueue_write(
-        """INSERT INTO cost_tracking (platform, user_id, date, requests, input_tokens, output_tokens, cost_usd)
-           VALUES (?,?,?,1,?,?,?)
-           ON CONFLICT(platform, user_id, date) DO UPDATE SET
-               requests = requests + 1,
-               input_tokens = input_tokens + excluded.input_tokens,
-               output_tokens = output_tokens + excluded.output_tokens,
-               cost_usd = cost_usd + excluded.cost_usd""",
-        (platform, user_id, today, in_tok, out_tok, cost_usd),
-    )
-
-
-# ─── Multi-session management ──────────────────────────────────────────────────
-
-_SESSION_TTL = 3600  # 1 hour — CLI sessions stay valid for a while; short TTL caused loss during long tasks
-
-
-class UserSession:
-    """A named conversation session with its own history and Claude session ID."""
-
-    def __init__(self, name: str, platform: str, user_id: str):
-        self.name = name
-        self.platform = platform
-        self.user_id = user_id
-        self.claude_session_id: str | None = None
-        self.last_active = time.time()
-        self.created_at = time.time()
-        self.message_count = 0
-        self.is_busy = False  # True while a task is running
-
-    @property
-    def cli_session_valid(self) -> bool:
-        if self.claude_session_id is None:
-            return False
-        if self.is_busy:
-            return True
-        return (time.time() - self.last_active) < _SESSION_TTL
-
-    def touch(self):
-        self.last_active = time.time()
-        self.message_count += 1
-
-    def age_str(self) -> str:
-        secs = int(time.time() - self.last_active)
-        if secs < 60:
-            return "just now"
-        if secs < 3600:
-            return f"{secs // 60}m ago"
-        return f"{secs // 3600}h ago"
-
-    def status_emoji(self) -> str:
-        if self.is_busy:
-            return "⚙️"
-        if self.cli_session_valid:
-            return "🟢"
-        return "💤"
-
-
-class SessionManager:
-    """Manages multiple named sessions per user."""
-
-    def __init__(self):
-        self._sessions: dict[str, list[UserSession]] = {}  # key → sessions
-        self._active: dict[str, int] = {}  # key → active index
-
-    def _key(self, platform: str, user_id: str) -> str:
-        return f"{platform}:{user_id}"
-
-    def get_or_create_active(self, platform: str, user_id: str) -> UserSession:
-        """Get the active session, or create a default one."""
-        key = self._key(platform, user_id)
-        sessions = self._sessions.setdefault(key, [])
-        if not sessions:
-            sessions.append(UserSession("default", platform, user_id))
-            self._active[key] = 0
-        idx = self._active.get(key, 0)
-        return sessions[idx]
-
-    def get_all(self, platform: str, user_id: str) -> list[UserSession]:
-        key = self._key(platform, user_id)
-        return self._sessions.get(key, [])
-
-    def get_active_index(self, platform: str, user_id: str) -> int:
-        key = self._key(platform, user_id)
-        return self._active.get(key, 0)
-
-    def create(self, platform: str, user_id: str, name: str) -> UserSession:
-        """Create a new session and switch to it."""
-        key = self._key(platform, user_id)
-        sessions = self._sessions.setdefault(key, [])
-        # Limit to 10 sessions per user
-        if len(sessions) >= 10:
-            # Remove oldest inactive
-            oldest = min(
-                (s for s in sessions if not s.is_busy),
-                key=lambda s: s.last_active,
-                default=None,
-            )
-            if oldest:
-                sessions.remove(oldest)
-        sess = UserSession(name, platform, user_id)
-        sessions.append(sess)
-        self._active[key] = len(sessions) - 1
-        return sess
-
-    def switch_to(self, platform: str, user_id: str, index: int) -> UserSession | None:
-        key = self._key(platform, user_id)
-        sessions = self._sessions.get(key, [])
-        if 0 <= index < len(sessions):
-            self._active[key] = index
-            return sessions[index]
-        return None
-
-    def delete(self, platform: str, user_id: str, index: int) -> bool:
-        key = self._key(platform, user_id)
-        sessions = self._sessions.get(key, [])
-        if not sessions or index < 0 or index >= len(sessions):
-            return False
-        if sessions[index].is_busy:
-            return False
-        sessions.pop(index)
-        # Adjust active index
-        active = self._active.get(key, 0)
-        if active >= len(sessions):
-            self._active[key] = max(0, len(sessions) - 1)
-        elif active > index:
-            self._active[key] = active - 1
-        # Ensure at least one session exists
-        if not sessions:
-            sessions.append(UserSession("default", platform, user_id))
-            self._active[key] = 0
-        return True
-
-    def clear_active(self, platform: str, user_id: str):
-        """Clear the active session's history and CLI session."""
-        sess = self.get_or_create_active(platform, user_id)
-        sess.claude_session_id = None
-        sess.message_count = 0
-
-
-_session_mgr = SessionManager()
-
-
-# Legacy API compatibility
-def get_session_id(platform: str, user_id: str) -> str | None:
-    sess = _session_mgr.get_or_create_active(platform, user_id)
-    return sess.claude_session_id if sess.cli_session_valid else None
-
-
-def set_session_id(platform: str, user_id: str, session_id: str):
-    sess = _session_mgr.get_or_create_active(platform, user_id)
-    sess.claude_session_id = session_id
-    sess.touch()
-
-
-def clear_session(platform: str, user_id: str):
-    _session_mgr.clear_active(platform, user_id)
-    _invalidate_history(platform, user_id)
-
-
-# ─── Claude CLI (sync — for WhatsApp threading model) ──────────────────────────
+# ─── Claude CLI (sync) ──────────────────────────────────────────────────────────
 
 def ask_claude_sync(
     user_text: str,
@@ -532,7 +91,7 @@ def ask_claude_sync(
         "-p", full_prompt,
         "--output-format", "stream-json",
         "--verbose",
-        "--dangerously-skip-permissions",
+        "--permission-mode", perm_mode,
     ]
     for d in [x.strip() for x in add_dirs.split(",") if x.strip()]:
         cmd += ["--add-dir", d]
@@ -552,7 +111,7 @@ def ask_claude_sync(
         return "[Error] `claude` CLI not found. Ensure Claude Code is installed and in PATH.", {}
 
 
-# ─── Claude CLI (async — for Telegram asyncio model) ───────────────────────────
+# ─── Claude CLI (async) ─────────────────────────────────────────────────────────
 
 async def ask_claude_async(
     user_text: str,
@@ -571,20 +130,12 @@ async def ask_claude_async(
     resume_session_id: str = "",
     work_dir: str = "",
 ) -> tuple[str, dict]:
-    """Async Claude CLI call with streaming progress. Returns (reply_text, stats_dict).
-
-    on_progress(tool_name: str) is called whenever Claude starts using a tool.
-    on_text(partial_text: str) is called when text content is received.
-    work_dir overrides the working directory (e.g. the coding agent's
-    per-user project dir); defaults to CLAUDE_WORK_DIR.
-    """
-    # Try to resume existing session (skips project re-indexing)
+    """Async Claude CLI call with streaming progress."""
     session_id = resume_session_id or (get_session_id(platform, user_id) if platform else None)
-
     full_prompt = _build_prompt(user_text, history) if history else user_text
+    cwd = work_dir or CLAUDE_WORK_DIR
 
     if session_id:
-        # Resume: send only new message (CLI has full conversation context)
         cmd = [
             "claude",
             "--model", model,
@@ -592,38 +143,26 @@ async def ask_claude_async(
             "--resume", session_id,
             "--output-format", "stream-json",
             "--verbose",
-            "--dangerously-skip-permissions",
+            "--permission-mode", perm_mode,
         ]
     else:
-        # New session: include conversation history in prompt
         cmd = [
             "claude",
             "--model", model,
             "-p", full_prompt,
             "--output-format", "stream-json",
             "--verbose",
-            "--dangerously-skip-permissions",
+            "--permission-mode", perm_mode,
         ]
 
-    # Inject a custom system prompt only when explicitly overridden (e.g. the
-    # coding agent). Normal chat passes the default and is unaffected.
-    if system and system != CLAUDE_SYSTEM:
-        cmd += ["--append-system-prompt", system]
-
-    run_dir = work_dir or CLAUDE_WORK_DIR
-    extra_dirs = [x.strip() for x in add_dirs.split(",") if x.strip()]
-    if work_dir and work_dir not in extra_dirs:
-        extra_dirs.append(work_dir)
-    for d in extra_dirs:
+    for d in [x.strip() for x in add_dirs.split(",") if x.strip()]:
         cmd += ["--add-dir", d]
 
-    # Use 10MB buffer limit — Claude can produce very large JSON lines
-    # when writing files (default 64KB is too small)
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
-        cwd=run_dir,
+        cwd=cwd,
         limit=10 * 1024 * 1024,
     )
 
@@ -631,7 +170,6 @@ async def ask_claude_async(
     try:
         async def _read_stream():
             while True:
-                # Check for cancellation
                 if is_cancelled and is_cancelled():
                     proc.kill()
                     return
@@ -644,13 +182,11 @@ async def ask_claude_async(
                     continue
                 stdout_lines.append(decoded)
 
-                # Parse streaming events for progress callbacks
                 if on_progress or on_text:
                     try:
                         event = json.loads(decoded)
                         etype = event.get("type", "")
 
-                        # Tool use detected in assistant message blocks
                         if etype == "assistant":
                             msg = event.get("message", {})
                             if isinstance(msg, dict):
@@ -661,14 +197,12 @@ async def ask_claude_async(
                                     elif block.get("type") == "text" and on_text:
                                         await on_text(block.get("text", ""))
 
-                        # Tool use detected in content_block_start events
                         elif etype == "content_block_start":
                             cb = event.get("content_block", {})
                             if cb.get("type") == "tool_use" and on_progress:
                                 detail = _extract_tool_detail(cb)
                                 await on_progress(cb.get("name", "tool"), detail)
 
-                        # Partial text in content_block_delta
                         elif etype == "content_block_delta" and on_text:
                             delta = event.get("delta", {})
                             if delta.get("type") == "text_delta":
@@ -690,10 +224,9 @@ async def ask_claude_async(
         stdout_text, stderr_data.decode(), proc.returncode, timeout
     )
 
-    # If resume failed (error or empty), retry with full history as a new session
+    # Retry with full history if session resume failed
     if session_id and (proc.returncode != 0 or not result[0] or result[0].startswith("[Claude error]")):
         log.warning("Session resume failed (rc=%d), retrying with full history", proc.returncode)
-        # Invalidate the stale session
         if platform:
             active_sess = _session_mgr.get_or_create_active(platform, user_id)
             active_sess.claude_session_id = None
@@ -704,7 +237,7 @@ async def ask_claude_async(
             "-p", full_prompt,
             "--output-format", "stream-json",
             "--verbose",
-            "--dangerously-skip-permissions",
+            "--permission-mode", perm_mode,
         ]
         for d in [x.strip() for x in add_dirs.split(",") if x.strip()]:
             retry_cmd += ["--add-dir", d]
@@ -755,7 +288,35 @@ async def ask_claude_async(
     return result
 
 
-# ─── Claude API (sync — usable from both adapters) ─────────────────────────────
+# ─── Claude API client (reused across calls) ────────────────────────────────────
+
+_api_client = None
+_async_api_client = None
+
+
+def _get_api_client():
+    global _api_client
+    if _api_client is None:
+        try:
+            import anthropic
+        except ImportError:
+            return None
+        _api_client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
+    return _api_client
+
+
+def _get_async_api_client():
+    global _async_api_client
+    if _async_api_client is None:
+        try:
+            import anthropic
+        except ImportError:
+            return None
+        _async_api_client = anthropic.AsyncAnthropic(api_key=CLAUDE_API_KEY)
+    return _async_api_client
+
+
+# ─── Claude API (sync) ──────────────────────────────────────────────────────────
 
 def ask_claude_api(
     user_text: str,
@@ -765,12 +326,10 @@ def ask_claude_api(
     system: str = CLAUDE_SYSTEM,
     max_tokens: int = CLAUDE_MAX_TOKENS,
 ) -> tuple[str, dict]:
-    try:
-        import anthropic
-    except ImportError:
+    client = _get_api_client()
+    if client is None:
         return "[Error] anthropic package not installed. Run: pip install anthropic", {}
 
-    client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
     messages = history + [{"role": "user", "content": user_text}]
     resp = client.messages.create(
         model=model,
@@ -787,7 +346,51 @@ def ask_claude_api(
     return text, stats
 
 
-# ─── Claude Code SDK (async — requires Python 3.10+) ─────────────────────────
+# ─── Claude API (async with streaming) ──────────────────────────────────────────
+
+async def ask_claude_api_async(
+    user_text: str,
+    history: list[dict],
+    *,
+    model: str = CLAUDE_API_MODEL,
+    system: str = CLAUDE_SYSTEM,
+    max_tokens: int = CLAUDE_MAX_TOKENS,
+    on_text: Optional[callable] = None,
+    is_cancelled: Optional[callable] = None,
+) -> tuple[str, dict]:
+    """Async Claude API call with streaming."""
+    client = _get_async_api_client()
+    if client is None:
+        return "[Error] anthropic package not installed. Run: pip install anthropic", {}
+
+    messages = history + [{"role": "user", "content": user_text}]
+    result_parts: list[str] = []
+    stats = {"tools_used": []}
+
+    async with client.messages.stream(
+        model=model,
+        max_tokens=max_tokens,
+        system=system,
+        messages=messages,
+    ) as stream:
+        async for text_chunk in stream.text_stream:
+            if is_cancelled and is_cancelled():
+                break
+            result_parts.append(text_chunk)
+            if on_text:
+                try:
+                    await on_text(text_chunk)
+                except Exception:
+                    pass
+        final = await stream.get_final_message()
+        stats["input_tokens"] = final.usage.input_tokens
+        stats["output_tokens"] = final.usage.output_tokens
+
+    result_text = "".join(result_parts)
+    return result_text or "(no response)", stats
+
+
+# ─── Claude Code SDK (async) ────────────────────────────────────────────────────
 
 async def ask_claude_sdk(
     user_text: str,
@@ -801,11 +404,7 @@ async def ask_claude_sdk(
     on_text: Optional[callable] = None,
     is_cancelled: Optional[callable] = None,
 ) -> tuple[str, dict]:
-    """Async Claude Code SDK call with streaming progress. Returns (reply_text, stats_dict).
-
-    Uses the claude-code-sdk package which communicates with the Claude CLI
-    via subprocess but provides a cleaner Python API with typed messages.
-    """
+    """Async Claude Code SDK call with streaming progress."""
     try:
         from claude_code_sdk import (
             query,
@@ -820,7 +419,6 @@ async def ask_claude_sdk(
 
     full_prompt = _build_prompt(user_text, history)
 
-    # Build options
     opts = ClaudeCodeOptions(
         model=model,
         system_prompt=system,
@@ -837,12 +435,10 @@ async def ask_claude_sdk(
 
     try:
         async for message in query(prompt=full_prompt, options=opts):
-            # Check for cancellation
             if is_cancelled and is_cancelled():
                 break
 
             if isinstance(message, AssistantMessage):
-                # Extract tool use blocks for progress
                 for block in getattr(message, "content", []):
                     if isinstance(block, ToolUseBlock):
                         tools_used.append(block.name)
@@ -887,21 +483,16 @@ async def ask_claude_sdk(
 # ─── Internal helpers ───────────────────────────────────────────────────────────
 
 def _extract_tool_detail(block: dict) -> str:
-    """Extract a short detail string from a tool_use block (e.g. file path, command)."""
     inp = block.get("input", {})
     if not isinstance(inp, dict):
         return ""
-    # Read/Write/Edit → file_path
     fp = inp.get("file_path", "")
     if fp:
-        # Show just the filename or last 2 path components
         parts = fp.rsplit("/", 2)
         return "/".join(parts[-2:]) if len(parts) > 2 else fp
-    # Bash → command (truncated)
     cmd = inp.get("command", "")
     if cmd:
         return cmd[:50]
-    # Grep → pattern
     pattern = inp.get("pattern", "")
     if pattern:
         return f"/{pattern[:30]}/"

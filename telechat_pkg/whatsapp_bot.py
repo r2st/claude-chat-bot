@@ -22,6 +22,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -31,7 +32,7 @@ import requests
 from dotenv import load_dotenv
 
 from . import claude_core as cc
-from .memory import MemoryStore
+from .memory import MemoryStore, extract_memories
 
 load_dotenv()
 
@@ -71,6 +72,27 @@ TOOL_ICONS = {
     "Grep": "🔍", "Glob": "📂", "WebSearch": "🌐", "WebFetch": "🌐",
     "TodoRead": "📋", "TodoWrite": "📋", "Agent": "🤖",
 }
+
+
+def _parse_remember_args(text: str) -> tuple[str, list[str], float]:
+    tags = []
+    importance = 0.5
+    words = []
+    for word in text.split():
+        if word.startswith("#") and len(word) > 1:
+            tags.append(word[1:].lower())
+        elif word.startswith("!") and len(word) > 1:
+            try:
+                importance = float(word[1:])
+            except ValueError:
+                words.append(word)
+        else:
+            words.append(word)
+    return " ".join(words), tags, importance
+
+
+def _active_session(sender: str):
+    return cc._session_mgr.get_or_create_active(PLATFORM, sender)
 
 
 def _lock_for(chat_id: str) -> threading.Lock:
@@ -140,15 +162,23 @@ HELP_TEXT = """*Claude Bot Commands*
 !ask — Ask Claude about current folder
 
 *Sessions:*
-!sessions — List your sessions
+!sessions [all] — List sessions (all = include archived)
 !new <name> — Create new session
-!switch <n> — Switch to session #n
+!switch <name|n> — Switch to session
+!rename <name> — Rename current session
+!title <text> — Set session description
+!pin — Pin/unpin session
+!archive [name] — Archive a session
+!searchsess <q> — Search sessions
 
 *Memory:*
-!remember <text> — Save a memory
+!remember <text> [#tag] [!0.9] — Save a memory
 !recall <query> — Search your memories
-!memories — List recent memories
+!memories [#tag] — List recent memories
 !forget <id> — Delete a memory
+!editmem <id> <new text> — Update a memory
+!exportmem — Export memories as JSON
+!extractmem — Extract memories from chat
 
 *Stats:*
 !usage — Usage statistics
@@ -257,33 +287,94 @@ def _handle_command(chat_id: str, sender: str, text: str) -> bool:
             send_message(chat_id, f"✅ Model switched to *{arg}*")
 
     elif cmd == "!sessions":
-        sessions = cc._session_mgr.get_all(PLATFORM, sender)
-        active_idx = cc._session_mgr.get_active_index(PLATFORM, sender)
+        show_archived = arg == "all"
+        sessions = cc._session_mgr.get_all(PLATFORM, sender, include_archived=show_archived)
         if not sessions:
-            send_message(chat_id, "No sessions. Send a message to start one.")
-        else:
-            lines = ["*Your sessions:*\n"]
-            for i, s in enumerate(sessions):
-                marker = " 👈" if i == active_idx else ""
-                lines.append(f"{i+1}. {s.name} ({s.age_str()}){marker}")
-            lines.append("\n_!switch <n> to change, !new <name> to create_")
-            send_message(chat_id, "\n".join(lines))
+            sessions = [cc._session_mgr.get_or_create_active(PLATFORM, sender)]
+        # Auto-archive idle
+        cc._session_mgr.auto_archive_idle(PLATFORM, sender)
+        active_idx = cc._session_mgr.get_active_index(PLATFORM, sender)
+        lines = ["*Your sessions:*\n"]
+        for i, s in enumerate(sessions):
+            marker = " 👈" if i == active_idx else ""
+            lines.append(f"{i+1}. {s.summary_line()}{marker}")
+        lines.append("\n_!switch <n>, !new <name>, !rename <name>, !title <text>, !pin, !archive_")
+        send_message(chat_id, "\n".join(lines))
 
     elif cmd == "!new":
         name = arg or f"session-{int(time.time()) % 10000}"
+        name = re.sub(r"[^a-zA-Z0-9_-]", "-", name)[:20]
         sess = cc._session_mgr.create(PLATFORM, sender, name)
         send_message(chat_id, f"✅ Created session *{sess.name}*")
 
     elif cmd == "!switch":
-        try:
-            idx = int(arg) - 1
-            sess = cc._session_mgr.switch_to(PLATFORM, sender, idx)
-            if sess:
-                send_message(chat_id, f"✅ Switched to *{sess.name}*")
+        # Try by name first, then by 1-based index
+        s = cc._session_mgr.switch_to_name(PLATFORM, sender, arg)
+        if not s:
+            try:
+                idx = int(arg) - 1
+                s = cc._session_mgr.switch_to(PLATFORM, sender, idx)
+            except ValueError:
+                pass
+        if s:
+            send_message(chat_id, f"✅ Switched to *{s.display_name}*")
+        else:
+            send_message(chat_id, "❌ Session not found. Use !sessions to see the list.")
+
+    elif cmd == "!rename":
+        if not arg:
+            send_message(chat_id, "Usage: !rename <new-name>")
+        else:
+            new_name = re.sub(r"[^a-zA-Z0-9_-]", "-", arg)[:20]
+            sess = _active_session(sender)
+            result = cc._session_mgr.rename(PLATFORM, sender, sess.name, new_name)
+            if result:
+                send_message(chat_id, f"✅ Renamed to *{result.name}*")
             else:
-                send_message(chat_id, "❌ Invalid session number. Use !sessions to see the list.")
-        except ValueError:
-            send_message(chat_id, "Usage: !switch <number>")
+                send_message(chat_id, "❌ Rename failed — name may already be taken.")
+
+    elif cmd == "!title":
+        if not arg:
+            send_message(chat_id, "Usage: !title <description>")
+        else:
+            sess = _active_session(sender)
+            raw_title = text.split(None, 1)[1] if len(text.split(None, 1)) > 1 else arg
+            result = cc._session_mgr.set_title(PLATFORM, sender, sess.name, raw_title)
+            if result:
+                send_message(chat_id, f"✅ Title: _{result.title}_")
+            else:
+                send_message(chat_id, "❌ Failed.")
+
+    elif cmd == "!pin":
+        sess = _active_session(sender)
+        new_state = not sess.pinned
+        result = cc._session_mgr.pin(PLATFORM, sender, sess.name, new_state)
+        if result:
+            send_message(chat_id, f"{'📌 Pinned' if result.pinned else 'Unpinned'} session *{result.name}*")
+        else:
+            send_message(chat_id, "❌ Failed.")
+
+    elif cmd == "!archive":
+        name = arg or _active_session(sender).name
+        result = cc._session_mgr.archive(PLATFORM, sender, name)
+        if result:
+            send_message(chat_id, f"📦 Archived *{result.name}*. Use !sessions all to see.")
+        else:
+            send_message(chat_id, "❌ Cannot archive.")
+
+    elif cmd == "!searchsess":
+        if not arg:
+            send_message(chat_id, "Usage: !searchsess <query>")
+        else:
+            raw_query = text.split(None, 1)[1] if len(text.split(None, 1)) > 1 else arg
+            results = cc._session_mgr.search(PLATFORM, sender, raw_query)
+            if not results:
+                send_message(chat_id, "🔍 No sessions found.")
+            else:
+                lines = [f"🔍 *Found {len(results)} session(s):*\n"]
+                for s in results:
+                    lines.append(s.summary_line())
+                send_message(chat_id, "\n".join(lines))
 
     elif cmd == "!usage":
         usage = cc.get_usage(PLATFORM, sender)
@@ -391,11 +482,16 @@ def _handle_command(chat_id: str, sender: str, text: str) -> bool:
 
     elif cmd == "!remember":
         if not arg:
-            send_message(chat_id, "Usage: !remember <something to remember>")
+            send_message(chat_id, "Usage: !remember <text> [#tag1 #tag2] [!0.9]")
         else:
             raw_arg = text.split(None, 1)[1] if len(text.split(None, 1)) > 1 else ""
-            mem = _memory.remember(PLATFORM, sender, raw_arg)
-            send_message(chat_id, f"✅ Remembered!\n_ID: {mem.id[:8]}…_")
+            content, tags, importance = _parse_remember_args(raw_arg)
+            if not content:
+                send_message(chat_id, "Memory content can't be empty.")
+            else:
+                mem = _memory.remember(PLATFORM, sender, content, tags=tags or None, importance=importance)
+                tag_str = f"  Tags: {', '.join(mem.tags)}" if mem.tags else ""
+                send_message(chat_id, f"✅ Remembered!\n_ID: {mem.id[:8]}…_{tag_str}")
 
     elif cmd == "!recall":
         if not arg:
@@ -408,20 +504,24 @@ def _handle_command(chat_id: str, sender: str, text: str) -> bool:
             else:
                 lines = [f"🔍 *Found {len(results)} memor{'y' if len(results) == 1 else 'ies'}:*\n"]
                 for r in results:
-                    short_id = r.id[:8]
-                    lines.append(f"• {r.content}\n  _ID: {short_id}…_")
+                    tag_str = f" [{', '.join(r.tags)}]" if r.tags else ""
+                    lines.append(f"• {r.content}{tag_str}\n  _ID: {r.id[:8]}…_")
                 send_message(chat_id, "\n".join(lines))
 
     elif cmd == "!memories":
-        mems = _memory.list_memories(PLATFORM, sender, limit=10)
+        filter_tags = None
+        if arg:
+            filter_tags = [w.lstrip("#") for w in arg.split() if w.startswith("#")]
+        mems = _memory.list_memories(PLATFORM, sender, limit=10, tags=filter_tags or None)
         if not mems:
             send_message(chat_id, "📭 No memories yet. Use !remember <text> to save one.")
         else:
             stats = _memory.stats(PLATFORM, sender)
-            lines = [f"🧠 *Your memories* ({stats['total']} total):\n"]
+            tag_label = f" (tag: {', '.join(filter_tags)})" if filter_tags else ""
+            lines = [f"🧠 *Your memories* ({stats['total']} total){tag_label}:\n"]
             for m in mems:
-                short_id = m.id[:8]
-                lines.append(f"• {m.content}\n  _ID: {short_id}…_")
+                tag_str = f" [{', '.join(m.tags)}]" if m.tags else ""
+                lines.append(f"• {m.content}{tag_str}\n  _ID: {m.id[:8]}…_")
             send_message(chat_id, "\n".join(lines))
 
     elif cmd == "!forget":
@@ -435,6 +535,76 @@ def _handle_command(chat_id: str, sender: str, text: str) -> bool:
                 send_message(chat_id, f"🗑️ Forgotten: _{match.content[:60]}_")
             else:
                 send_message(chat_id, "❌ Memory not found. Use !memories to see your memories.")
+
+    elif cmd == "!editmem":
+        parts = (arg or "").split(None, 1)
+        if len(parts) < 2:
+            send_message(chat_id, "Usage: !editmem <id> <new text> [#tag] [!0.9]")
+        else:
+            target_id = parts[0].rstrip("…")
+            content, tags, importance = _parse_remember_args(parts[1])
+            mems = _memory.list_memories(PLATFORM, sender, limit=100)
+            match = next((m for m in mems if m.id.startswith(target_id)), None)
+            if not match:
+                send_message(chat_id, "❌ Memory not found. Use !memories to see IDs.")
+            else:
+                updated = _memory.update(
+                    PLATFORM, sender, match.id,
+                    content=content or None,
+                    tags=tags or None,
+                    importance=importance if importance != 0.5 else None,
+                )
+                if updated:
+                    send_message(chat_id, f"✏️ Updated: _{updated.content[:80]}_")
+                else:
+                    send_message(chat_id, "❌ Update failed.")
+
+    elif cmd == "!exportmem":
+        data = _memory.export_all(PLATFORM, sender)
+        if not data:
+            send_message(chat_id, "📭 No memories to export.")
+        else:
+            import tempfile
+            payload = json.dumps({"memories": data, "platform": PLATFORM, "user_id": sender}, indent=2)
+            send_message(chat_id, f"📦 Exported {len(data)} memories:\n```\n{payload[:3000]}\n```")
+
+    elif cmd == "!extractmem":
+        sess = _active_session(sender)
+        history = cc.get_history(PLATFORM, sender, session_name=sess.name)
+        if not history:
+            send_message(chat_id, "No conversation history to extract from.")
+        else:
+            text_parts = []
+            for msg in history[-20:]:
+                role = msg.get("role", "")
+                content_val = msg.get("content", "")
+                if isinstance(content_val, str) and content_val.strip():
+                    text_parts.append(f"{role}: {content_val}")
+            if not text_parts:
+                send_message(chat_id, "No text messages found in recent history.")
+            else:
+                send_message(chat_id, "🔍 Extracting memories from recent conversation...")
+                import asyncio
+                extracted = asyncio.get_event_loop().run_until_complete(
+                    extract_memories("\n".join(text_parts))
+                )
+                if not extracted:
+                    send_message(chat_id, "No memorable facts found.")
+                else:
+                    saved = []
+                    for entry in extracted:
+                        mem = _memory.remember(
+                            PLATFORM, sender, entry["content"],
+                            tags=entry.get("tags"),
+                            importance=entry.get("importance", 0.5),
+                            metadata={"source": "auto-extract"},
+                        )
+                        saved.append(mem)
+                    lines = [f"🧠 *Extracted {len(saved)} memories:*\n"]
+                    for m in saved:
+                        tag_str = f" [{', '.join(m.tags)}]" if m.tags else ""
+                        lines.append(f"• {m.content}{tag_str}")
+                    send_message(chat_id, "\n".join(lines))
 
     else:
         send_message(chat_id, f"Unknown command: {cmd}\nType !help for available commands.")

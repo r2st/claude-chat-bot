@@ -13,7 +13,7 @@ import re
 import time
 from pathlib import Path
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import (
     Application,
@@ -25,8 +25,19 @@ from telegram.ext import (
 )
 
 from . import claude_core as cc
+from .memory import MemoryStore, extract_memories
+from .link_understanding import understand_links, extract_links, ENABLED as LINK_ENABLED
+from .polls import parse_poll_command, extract_poll_from_response
+from .tts import synthesize as tts_synthesize, is_available as tts_available, VOICES as TTS_VOICES
+from .image_gen import generate as image_generate, is_available as image_gen_available
+from .web_search import search as web_search, format_results as format_search_results, is_available as search_available
+from .voice_transcription import transcribe as voice_transcribe, is_available as transcription_available
+from .music_gen import generate as music_generate, is_available as music_gen_available
+from .video_gen import generate as video_generate, is_available as video_gen_available
+from .web_fetch import fetch_readable, is_available as web_fetch_available
+from .text_chunking import chunk_text
+from .scheduled_tasks import scheduler, ScheduledTask
 from . import coder
-from .memory import MemoryStore
 
 log = logging.getLogger(__name__)
 
@@ -64,6 +75,79 @@ _DEFAULT_PERM  = os.getenv("CLAUDE_CLI_PERMISSION_MODE", cc.CLAUDE_PERM_MODE)
 
 _memory = MemoryStore()
 
+# ─── Feature flags ────────────────────────────────────────────────────────────────
+AUTO_MEMORY_ENABLED = os.getenv("AUTO_MEMORY", "true").lower() in ("1", "true", "yes")
+AUTO_MEMORY_MIN_LENGTH = int(os.getenv("AUTO_MEMORY_MIN_LENGTH", "100"))
+COST_BUDGET_ENABLED = os.getenv("COST_BUDGET_ENABLED", "true").lower() in ("1", "true", "yes")
+SMART_ROUTING_ENABLED = os.getenv("SMART_ROUTING_ENABLED", "true").lower() in ("1", "true", "yes")
+
+# ─── Settings panel icons ────────────────────────────────────────────────────────
+
+_MODEL_ICONS = {"haiku": "⚡", "sonnet": "⚖️", "opus": "🧠"}
+_PERM_ICONS = {"default": "🔒", "acceptEdits": "📝", "auto": "🤖", "bypassPermissions": "⚠️"}
+_VERBOSE_ICONS = {0: "🔇", 1: "🔈", 2: "🔊"}
+_ENGINE_ICONS = {"cli": "🖥️", "sdk": "🔌", "api": "🌐"}
+
+
+def _build_settings_text(uid: int) -> str:
+    """Build the settings panel message text."""
+    m = _model(uid)
+    e = _engine(uid)
+    p = _perm(uid) or "default"
+    v = _verbose(uid)
+    sess = _active_session(uid)
+    return (
+        f"⚙️ *Settings*\n\n"
+        f"Session: `{sess.name}` {sess.status_emoji()}\n"
+        f"Model: {_MODEL_ICONS.get(m, '')} `{m}`\n"
+        f"Engine: {_ENGINE_ICONS.get(e, '')} `{e}`\n"
+        f"Permissions: {_PERM_ICONS.get(p, '')} `{p}`\n"
+        f"Verbosity: {_VERBOSE_ICONS.get(v, '')} `{v}`"
+    )
+
+
+def _build_settings_markup(uid: int) -> InlineKeyboardMarkup:
+    """Build the inline keyboard for the settings panel."""
+    m = _model(uid)
+    e = _engine(uid)
+    p = _perm(uid) or "default"
+    v = _verbose(uid)
+
+    # Row 1: Model selection
+    model_row = [
+        InlineKeyboardButton(
+            f"{_MODEL_ICONS.get(k, '')} {k.title()}{' ✓' if k == m else ''}",
+            callback_data=f"tg:set:model:{k}",
+        )
+        for k in CLI_MODELS
+    ]
+    # Row 2: Engine selection
+    engine_row = [
+        InlineKeyboardButton(
+            f"{_ENGINE_ICONS.get(k, '')} {k.upper()}{' ✓' if k == e else ''}",
+            callback_data=f"tg:set:engine:{k}",
+        )
+        for k in ENGINE_MODES
+    ]
+    # Row 3: Permissions (compact)
+    perm_row = [
+        InlineKeyboardButton(
+            f"{_PERM_ICONS.get(k, '')} {k[:8]}{' ✓' if k == p else ''}",
+            callback_data=f"tg:set:perm:{k}",
+        )
+        for k in PERMISSION_MODES
+    ]
+    # Row 4: Verbosity
+    verbose_row = [
+        InlineKeyboardButton(
+            f"{_VERBOSE_ICONS.get(lvl, '')} {lbl}{' ✓' if lvl == v else ''}",
+            callback_data=f"tg:set:verbose:{lvl}",
+        )
+        for lvl, lbl in VERBOSE_LEVELS.items()
+    ]
+
+    return InlineKeyboardMarkup([model_row, engine_row, perm_row, verbose_row])
+
 
 # ─── Per-user getters ───────────────────────────────────────────────────────────
 
@@ -96,17 +180,22 @@ async def _typing_loop(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, stop: async
 
 _processed_msgs: dict[int, float] = {}  # message_id → timestamp
 _DEDUP_TTL = 30  # seconds
+_dedup_last_cleanup = 0.0
 
 
 def _is_duplicate(msg_id: int) -> bool:
     """Return True if this message was already processed recently."""
+    global _dedup_last_cleanup
     now = time.time()
-    # Clean old entries
-    stale = [k for k, v in _processed_msgs.items() if now - v > _DEDUP_TTL]
-    for k in stale:
-        del _processed_msgs[k]
     if msg_id in _processed_msgs:
         return True
+    # Periodic cleanup instead of every call (every 60s)
+    if now - _dedup_last_cleanup > 60:
+        _dedup_last_cleanup = now
+        cutoff = now - _DEDUP_TTL
+        stale = [k for k, v in _processed_msgs.items() if v < cutoff]
+        for k in stale:
+            del _processed_msgs[k]
     _processed_msgs[msg_id] = now
     return False
 
@@ -131,6 +220,7 @@ class TaskSession:
         self.prompt_preview = prompt_preview[:40]
         self.start_time = time.time()
         self.tools: list[str] = []
+        self._tool_counts: dict[str, int] = {}
         self.tool_count = 0
         self._last_update = 0.0
         self._last_status = ""
@@ -174,16 +264,22 @@ class TaskSession:
         user_tasks = _task_registry.get_user_tasks(self.uid)
         task_label = f"  `#{self.task_id}`" if len(user_tasks) > 1 else ""
 
-        # Phase with emoji
+        # Phase with emoji and animated spinner
+        secs = int(time.time() - self.start_time)
+        spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"][secs % 10]
         if self._phase == "thinking":
-            phase = "🧠 *Thinking…*"
+            phase = f"{spinner} 🧠 *Thinking…*"
         elif self._phase == "working":
-            phase = "⚙️ *Working…*"
+            phase = f"{spinner} ⚙️ *Working…*"
         else:
-            phase = "✍️ *Writing…*"
+            phase = f"{spinner} ✍️ *Writing…*"
+
+        # Model badge
+        model_name = _model(self.uid)
+        model_badge = f"  `{model_name}`" if model_name else ""
 
         progress = self._progress_bar()
-        lines = [f"{phase} `{elapsed}`{task_label}", progress]
+        lines = [f"{phase} `{elapsed}`{model_badge}{task_label}", progress]
 
         # Current activity (detailed)
         if self._current_activity:
@@ -192,14 +288,13 @@ class TaskSession:
             last_tool = self.tools[-1]
             lines.append(f"\n{_tool_label(last_tool)}")
 
-        # Tool history summary
+        # Tool history — compact icon timeline
         if self.tool_count > 1:
             unique = list(dict.fromkeys(self.tools))
             summary_parts = []
-            for t in unique[-4:]:
-                count = self.tools.count(t)
+            for t in unique[-5:]:
                 icon = _TOOL_ICONS.get(t, "🔧")
-                summary_parts.append(f"{icon}×{count}" if count > 1 else icon)
+                summary_parts.append(f"{icon}×{self._tool_counts[t]}" if self._tool_counts[t] > 1 else icon)
             lines.append(f"\n{'  '.join(summary_parts)}  _({self.tool_count} steps)_")
 
         # Show partial streaming text preview
@@ -207,7 +302,6 @@ class TaskSession:
             preview = self._partial_text[-400:]
             if len(self._partial_text) > 400:
                 preview = "…" + preview
-            # Escape markdown special chars in preview to avoid parse errors
             lines.append(f"\n{'─' * 20}\n{preview}")
 
         return "\n".join(lines)
@@ -216,6 +310,7 @@ class TaskSession:
         """Called when Claude starts using a tool."""
         self._phase = "working"
         self.tools.append(tool_name)
+        self._tool_counts[tool_name] = self._tool_counts.get(tool_name, 0) + 1
         self.tool_count += 1
         if detail:
             self._current_activity = f"{_tool_label(tool_name).rstrip('…')} `{detail}`…"
@@ -379,6 +474,29 @@ def _store_response(uid: int, prompt: str, text: str) -> str:
     return rid
 
 
+def _action_buttons(rid: str, has_pages: bool = False, page: int = 0, total_pages: int = 1) -> InlineKeyboardMarkup:
+    """Build quick-action buttons for a response."""
+    rows = []
+    # Pagination row
+    if has_pages:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("◀️ Prev", callback_data=f"tg:pg:{rid}:{page - 1}"))
+        nav.append(InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data="tg:noop:_"))
+        if page < total_pages - 1:
+            nav.append(InlineKeyboardButton("▶️ Next", callback_data=f"tg:pg:{rid}:{page + 1}"))
+        rows.append(nav)
+    # Action row
+    actions = [
+        InlineKeyboardButton("🔄 Retry", callback_data=f"tg:act:{rid}:retry"),
+        InlineKeyboardButton("➡️ Continue", callback_data=f"tg:act:{rid}:continue"),
+    ]
+    if tts_available():
+        actions.append(InlineKeyboardButton("🔊 TTS", callback_data=f"tg:act:{rid}:tts"))
+    rows.append(actions)
+    return InlineKeyboardMarkup(rows)
+
+
 # ─── Reply helper ───────────────────────────────────────────────────────────────
 
 # Regex to find bare URLs not already inside markdown link syntax
@@ -507,8 +625,25 @@ async def _ask(uid: int, text: str, tracker: TaskSession | None = None, session:
     history = cc.load_history(PLATFORM, str(uid), session_name=sess.name)
     engine = _engine(uid)
 
-    if engine == "api":
-        return cc.ask_claude_api(text, history, system=cc.CLAUDE_SYSTEM)
+    # ── Feature 2: Budget check before calling Claude ──
+    budget_msg = await _check_budget(uid)
+    if budget_msg and budget_msg.startswith(("Daily budget exceeded", "Monthly budget exceeded")):
+        return budget_msg, {}
+
+    # ── Feature 3: Smart model selection ──
+    selected_model = _smart_model(uid, text)
+
+    # ── Feature 9: RAG context injection ──
+    kb_context = _kb.build_context(PLATFORM, str(uid), text)
+    if kb_context:
+        text = text + kb_context
+
+    # ── Feature 6: Publish chat event ──
+    from .event_bus import get_event_bus, Event, EventTypes
+    await get_event_bus().publish_async(Event(
+        type=EventTypes.MESSAGE_RECEIVED,
+        data={"uid": uid, "text": text[:200], "model": selected_model},
+    ))
 
     # Progress callback via tracker
     async def _on_progress(tool_name: str, detail: str = ""):
@@ -524,10 +659,17 @@ async def _ask(uid: int, text: str, tracker: TaskSession | None = None, session:
     def _is_cancelled() -> bool:
         return tracker.cancelled if tracker else False
 
+    if engine == "api":
+        return await cc.ask_claude_api_async(
+            text, history, system=cc.CLAUDE_SYSTEM,
+            model=route_model_api(text) if SMART_ROUTING_ENABLED else cc.CLAUDE_API_MODEL,
+            on_text=_on_text, is_cancelled=_is_cancelled,
+        )
+
     if engine == "sdk":
         result = await cc.ask_claude_sdk(
             text, history,
-            model=_model(uid),
+            model=selected_model,
             system=cc.CLAUDE_SYSTEM,
             add_dirs=cc.CLAUDE_ADD_DIRS,
             timeout=cc.CLAUDE_TIMEOUT,
@@ -544,7 +686,7 @@ async def _ask(uid: int, text: str, tracker: TaskSession | None = None, session:
     cli_sid = sess.claude_session_id if sess.cli_session_valid else ""
     result = await cc.ask_claude_async(
         text, history,
-        model=_model(uid),
+        model=selected_model,
         system=cc.CLAUDE_SYSTEM,
         add_dirs=cc.CLAUDE_ADD_DIRS,
         perm_mode=_perm(uid),
@@ -574,12 +716,14 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/sessions — view/switch sessions\n"
         "/new <name> — create a new session\n"
         "/switch — switch to another session\n"
+        "/rename <name> — rename current session\n"
+        "/title <text> — set session description\n"
+        "/pin — pin/unpin current session\n"
+        "/archive — archive current session\n"
+        "/searchsess <q> — search sessions\n"
         "/browse — browse project folders interactively\n"
-        "/reset — clear conversation history\n\n"
-        "Coding agent (end-to-end development):\n"
-        "/project <path> — set the repo to work in\n"
-        "/code <task> — plan, implement, test & report\n\n"
-        "Settings:\n"
+        "/reset — clear conversation history\n"
+        "/settings — all settings in one panel\n"
         "/model — switch Claude model\n"
         "/engine — switch engine (cli/sdk/api)\n"
         "/permissions — change CLI permission mode\n"
@@ -589,10 +733,14 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/mode — show current settings\n"
         "/id — show your Telegram user ID\n\n"
         "Memory:\n"
-        "/remember <text> — save a memory\n"
+        "/remember <text> [#tag1 #tag2] [!0.9] — save a memory\n"
         "/recall <query> — search your memories\n"
-        "/memories — list recent memories\n"
-        "/forget <id> — delete a memory"
+        "/memories [#tag] — list recent memories\n"
+        "/forget <id> — delete a memory\n"
+        "/editmem <id> <new text> — update a memory\n"
+        "/exportmem — export all memories as JSON\n"
+        "/importmem — reply to a JSON file to import\n"
+        "/extractmem — extract memories from recent chat"
     )
 
 
@@ -714,9 +862,13 @@ async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_sessions(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Show all sessions for this user with status indicators."""
     uid = update.effective_user.id
-    sessions = cc._session_mgr.get_all(PLATFORM, str(uid))
+    show_archived = ctx.args and ctx.args[0] == "all"
+    sessions = cc._session_mgr.get_all(PLATFORM, str(uid), include_archived=show_archived)
     if not sessions:
         sessions = [cc._session_mgr.get_or_create_active(PLATFORM, str(uid))]
+
+    # Auto-archive idle sessions
+    archived = cc._session_mgr.auto_archive_idle(PLATFORM, str(uid))
 
     active_idx = cc._session_mgr.get_active_index(PLATFORM, str(uid))
 
@@ -724,17 +876,23 @@ async def cmd_sessions(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     btns = []
     for i, s in enumerate(sessions):
         marker = " ← active" if i == active_idx else ""
-        lines.append(
-            f"{s.status_emoji()} `{s.name}` — {s.message_count} msgs, {s.age_str()}{marker}"
-        )
-        if i != active_idx:
+        lines.append(f"{s.summary_line()}{marker}")
+        if i != active_idx and not s.archived:
             btns.append([InlineKeyboardButton(
-                f"Switch to: {s.name}", callback_data=f"tg:sess:sw:{i}"
+                f"Switch to: {s.display_name}", callback_data=f"tg:sess:sw:{i}"
             )])
 
+    if archived:
+        lines.append(f"\n_Auto-archived {len(archived)} idle session(s)._")
+
     btns.append([InlineKeyboardButton("➕ New session", callback_data="tg:sess:new:_")])
+    row2 = []
     if len(sessions) > 1:
-        btns.append([InlineKeyboardButton("🗑 Delete a session…", callback_data="tg:sess:delmenu:_")])
+        row2.append(InlineKeyboardButton("🗑 Delete…", callback_data="tg:sess:delmenu:_"))
+    if any(s.archived for s in cc._session_mgr.get_all(PLATFORM, str(uid), include_archived=True)):
+        row2.append(InlineKeyboardButton("📦 Archived…", callback_data="tg:sess:arcmenu:_"))
+    if row2:
+        btns.append(row2)
 
     await update.message.reply_text(
         "\n".join(lines),
@@ -767,14 +925,20 @@ async def cmd_switch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if ctx.args:
         target = ctx.args[0].strip()
-        for i, s in enumerate(sessions):
-            if s.name == target or str(i) == target:
-                cc._session_mgr.switch_to(PLATFORM, str(uid), i)
-                await update.message.reply_text(
-                    f"✅ Switched to `{s.name}`", parse_mode="Markdown"
-                )
-                return
-        await update.message.reply_text(f"Session `{target}` not found.", parse_mode="Markdown")
+        # Try by name first, then by index
+        s = cc._session_mgr.switch_to_name(PLATFORM, str(uid), target)
+        if not s:
+            try:
+                idx = int(target)
+                s = cc._session_mgr.switch_to(PLATFORM, str(uid), idx)
+            except ValueError:
+                pass
+        if s:
+            await update.message.reply_text(
+                f"✅ Switched to `{s.display_name}`", parse_mode="Markdown"
+            )
+        else:
+            await update.message.reply_text(f"Session `{target}` not found.", parse_mode="Markdown")
         return
 
     active_idx = cc._session_mgr.get_active_index(PLATFORM, str(uid))
@@ -783,7 +947,7 @@ async def cmd_switch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if i == active_idx:
             continue
         btns.append([InlineKeyboardButton(
-            f"{s.status_emoji()} {s.name} ({s.message_count} msgs)",
+            f"{s.status_emoji()} {s.display_name} ({s.message_count} msgs)",
             callback_data=f"tg:sess:sw:{i}",
         )])
 
@@ -793,6 +957,80 @@ async def cmd_switch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_rename(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Rename the current session. Usage: /rename <new-name>"""
+    uid = update.effective_user.id
+    if not ctx.args:
+        await update.message.reply_text("Usage: /rename <new-name>")
+        return
+    new_name = re.sub(r"[^a-zA-Z0-9_-]", "-", " ".join(ctx.args))[:20]
+    sess = _active_session(uid)
+    result = cc._session_mgr.rename(PLATFORM, str(uid), sess.name, new_name)
+    if result:
+        await update.message.reply_text(f"✅ Session renamed to `{result.name}`", parse_mode="Markdown")
+    else:
+        await update.message.reply_text("❌ Rename failed — name may already be taken.")
+
+
+async def cmd_title(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Set a title/description for the current session. Usage: /title <text>"""
+    uid = update.effective_user.id
+    if not ctx.args:
+        await update.message.reply_text("Usage: /title <description>")
+        return
+    title = " ".join(ctx.args)
+    sess = _active_session(uid)
+    result = cc._session_mgr.set_title(PLATFORM, str(uid), sess.name, title)
+    if result:
+        await update.message.reply_text(f"✅ Title set: _{result.title}_", parse_mode="Markdown")
+    else:
+        await update.message.reply_text("❌ Failed to set title.")
+
+
+async def cmd_pin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Pin/unpin the current session. Pinned sessions won't be auto-archived."""
+    uid = update.effective_user.id
+    sess = _active_session(uid)
+    new_state = not sess.pinned
+    result = cc._session_mgr.pin(PLATFORM, str(uid), sess.name, new_state)
+    if result:
+        emoji = "📌" if result.pinned else "📌❌"
+        await update.message.reply_text(f"{emoji} Session `{result.name}` {'pinned' if result.pinned else 'unpinned'}.", parse_mode="Markdown")
+    else:
+        await update.message.reply_text("❌ Failed.")
+
+
+async def cmd_archive(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Archive the current or named session."""
+    uid = update.effective_user.id
+    if ctx.args:
+        name = ctx.args[0]
+    else:
+        name = _active_session(uid).name
+    result = cc._session_mgr.archive(PLATFORM, str(uid), name)
+    if result:
+        await update.message.reply_text(f"📦 Archived session `{result.name}`. Use /sessions all to see archived.", parse_mode="Markdown")
+    else:
+        await update.message.reply_text("❌ Cannot archive (busy or not found).")
+
+
+async def cmd_search_sessions(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Search sessions by name, title, or content."""
+    uid = update.effective_user.id
+    if not ctx.args:
+        await update.message.reply_text("Usage: /searchsess <query>")
+        return
+    query = " ".join(ctx.args)
+    results = cc._session_mgr.search(PLATFORM, str(uid), query)
+    if not results:
+        await update.message.reply_text("🔍 No sessions found.")
+        return
+    lines = [f"🔍 *Found {len(results)} session(s):*\n"]
+    for s in results:
+        lines.append(s.summary_line())
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
 # ─── Folder browser ─────────────────────────────────────────────────────────────
 
 BROWSE_ROOT = Path(cc.CLAUDE_WORK_DIR)
@@ -800,16 +1038,23 @@ BROWSE_PAGE_SIZE = 8
 
 # Path registry: maps short IDs to absolute paths (per-session, in-memory)
 _path_registry: dict[str, Path] = {}
+_path_reverse: dict[Path, str] = {}
 _path_counter = itertools.count(1)
+_PATH_REGISTRY_MAX = 5000
 
 
 def _pid(path: Path) -> str:
     """Register a path and return a short ID for use in callback_data."""
-    for k, v in _path_registry.items():
-        if v == path:
-            return k
+    existing = _path_reverse.get(path)
+    if existing is not None:
+        return existing
+    if len(_path_registry) >= _PATH_REGISTRY_MAX:
+        oldest_key = next(iter(_path_registry))
+        oldest_path = _path_registry.pop(oldest_key)
+        _path_reverse.pop(oldest_path, None)
     pid = f"p{next(_path_counter)}"
     _path_registry[pid] = path
+    _path_reverse[path] = pid
     return pid
 
 
@@ -1027,14 +1272,44 @@ async def _handle_browse_callback(q, uid: int):
             _task_registry.unregister(task.task_id)
 
 
+def _parse_remember_args(text: str) -> tuple[str, list[str], float]:
+    """Parse tags (#tag) and importance (!0.9) from remember text."""
+    tags = []
+    importance = 0.5
+    words = []
+    for word in text.split():
+        if word.startswith("#") and len(word) > 1:
+            tags.append(word[1:].lower())
+        elif word.startswith("!") and len(word) > 1:
+            try:
+                importance = float(word[1:])
+            except ValueError:
+                words.append(word)
+        else:
+            words.append(word)
+    return " ".join(words), tags, importance
+
+
 async def cmd_remember(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = str(update.effective_user.id)
     text = " ".join(ctx.args) if ctx.args else ""
     if not text:
-        await update.message.reply_text("Usage: /remember <something to remember>")
+        await update.message.reply_text(
+            "Usage: /remember <text> [#tag1 #tag2] [!0.9]\n"
+            "Example: /remember I prefer dark mode #preference !0.8"
+        )
         return
-    mem = _memory.remember(PLATFORM, uid, text)
-    await update.message.reply_text(f"✅ Remembered!\n_ID: `{mem.id[:8]}…`_", parse_mode="Markdown")
+    content, tags, importance = _parse_remember_args(text)
+    if not content:
+        await update.message.reply_text("Memory content can't be empty.")
+        return
+    mem = _memory.remember(PLATFORM, uid, content, tags=tags or None, importance=importance)
+    tag_str = f"  Tags: {', '.join(mem.tags)}" if mem.tags else ""
+    imp_str = f"  Importance: {mem.importance}" if mem.importance != 0.5 else ""
+    await update.message.reply_text(
+        f"✅ Remembered!\n_ID: `{mem.id[:8]}…`_{tag_str}{imp_str}",
+        parse_mode="Markdown",
+    )
 
 
 async def cmd_recall(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1055,14 +1330,19 @@ async def cmd_recall(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_memories(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = str(update.effective_user.id)
-    mems = _memory.list_memories(PLATFORM, uid, limit=10)
+    filter_tags = None
+    if ctx.args:
+        filter_tags = [a.lstrip("#") for a in ctx.args if a.startswith("#")]
+    mems = _memory.list_memories(PLATFORM, uid, limit=10, tags=filter_tags or None)
     if not mems:
         await update.message.reply_text("📭 No memories yet. Use /remember <text> to save one.")
         return
     stats = _memory.stats(PLATFORM, uid)
-    lines = [f"🧠 *Your memories* ({stats['total']} total):\n"]
+    tag_label = f" (tag: {', '.join(filter_tags)})" if filter_tags else ""
+    lines = [f"🧠 *Your memories* ({stats['total']} total){tag_label}:\n"]
     for m in mems:
-        lines.append(f"• {m.content}\n  _ID: `{m.id[:8]}…`_")
+        tag_str = f" [{', '.join(m.tags)}]" if m.tags else ""
+        lines.append(f"• {m.content}{tag_str}\n  _ID: `{m.id[:8]}…`_")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
@@ -1078,6 +1358,116 @@ async def cmd_forget(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"🗑️ Forgotten: _{match.content[:60]}_", parse_mode="Markdown")
     else:
         await update.message.reply_text("❌ Memory not found. Use /memories to see your memories.")
+
+
+async def cmd_editmem(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = str(update.effective_user.id)
+    if not ctx.args or len(ctx.args) < 2:
+        await update.message.reply_text("Usage: /editmem <id> <new text> [#tag1] [!0.9]")
+        return
+    target_id = ctx.args[0].rstrip("…")
+    rest = " ".join(ctx.args[1:])
+    content, tags, importance = _parse_remember_args(rest)
+
+    mems = _memory.list_memories(PLATFORM, uid, limit=100)
+    match = next((m for m in mems if m.id.startswith(target_id)), None)
+    if not match:
+        await update.message.reply_text("❌ Memory not found. Use /memories to see IDs.")
+        return
+
+    updated = _memory.update(
+        PLATFORM, uid, match.id,
+        content=content or None,
+        tags=tags or None,
+        importance=importance if importance != 0.5 else None,
+    )
+    if updated:
+        await update.message.reply_text(f"✏️ Updated: _{updated.content[:80]}_", parse_mode="Markdown")
+    else:
+        await update.message.reply_text("❌ Update failed.")
+
+
+async def cmd_exportmem(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = str(update.effective_user.id)
+    data = _memory.export_all(PLATFORM, uid)
+    if not data:
+        await update.message.reply_text("📭 No memories to export.")
+        return
+    import tempfile
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, prefix="memories_") as f:
+        json.dump({"memories": data, "platform": PLATFORM, "user_id": uid}, f, indent=2)
+        tmp_path = f.name
+    try:
+        await update.message.reply_document(
+            document=open(tmp_path, "rb"),
+            filename=f"memories_{uid}.json",
+            caption=f"📦 Exported {len(data)} memories.",
+        )
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+
+async def cmd_importmem(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = str(update.effective_user.id)
+    reply = update.message.reply_to_message
+    if not reply or not reply.document:
+        await update.message.reply_text(
+            "Usage: Reply to a JSON file with /importmem\n"
+            "The file should have a `memories` array (from /exportmem)."
+        )
+        return
+    try:
+        file = await ctx.bot.get_file(reply.document.file_id)
+        raw = await file.download_as_bytearray()
+        payload = json.loads(raw.decode())
+        entries = payload.get("memories", payload) if isinstance(payload, dict) else payload
+        if not isinstance(entries, list):
+            await update.message.reply_text("❌ Invalid format — expected a JSON array or {memories: [...]}.")
+            return
+        result = _memory.import_all(PLATFORM, uid, entries)
+        await update.message.reply_text(
+            f"📥 Imported {result['imported']} memories"
+            + (f" ({result['skipped']} skipped)" if result["skipped"] else "")
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Import failed: {e}")
+
+
+async def cmd_extractmem(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = str(update.effective_user.id)
+    sess = _active_session(int(uid))
+    history = cc.get_history(PLATFORM, uid, session_name=sess.name)
+    if not history:
+        await update.message.reply_text("No conversation history to extract from.")
+        return
+    text_parts = []
+    for msg in history[-20:]:
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+        if isinstance(content, str) and content.strip():
+            text_parts.append(f"{role}: {content}")
+    if not text_parts:
+        await update.message.reply_text("No text messages found in recent history.")
+        return
+    await update.message.reply_text("🔍 Extracting memories from recent conversation...")
+    extracted = await extract_memories("\n".join(text_parts))
+    if not extracted:
+        await update.message.reply_text("No memorable facts found.")
+        return
+    saved = []
+    for entry in extracted:
+        mem = _memory.remember(
+            PLATFORM, uid, entry["content"],
+            tags=entry.get("tags"),
+            importance=entry.get("importance", 0.5),
+            metadata={"source": "auto-extract"},
+        )
+        saved.append(mem)
+    lines = [f"🧠 *Extracted {len(saved)} memories:*\n"]
+    for m in saved:
+        tag_str = f" [{', '.join(m.tags)}]" if m.tags else ""
+        lines.append(f"• {m.content}{tag_str}")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 async def cmd_usage(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1193,139 +1583,15 @@ async def cmd_verbose(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ─── Coding agent ───────────────────────────────────────────────────────────────
-
-CODER_TIMEOUT = int(os.getenv("CODER_TIMEOUT", "1800"))  # coding tasks run long
-
-
-async def cmd_project(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Show or set the per-user project directory for the coding agent."""
+async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not _allowed(uid):
         return
-    arg = " ".join(ctx.args).strip() if ctx.args else ""
-    if not arg:
-        cur = coder.get_project(PLATFORM, str(uid))
-        if cur:
-            await update.message.reply_text(
-                f"📁 Project directory:\n`{cur}`\n\n"
-                f"Use `/code <task>` to develop here, or `/project <path>` to change it.",
-                parse_mode="Markdown",
-            )
-        else:
-            await update.message.reply_text(
-                "No project directory set.\n\n"
-                "Set one with `/project /path/to/repo`, then use `/code <task>`.",
-                parse_mode="Markdown",
-            )
-        return
-    ok, msg = coder.set_project(PLATFORM, str(uid), arg)
-    if ok:
-        await update.message.reply_text(
-            f"✓ Project set to:\n`{msg}`\n\nNow use `/code <task>`.",
-            parse_mode="Markdown",
-        )
-    else:
-        await update.message.reply_text(f"✗ {msg}")
-
-
-async def cmd_code(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Run the autonomous coding agent on a task in the user's project dir."""
-    uid = update.effective_user.id
-    if not _allowed(uid):
-        return
-
-    task_text = " ".join(ctx.args).strip() if ctx.args else ""
-    if not task_text:
-        await update.message.reply_text(
-            "Usage: `/code <what to build or fix>`\n\n"
-            "Example: `/code add a --json flag to the export command and test it`\n\n"
-            "Set the target repo first with `/project /path/to/repo`.",
-            parse_mode="Markdown",
-        )
-        return
-
-    project_dir = coder.get_project(PLATFORM, str(uid))
-    if not project_dir:
-        await update.message.reply_text(
-            "No project directory set. Run `/project /path/to/repo` first.",
-            parse_mode="Markdown",
-        )
-        return
-    if not os.path.isdir(project_dir):
-        await update.message.reply_text(
-            f"Project directory no longer exists:\n`{project_dir}`\n\n"
-            f"Set a new one with `/project <path>`.",
-            parse_mode="Markdown",
-        )
-        return
-
-    placeholder = await update.message.reply_text(
-        f"🛠 Coding agent starting in `{os.path.basename(project_dir)}`…",
+    await update.message.reply_text(
+        _build_settings_text(uid),
+        reply_markup=_build_settings_markup(uid),
         parse_mode="Markdown",
     )
-    stop = asyncio.Event()
-    typing_task = asyncio.create_task(_typing_loop(update.effective_chat.id, ctx, stop))
-
-    task = TaskSession(placeholder, uid, task_text)
-    task.chat_id = update.effective_chat.id
-    task.bot = ctx.bot
-    task.start_heartbeat()
-    _task_registry.register(task)
-
-    async def _on_progress(tool_name: str, detail: str = ""):
-        await task.on_tool(tool_name, detail)
-
-    async def _on_text(chunk: str):
-        await task.on_text(chunk)
-
-    def _is_cancelled() -> bool:
-        return task.cancelled
-
-    try:
-        prompt = coder.build_task_prompt(task_text, project_dir)
-        reply, stats = await cc.ask_claude_async(
-            prompt,
-            [],  # fresh agentic context — not the chat session
-            model=_model(uid),
-            system=coder.CODER_SYSTEM,
-            add_dirs=cc.CLAUDE_ADD_DIRS,
-            perm_mode="bypassPermissions",
-            timeout=CODER_TIMEOUT,
-            on_progress=_on_progress,
-            on_text=_on_text,
-            is_cancelled=_is_cancelled,
-            work_dir=project_dir,
-        )
-
-        if task.cancelled:
-            await placeholder.edit_text(
-                f"⏹ Coding task cancelled after {task._elapsed()}.", reply_markup=None
-            )
-            return
-
-        await task.stop()
-
-        if not reply or not reply.strip():
-            reply = "(Coding agent finished without a summary — check the repo for changes.)"
-
-        cc.track_usage(PLATFORM, str(uid),
-                       stats.get("input_tokens", 0), stats.get("output_tokens", 0))
-        cc.track_tool_usage(PLATFORM, str(uid), stats.get("tools_used", []))
-
-        header = f"🛠 *Coding agent* · `{os.path.basename(project_dir)}` · {task._elapsed()}\n\n"
-        await _send_paginated(update, uid, task_text, header + reply, placeholder)
-    except Exception as e:
-        log.exception("Coding agent failed for uid=%s", uid)
-        try:
-            await placeholder.edit_text(f"✗ Coding agent error: {e}", reply_markup=None)
-        except Exception:
-            pass
-    finally:
-        stop.set()
-        typing_task.cancel()
-        await task.stop()
-        _task_registry.unregister(task.task_id)
 
 
 # ─── Callback buttons ───────────────────────────────────────────────────────────
@@ -1369,14 +1635,15 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             idx = int(param)
             s = cc._session_mgr.switch_to(PLATFORM, str(uid), idx)
             if s:
-                await q.edit_message_text(f"✅ Switched to `{s.name}`", parse_mode="Markdown")
+                await q.edit_message_text(f"✅ Switched to `{s.display_name}`", parse_mode="Markdown")
             else:
                 await q.edit_message_text("Session not found.")
         elif action == "new":
             name = f"session-{int(time.time()) % 10000}"
             s = cc._session_mgr.create(PLATFORM, str(uid), name)
             await q.edit_message_text(
-                f"✅ Created and switched to `{s.name}`\n\nTip: use `/new <name>` to pick a name.",
+                f"✅ Created and switched to `{s.name}`\n\nTip: use `/new <name>` to pick a name, "
+                f"`/title <text>` to describe it.",
                 parse_mode="Markdown",
             )
         elif action == "delmenu":
@@ -1386,21 +1653,50 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             for i, s in enumerate(sessions):
                 if s.is_busy:
                     continue
-                label = f"🗑 {s.name}" + (" (active)" if i == active_idx else "")
+                label = f"🗑 {s.display_name}" + (" (active)" if i == active_idx else "")
                 btns.append([InlineKeyboardButton(label, callback_data=f"tg:sess:del:{i}")])
+            btns.append([InlineKeyboardButton("📦 Archive instead…", callback_data="tg:sess:arcmenu:_")])
             btns.append([InlineKeyboardButton("↩️ Cancel", callback_data="tg:sess:back:_")])
             await q.edit_message_text(
-                "Which session to delete?",
+                "Which session to delete?\n_Tip: /archive preserves history._",
                 reply_markup=InlineKeyboardMarkup(btns),
+                parse_mode="Markdown",
             )
         elif action == "del":
             idx = int(param)
             sessions = cc._session_mgr.get_all(PLATFORM, str(uid))
             name = sessions[idx].name if idx < len(sessions) else "?"
             if cc._session_mgr.delete(PLATFORM, str(uid), idx):
-                await q.edit_message_text(f"🗑 Deleted session `{name}`", parse_mode="Markdown")
+                await q.edit_message_text(f"🗑 Deleted session `{name}` and its history.", parse_mode="Markdown")
             else:
                 await q.edit_message_text("Cannot delete (busy or not found).")
+        elif action == "arcmenu":
+            sessions = cc._session_mgr.get_all(PLATFORM, str(uid))
+            btns = []
+            for i, s in enumerate(sessions):
+                if s.is_busy or s.archived:
+                    continue
+                btns.append([InlineKeyboardButton(
+                    f"📦 {s.display_name}", callback_data=f"tg:sess:arc:{s.name}"
+                )])
+            btns.append([InlineKeyboardButton("↩️ Cancel", callback_data="tg:sess:back:_")])
+            await q.edit_message_text(
+                "Which session to archive?\n_Archived sessions are hidden but keep their history._",
+                reply_markup=InlineKeyboardMarkup(btns),
+                parse_mode="Markdown",
+            )
+        elif action == "arc":
+            s = cc._session_mgr.archive(PLATFORM, str(uid), param)
+            if s:
+                await q.edit_message_text(f"📦 Archived `{s.display_name}`. Use /sessions all to see.", parse_mode="Markdown")
+            else:
+                await q.edit_message_text("Cannot archive.")
+        elif action == "unarc":
+            s = cc._session_mgr.unarchive(PLATFORM, str(uid), param)
+            if s:
+                await q.edit_message_text(f"✅ Restored and switched to `{s.display_name}`", parse_mode="Markdown")
+            else:
+                await q.edit_message_text("Session not found.")
         elif action == "back":
             await q.edit_message_text("Cancelled.")
         return
@@ -1408,6 +1704,10 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # Handle folder browser callbacks
     if kind in ("br", "bf", "bv", "ba"):
         await _handle_browse_callback(q, uid)
+        return
+
+    # Handle no-op (used for page counter display)
+    if kind == "noop":
         return
 
     # Handle pagination
@@ -1429,13 +1729,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         page_text = text[start:start + RESPONSE_PAGE_SIZE]
 
         footer = f"\n\n📄 _Page {page_num + 1}/{total_pages}_"
-
-        nav = []
-        if page_num > 0:
-            nav.append(InlineKeyboardButton("◀️ Prev", callback_data=f"tg:pg:{rid}:{page_num - 1}"))
-        if page_num < total_pages - 1:
-            nav.append(InlineKeyboardButton("▶️ Next", callback_data=f"tg:pg:{rid}:{page_num + 1}"))
-        markup = InlineKeyboardMarkup([nav]) if nav else None
+        markup = _action_buttons(rid, has_pages=True, page=page_num, total_pages=total_pages)
 
         try:
             await q.edit_message_text(page_text + footer, parse_mode=ParseMode.MARKDOWN, reply_markup=markup)
@@ -1472,21 +1766,22 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             summary = task.finish_summary()
             reply = f"{summary}\n\n{reply}"
             md_text = _protect_urls_for_markdown(reply)
+            r_rid = _store_response(uid, prompt, md_text)
             if len(md_text) <= 4096:
+                r_markup = _action_buttons(r_rid)
                 try:
-                    await placeholder.edit_text(md_text, parse_mode=ParseMode.MARKDOWN, reply_markup=None)
+                    await placeholder.edit_text(md_text, parse_mode=ParseMode.MARKDOWN, reply_markup=r_markup)
                 except Exception:
-                    await placeholder.edit_text(reply[:4096], reply_markup=None)
+                    await placeholder.edit_text(reply[:4096], reply_markup=r_markup)
             else:
-                rid = _store_response(uid, prompt, md_text)
-                page_text = md_text[:RESPONSE_PAGE_SIZE]
                 total_pages = (len(md_text) + RESPONSE_PAGE_SIZE - 1) // RESPONSE_PAGE_SIZE
-                btns = [[InlineKeyboardButton("▶️ Next page", callback_data=f"tg:pg:{rid}:1")]]
+                page_text = md_text[:RESPONSE_PAGE_SIZE]
                 footer = f"\n\n📄 _Page 1/{total_pages}_"
+                r_markup = _action_buttons(r_rid, has_pages=True, page=0, total_pages=total_pages)
                 try:
-                    await placeholder.edit_text(page_text + footer, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(btns))
+                    await placeholder.edit_text(page_text + footer, parse_mode=ParseMode.MARKDOWN, reply_markup=r_markup)
                 except Exception:
-                    await placeholder.edit_text(reply[:RESPONSE_PAGE_SIZE] + footer, reply_markup=InlineKeyboardMarkup(btns))
+                    await placeholder.edit_text(reply[:RESPONSE_PAGE_SIZE] + footer, reply_markup=r_markup)
         except Exception as exc:
             retry_btn = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Retry", callback_data=f"tg:retry:{task.task_id}")]])
             _response_store[f"retry_{task.task_id}"] = {"prompt": prompt, "uid": uid}
@@ -1494,6 +1789,144 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         finally:
             await task.stop()
             _task_registry.unregister(task.task_id)
+        return
+
+    # Handle response action buttons (retry/continue/tts from action row)
+    if kind == "act":
+        # value = "rid:action"
+        act_parts = value.split(":", 1)
+        if len(act_parts) < 2:
+            return
+        rid, action = act_parts
+        resp = _response_store.get(rid)
+        if not resp or resp["uid"] != uid:
+            await q.edit_message_text("Response expired.", reply_markup=None)
+            return
+
+        if action == "retry":
+            prompt = resp["prompt"]
+            await q.edit_message_text("🔄 Retrying…", reply_markup=None)
+            placeholder = q.message
+            task = TaskSession(placeholder, uid, prompt)
+            task.start_heartbeat()
+            _task_registry.register(task)
+            try:
+                reply, stats = await _ask(uid, prompt, tracker=task)
+                if task.cancelled:
+                    await placeholder.edit_text("⏹ Retry cancelled.", reply_markup=None)
+                    return
+                act_sess = _active_session(uid)
+                cc.save_turn(PLATFORM, str(uid), prompt, reply, session_name=act_sess.name)
+                cc.track_usage(PLATFORM, str(uid), stats.get("input_tokens", 0), stats.get("output_tokens", 0))
+                summary = task.finish_summary()
+                reply = f"{summary}\n\n{reply}"
+                md_text = _protect_urls_for_markdown(reply)
+                new_rid = _store_response(uid, prompt, md_text)
+                if len(md_text) <= 4096:
+                    act_markup = _action_buttons(new_rid)
+                    try:
+                        await placeholder.edit_text(md_text, parse_mode=ParseMode.MARKDOWN, reply_markup=act_markup)
+                    except Exception:
+                        await placeholder.edit_text(reply[:4096], reply_markup=act_markup)
+                else:
+                    tp = (len(md_text) + RESPONSE_PAGE_SIZE - 1) // RESPONSE_PAGE_SIZE
+                    act_markup = _action_buttons(new_rid, has_pages=True, page=0, total_pages=tp)
+                    footer = f"\n\n📄 _Page 1/{tp}_"
+                    try:
+                        await placeholder.edit_text(md_text[:RESPONSE_PAGE_SIZE] + footer, parse_mode=ParseMode.MARKDOWN, reply_markup=act_markup)
+                    except Exception:
+                        await placeholder.edit_text(reply[:RESPONSE_PAGE_SIZE] + footer, reply_markup=act_markup)
+            except Exception as exc:
+                await placeholder.edit_text(f"❌ Retry failed: {str(exc)[:150]}", reply_markup=None)
+            finally:
+                await task.stop()
+                _task_registry.unregister(task.task_id)
+            return
+
+        elif action == "continue":
+            prompt = "Continue from where you left off."
+            await q.edit_message_text("➡️ Continuing…", reply_markup=None)
+            placeholder = q.message
+            task = TaskSession(placeholder, uid, prompt)
+            task.start_heartbeat()
+            _task_registry.register(task)
+            try:
+                reply, stats = await _ask(uid, prompt, tracker=task)
+                if task.cancelled:
+                    await placeholder.edit_text("⏹ Cancelled.", reply_markup=None)
+                    return
+                cont_sess = _active_session(uid)
+                cc.save_turn(PLATFORM, str(uid), prompt, reply, session_name=cont_sess.name)
+                cc.track_usage(PLATFORM, str(uid), stats.get("input_tokens", 0), stats.get("output_tokens", 0))
+                summary = task.finish_summary()
+                reply = f"{summary}\n\n{reply}"
+                md_text = _protect_urls_for_markdown(reply)
+                new_rid = _store_response(uid, prompt, md_text)
+                if len(md_text) <= 4096:
+                    act_markup = _action_buttons(new_rid)
+                    try:
+                        await placeholder.edit_text(md_text, parse_mode=ParseMode.MARKDOWN, reply_markup=act_markup)
+                    except Exception:
+                        await placeholder.edit_text(reply[:4096], reply_markup=act_markup)
+                else:
+                    tp = (len(md_text) + RESPONSE_PAGE_SIZE - 1) // RESPONSE_PAGE_SIZE
+                    act_markup = _action_buttons(new_rid, has_pages=True, page=0, total_pages=tp)
+                    footer = f"\n\n📄 _Page 1/{tp}_"
+                    try:
+                        await placeholder.edit_text(md_text[:RESPONSE_PAGE_SIZE] + footer, parse_mode=ParseMode.MARKDOWN, reply_markup=act_markup)
+                    except Exception:
+                        await placeholder.edit_text(reply[:RESPONSE_PAGE_SIZE] + footer, reply_markup=act_markup)
+            except Exception as exc:
+                await placeholder.edit_text(f"❌ Continue failed: {str(exc)[:150]}", reply_markup=None)
+            finally:
+                await task.stop()
+                _task_registry.unregister(task.task_id)
+            return
+
+        elif action == "tts":
+            resp_text = resp["text"]
+            clean = re.sub(r'[*_`\[\]()]', '', resp_text)[:4000]
+            await q.edit_message_reply_markup(reply_markup=None)
+            try:
+                result = await tts_synthesize(clean, voice="alloy")
+                if result.error:
+                    await q.message.reply_text(f"TTS error: {result.error}")
+                    return
+                with open(result.audio_path, "rb") as f:
+                    await q.message.reply_voice(
+                        voice=f,
+                        caption=f"🔊 _{result.voice}_ · {result.text_length} chars",
+                        parse_mode=ParseMode.MARKDOWN,
+                    )
+                os.unlink(result.audio_path)
+            except Exception as exc:
+                await q.message.reply_text(f"TTS failed: {str(exc)[:100]}")
+            return
+        return
+
+    # Handle settings panel callbacks
+    if kind == "set":
+        # value = "category:choice" e.g. "model:sonnet", "perm:auto"
+        set_parts = value.split(":", 1)
+        if len(set_parts) < 2:
+            return
+        cat, choice = set_parts
+
+        if cat == "model":
+            _user_model[uid] = choice
+        elif cat == "perm":
+            _user_perm[uid] = "" if choice == "default" else choice
+        elif cat == "verbose":
+            _user_verbose[uid] = int(choice)
+        elif cat == "engine":
+            _user_engine[uid] = choice
+
+        # Re-render the settings panel
+        await q.edit_message_text(
+            _build_settings_text(uid),
+            reply_markup=_build_settings_markup(uid),
+            parse_mode="Markdown",
+        )
         return
 
     if kind == "model":
@@ -1549,6 +1982,463 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
 
 
+# ─── New features: /help, /poll, /tts, /imagine, /search ─────────────────────
+
+HELP_TEXT = """*Available commands:*
+
+*Chat & Sessions*
+/start — Welcome message
+/reset — Clear conversation history
+/sessions — List sessions
+/new `name` — Create new session
+/switch `N` — Switch to session N
+/tasks — List running tasks
+/cancel — Cancel a task
+/id — Show your user ID
+
+*Settings*
+/settings — All settings in one panel
+/model — Change Claude model
+/engine — Switch CLI/API/SDK
+/mode — Show current settings
+/permissions — Set CLI permissions
+/verbose — Set detail level
+
+*Memory*
+/remember `text` — Save a memory
+/recall `query` — Search memories
+/memories — List all memories
+/forget `id` — Delete a memory
+/editmem — Edit a memory
+/exportmem — Export all memories
+/importmem — Import memories
+/extractmem — Auto-extract from chat
+
+*Tools*
+/poll `Q | A | B | C` — Create a poll
+/tts `text` — Text to speech
+/imagine `prompt` — Generate an image
+/search `query` — Web search
+/fetch `url` — Extract page content
+/music `prompt` — Generate music
+/video `prompt` — Generate video
+/browse — Browse files
+/usage — Token usage stats
+/watchdog — Watchdog status
+
+*Tips:*
+- Send photos/documents for analysis
+- Send voice messages for transcription + Claude
+- URLs in messages are auto-fetched for context
+- Long responses are paginated with nav buttons
+- Every response has 🔄 Retry, ➡️ Continue, and 🔊 TTS buttons
+"""
+
+
+async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not _allowed(uid):
+        return
+    await update.message.reply_text(HELP_TEXT, parse_mode=ParseMode.MARKDOWN)
+
+
+async def cmd_poll(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not _allowed(uid):
+        return
+    text = (update.message.text or "").split(None, 1)
+    args = text[1] if len(text) > 1 else ""
+    result = parse_poll_command(args)
+    if isinstance(result, str):
+        await update.message.reply_text(result, parse_mode=ParseMode.MARKDOWN)
+        return
+    try:
+        await ctx.bot.send_poll(
+            chat_id=update.effective_chat.id,
+            question=result.question,
+            options=result.options,
+            is_anonymous=result.is_anonymous,
+            allows_multiple_answers=result.allows_multiple_answers,
+        )
+    except Exception as e:
+        await update.message.reply_text(f"Failed to create poll: {e}")
+
+
+async def cmd_tts(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not _allowed(uid):
+        return
+    if not tts_available():
+        await update.message.reply_text(
+            "TTS not configured. Set `OPENAI_API_KEY` and `TTS_ENABLED=true` in .env."
+        )
+        return
+
+    text = (update.message.text or "").split(None, 1)
+    if len(text) < 2 or not text[1].strip():
+        voices = ", ".join(f"`{v}`" for v in TTS_VOICES)
+        await update.message.reply_text(
+            f"Usage: `/tts text to speak`\n\nVoice: `/tts --voice nova Hello!`\n\nVoices: {voices}",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    args = text[1].strip()
+    voice = None
+    if args.startswith("--voice "):
+        parts = args.split(None, 2)
+        if len(parts) >= 3:
+            voice = parts[1]
+            args = parts[2]
+
+    placeholder = await update.message.reply_text("🔊 Generating speech…")
+    result = await tts_synthesize(args, voice=voice or "alloy")
+    if result.error:
+        await placeholder.edit_text(f"TTS error: {result.error}")
+        return
+    try:
+        with open(result.audio_path, "rb") as f:
+            await ctx.bot.send_voice(
+                chat_id=update.effective_chat.id,
+                voice=f,
+                caption=f"🔊 _{result.voice}_ · {result.text_length} chars",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        await placeholder.delete()
+    except Exception as e:
+        await placeholder.edit_text(f"Failed to send audio: {e}")
+    finally:
+        try:
+            os.unlink(result.audio_path)
+        except OSError:
+            pass
+
+
+async def cmd_imagine(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not _allowed(uid):
+        return
+    if not image_gen_available():
+        await update.message.reply_text(
+            "Image generation not configured. Set `OPENAI_API_KEY` and `IMAGE_GEN_ENABLED=true` in .env."
+        )
+        return
+
+    text = (update.message.text or "").split(None, 1)
+    if len(text) < 2 or not text[1].strip():
+        await update.message.reply_text(
+            "Usage: `/imagine a sunset over mountains`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    prompt = text[1].strip()
+    placeholder = await update.message.reply_text("🎨 Generating image…")
+    result = await image_generate(prompt)
+    if result.error:
+        await placeholder.edit_text(f"Image generation error: {result.error}")
+        return
+    try:
+        with open(result.image_path, "rb") as f:
+            caption = f"🎨 _{result.revised_prompt[:200]}_" if result.revised_prompt != prompt else f"🎨 _{prompt[:200]}_"
+            await ctx.bot.send_photo(
+                chat_id=update.effective_chat.id,
+                photo=f,
+                caption=caption,
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        await placeholder.delete()
+    except Exception as e:
+        await placeholder.edit_text(f"Failed to send image: {e}")
+    finally:
+        try:
+            os.unlink(result.image_path)
+        except OSError:
+            pass
+
+
+async def cmd_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not _allowed(uid):
+        return
+    if not search_available():
+        await update.message.reply_text(
+            "Web search not configured. Set `BRAVE_SEARCH_API_KEY` or `TAVILY_API_KEY` and `WEB_SEARCH_ENABLED=true` in .env."
+        )
+        return
+
+    text = (update.message.text or "").split(None, 1)
+    if len(text) < 2 or not text[1].strip():
+        await update.message.reply_text(
+            "Usage: `/search your query here`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    query = text[1].strip()
+    placeholder = await update.message.reply_text("🔍 Searching…")
+    resp = await web_search(query)
+    formatted = format_search_results(resp)
+    try:
+        await placeholder.edit_text(
+            formatted, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True,
+        )
+    except Exception:
+        await placeholder.edit_text(formatted, disable_web_page_preview=True)
+
+
+async def cmd_project(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Get or set the project directory for /code tasks."""
+    uid = update.effective_user.id
+    if not _allowed(uid):
+        return
+
+    if not ctx.args:
+        proj = coder.get_project(PLATFORM, str(uid))
+        if proj:
+            await update.message.reply_text(f"Current project directory: `{proj}`", parse_mode="Markdown")
+        else:
+            await update.message.reply_text("No project directory set. Usage: `/project /path/to/dir`", parse_mode="Markdown")
+        return
+
+    path = " ".join(ctx.args).strip()
+    ok, result = coder.set_project(PLATFORM, str(uid), path)
+    if ok:
+        await update.message.reply_text(f"✓ Project set to `{result}`", parse_mode="Markdown")
+    else:
+        await update.message.reply_text(f"✗ {result}")
+
+
+async def cmd_code(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Run a coding task in the project directory."""
+    uid = update.effective_user.id
+    if not _allowed(uid):
+        return
+
+    if not ctx.args:
+        await update.message.reply_text("Usage: `/code <task description>`", parse_mode="Markdown")
+        return
+
+    proj = coder.get_project(PLATFORM, str(uid))
+    if not proj:
+        await update.message.reply_text("No project directory set. Use `/project /path/to/dir` first.", parse_mode="Markdown")
+        return
+
+    if not os.path.isdir(proj):
+        await update.message.reply_text(f"Project directory no longer exists: `{proj}`", parse_mode="Markdown")
+        return
+
+    task = " ".join(ctx.args).strip()
+    prompt = coder.build_task_prompt(task, proj)
+
+    placeholder = await update.message.reply_text("⚙️ Working on your code task…")
+    stop = asyncio.Event()
+    typing_task = asyncio.create_task(_typing_loop(update.effective_chat.id, ctx, stop))
+
+    ts = TaskSession(placeholder, uid, task[:40])
+    _task_registry.register(ts)
+
+    try:
+        reply, stats = await cc.ask_claude_async(
+            prompt, [],
+            system=coder.CODER_SYSTEM,
+            timeout=cc.CLAUDE_TIMEOUT,
+            is_cancelled=lambda: ts.cancelled,
+            platform=PLATFORM,
+            user_id=str(uid),
+        )
+        if ts.cancelled:
+            await placeholder.edit_text("🚫 Cancelled.")
+            return
+
+        cc.track_usage(PLATFORM, str(uid), stats.get("input_tokens", 0), stats.get("output_tokens", 0))
+        cc.track_tool_usage(PLATFORM, str(uid), "code")
+
+        await placeholder.edit_text(reply[:4096])
+    except Exception as e:
+        log.error("cmd_code error: %s", e)
+        await placeholder.edit_text(f"❌ Error: {e}")
+    finally:
+        stop.set()
+        typing_task.cancel()
+        _task_registry.unregister(ts.task_id)
+
+
+async def cmd_music(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not _allowed(uid):
+        return
+    if not music_gen_available():
+        await update.message.reply_text(
+            "Music generation not configured. Set `REPLICATE_API_TOKEN` and `MUSIC_GEN_ENABLED=true` in .env."
+        )
+        return
+
+    text = (update.message.text or "").split(None, 1)
+    if len(text) < 2 or not text[1].strip():
+        await update.message.reply_text(
+            "Usage: `/music upbeat jazz piano solo`\n\nDuration: `/music --dur 15 chill lofi beats`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    args = text[1].strip()
+    duration = None
+    if args.startswith("--dur "):
+        parts = args.split(None, 2)
+        if len(parts) >= 3:
+            try:
+                duration = int(parts[1])
+            except ValueError:
+                pass
+            args = parts[2]
+
+    placeholder = await update.message.reply_text("🎵 Generating music… (this may take 1-2 min)")
+    result = await music_generate(args, duration=duration or 10)
+    if result.error:
+        await placeholder.edit_text(f"Music generation error: {result.error}")
+        return
+    try:
+        with open(result.audio_path, "rb") as f:
+            await ctx.bot.send_audio(
+                chat_id=update.effective_chat.id,
+                audio=f,
+                title=f"🎵 {args[:60]}",
+                caption=f"🎵 _{args[:200]}_",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        await placeholder.delete()
+    except Exception as e:
+        await placeholder.edit_text(f"Failed to send audio: {e}")
+    finally:
+        try:
+            os.unlink(result.audio_path)
+        except OSError:
+            pass
+
+
+async def cmd_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not _allowed(uid):
+        return
+    if not video_gen_available():
+        await update.message.reply_text(
+            "Video generation not configured. Set `REPLICATE_API_TOKEN` and `VIDEO_GEN_ENABLED=true` in .env."
+        )
+        return
+
+    text = (update.message.text or "").split(None, 1)
+    if len(text) < 2 or not text[1].strip():
+        await update.message.reply_text(
+            "Usage: `/video a cat playing piano`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    prompt = text[1].strip()
+    placeholder = await update.message.reply_text("🎬 Generating video… (this may take 2-5 min)")
+    result = await video_generate(prompt)
+    if result.error:
+        await placeholder.edit_text(f"Video generation error: {result.error}")
+        return
+    try:
+        with open(result.video_path, "rb") as f:
+            await ctx.bot.send_video(
+                chat_id=update.effective_chat.id,
+                video=f,
+                caption=f"🎬 _{prompt[:200]}_",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        await placeholder.delete()
+    except Exception as e:
+        await placeholder.edit_text(f"Failed to send video: {e}")
+    finally:
+        try:
+            os.unlink(result.video_path)
+        except OSError:
+            pass
+
+
+async def cmd_fetch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not _allowed(uid):
+        return
+
+    text = (update.message.text or "").split(None, 1)
+    if len(text) < 2 or not text[1].strip():
+        await update.message.reply_text(
+            "Usage: `/fetch https://example.com`\nExtracts readable content from a URL.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    url = text[1].strip()
+    placeholder = await update.message.reply_text("📖 Fetching content…")
+    result = await fetch_readable(url)
+    if result.error:
+        await placeholder.edit_text(f"Fetch error: {result.error}")
+        return
+
+    response = f"📖 *{result.title}*\n_{result.word_count} words_\n\n{result.content}"
+    if len(response) > 4000:
+        response = response[:4000] + "\n…_[truncated]_"
+    try:
+        await placeholder.edit_text(response, parse_mode=ParseMode.MARKDOWN,
+                                    disable_web_page_preview=True)
+    except Exception:
+        await placeholder.edit_text(response[:4000], disable_web_page_preview=True)
+
+
+# ─── Voice message handler ──────────────────────────────────────────────────────
+
+async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle voice messages: transcribe and optionally send to Claude."""
+    uid = update.effective_user.id
+    if not _allowed(uid):
+        return
+    if not cc.check_rate_limit(f"tg:{uid}"):
+        await update.message.reply_text("Rate limit exceeded.")
+        return
+
+    voice = update.message.voice or update.message.audio
+    if not voice:
+        return
+
+    # Download voice file
+    file = await ctx.bot.get_file(voice.file_id)
+    raw = bytes(await file.download_as_bytearray())
+    save_path = _upload_path(uid, ".ogg", "voice_")
+    save_path.write_bytes(raw)
+
+    if transcription_available():
+        placeholder = await update.message.reply_text("🎤 Transcribing…")
+        result = await voice_transcribe(str(save_path))
+        if result.error:
+            await placeholder.edit_text(f"Transcription error: {result.error}")
+            return
+
+        transcript = result.text.strip()
+        if not transcript:
+            await placeholder.edit_text("Could not transcribe audio (no speech detected).")
+            return
+
+        lang_note = f" [{result.language}]" if result.language else ""
+        dur_note = f" {result.duration_seconds:.0f}s" if result.duration_seconds else ""
+        header = f"🎤 _Transcribed{lang_note}{dur_note}:_\n\n"
+
+        # Send transcription and then process as a regular message
+        await placeholder.edit_text(f"{header}{transcript}", parse_mode=ParseMode.MARKDOWN)
+
+        # Now send the transcribed text to Claude
+        if _task_registry.user_task_count(uid) < MAX_CONCURRENT_TASKS:
+            asyncio.create_task(_run_task(update, ctx, uid, transcript))
+    else:
+        # No transcription available — send audio path to Claude
+        caption = update.message.caption or "Analyze this voice message."
+        prompt = f"{caption}\n\n[Voice message saved at: {save_path}]"
+        asyncio.create_task(_run_task(update, ctx, uid, prompt))
+
+
 # ─── Message handler ─────────────────────────────────────────────────────────────
 
 async def _send_paginated(update: Update, uid: int, prompt: str, text: str, placeholder=None):
@@ -1556,34 +2446,35 @@ async def _send_paginated(update: Update, uid: int, prompt: str, text: str, plac
     chunk = 4096
     md_text = _protect_urls_for_markdown(text)
 
-    # Short responses: send directly
+    # Store every response for action buttons (retry/continue/tts)
+    rid = _store_response(uid, prompt, md_text)
+
+    # Short responses: send with action buttons
     if len(md_text) <= chunk:
+        markup = _action_buttons(rid)
         if placeholder:
             try:
-                await placeholder.edit_text(md_text, parse_mode=ParseMode.MARKDOWN, reply_markup=None)
+                await placeholder.edit_text(md_text, parse_mode=ParseMode.MARKDOWN, reply_markup=markup)
                 return
             except Exception:
                 try:
-                    await placeholder.edit_text(text[:chunk], reply_markup=None)
+                    await placeholder.edit_text(text[:chunk], reply_markup=markup)
                     return
                 except Exception:
                     pass
 
         # Fallback: always try a new message
         try:
-            await update.effective_message.reply_text(md_text, parse_mode=ParseMode.MARKDOWN)
+            await update.effective_message.reply_text(md_text, parse_mode=ParseMode.MARKDOWN, reply_markup=markup)
         except Exception:
-            await update.effective_message.reply_text(text[:chunk])
+            await update.effective_message.reply_text(text[:chunk], reply_markup=markup)
         return
 
-    # Long responses: paginate
-    rid = _store_response(uid, prompt, md_text)
-    page_text = md_text[:RESPONSE_PAGE_SIZE]
+    # Long responses: paginate with action buttons
     total_pages = (len(md_text) + RESPONSE_PAGE_SIZE - 1) // RESPONSE_PAGE_SIZE
-
+    page_text = md_text[:RESPONSE_PAGE_SIZE]
     footer = f"\n\n📄 _Page 1/{total_pages}_"
-    btns = [[InlineKeyboardButton("▶️ Next page", callback_data=f"tg:pg:{rid}:1")]]
-    markup = InlineKeyboardMarkup(btns)
+    markup = _action_buttons(rid, has_pages=True, page=0, total_pages=total_pages)
 
     if placeholder:
         try:
@@ -1612,11 +2503,84 @@ async def _send_paginated(update: Update, uid: int, prompt: str, text: str, plac
             log.error("Failed to send response for uid=%s, text len=%d", uid, len(text))
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# Feature 1: Auto Memory Extraction
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def _auto_extract_memories(uid: int, user_text: str, reply: str):
+    """Background task: extract key facts from conversation and store as memories."""
+    try:
+        combined = f"User: {user_text}\nAssistant: {reply}"
+        if len(combined) < AUTO_MEMORY_MIN_LENGTH:
+            return
+        extracted = await extract_memories(combined)
+        stored = 0
+        for mem_data in extracted:
+            content = mem_data.get("content", "").strip()
+            if not content:
+                continue
+            # Deduplicate: skip if very similar memory already exists
+            existing = _memory.recall(PLATFORM, str(uid), content, limit=1)
+            if existing and existing[0].score and abs(existing[0].score) < 0.5:
+                continue
+            _memory.remember(
+                PLATFORM, str(uid), content,
+                tags=mem_data.get("tags", ["auto"]),
+                importance=mem_data.get("importance", 0.6),
+                metadata={"source": "auto_extract"},
+            )
+            stored += 1
+        if stored:
+            log.info("Auto-extracted %d memories for uid=%s", stored, uid)
+    except Exception:
+        log.debug("Auto memory extraction failed for uid=%s", uid, exc_info=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Feature 2: Cost Budget System
+# ═══════════════════════════════════════════════════════════════════════════════
+
+from .cost_budget import BudgetManager, BudgetExceeded
+
+_budget_mgr = BudgetManager()
+
+
+async def _check_budget(uid: int) -> str | None:
+    """Check if user is within budget. Returns warning/error message or None."""
+    if not COST_BUDGET_ENABLED:
+        return None
+    return _budget_mgr.check(PLATFORM, str(uid))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Feature 3: Smart Model Routing
+# ═══════════════════════════════════════════════════════════════════════════════
+
+from .smart_router import classify_complexity, route_model, route_model_api
+
+
+def _smart_model(uid: int, text: str) -> str:
+    """Pick model based on query complexity, or user override."""
+    override = _user_model.get(uid)
+    if override or not SMART_ROUTING_ENABLED:
+        return override or _DEFAULT_MODEL
+    return route_model(text)
+
+
 async def _run_task(update: Update, ctx: ContextTypes.DEFAULT_TYPE, uid: int, user_text: str):
     """Execute a single Claude task. Can run concurrently with other tasks."""
     placeholder = await update.message.reply_text("🧠 Thinking…")
     stop = asyncio.Event()
     typing_task = asyncio.create_task(_typing_loop(update.effective_chat.id, ctx, stop))
+
+    # Link understanding: fetch URL content after placeholder is visible
+    if LINK_ENABLED and extract_links(user_text):
+        try:
+            link_context = await understand_links(user_text)
+            if link_context:
+                user_text = f"{user_text}\n\n---\n[Auto-fetched link content below]\n{link_context}"
+        except Exception:
+            log.debug("Link understanding failed", exc_info=True)
 
     # Create task session with progress tracking
     task = TaskSession(placeholder, uid, user_text)
@@ -1652,6 +2616,10 @@ async def _run_task(update: Update, ctx: ContextTypes.DEFAULT_TYPE, uid: int, us
         cc.track_usage(PLATFORM, str(uid), stats.get("input_tokens", 0), stats.get("output_tokens", 0))
         cc.track_tool_usage(PLATFORM, str(uid), stats.get("tools_used", []))
         cc.track_cost(PLATFORM, str(uid), stats.get("input_tokens", 0), stats.get("output_tokens", 0), stats.get("cost_usd", 0))
+
+        # ── Auto Memory Extraction (Feature 1) ──────────────────────────
+        if not is_timeout and not is_error and AUTO_MEMORY_ENABLED:
+            asyncio.create_task(_auto_extract_memories(uid, user_text, reply))
 
         # Build header with completion stats
         v = _verbose(uid)
@@ -1768,6 +2736,8 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text or ""
     if not user_text.strip():
         return
+
+    # Link understanding moved to _run_task (after placeholder is shown)
 
     # Check concurrent task limit
     if _task_registry.user_task_count(uid) >= MAX_CONCURRENT_TASKS:
@@ -1905,6 +2875,381 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await typing_task
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# Feature 4: Session Resume/Fork commands
+# ═══════════════════════════════════════════════════════════════════════════════
+
+from .session_manager import SessionBrowser
+_session_browser = SessionBrowser()
+
+
+async def cmd_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Resume a previous conversation session."""
+    uid = update.effective_user.id
+    if not _allowed(uid):
+        return
+    args = (update.message.text or "").split(maxsplit=1)
+    if len(args) < 2:
+        # Show list of sessions to choose from
+        sessions = _session_browser.list_sessions(PLATFORM, str(uid), limit=5)
+        if not sessions:
+            await update.message.reply_text("No previous sessions found.")
+            return
+        lines = ["**Recent sessions** (use `/resume <name>`):\n"]
+        for s in sessions:
+            age = _format_age(s.last_active)
+            lines.append(f"  `{s.name}` — {s.message_count} msgs, {age} ago")
+            if s.preview:
+                lines.append(f"    _{s.preview[:60]}…_")
+        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+        return
+
+    session_name = args[1].strip()
+    sess = cc._session_mgr.get_or_create_active(PLATFORM, str(uid))
+    sess.name = session_name
+    await update.message.reply_text(f"Resumed session `{session_name}`.", parse_mode=ParseMode.MARKDOWN)
+
+
+async def cmd_fork(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Fork a session into a new branch."""
+    uid = update.effective_user.id
+    if not _allowed(uid):
+        return
+    args = (update.message.text or "").split(maxsplit=2)
+    source = args[1].strip() if len(args) > 1 else None
+    new_name = args[2].strip() if len(args) > 2 else None
+
+    if not source:
+        sess = cc._session_mgr.get_or_create_active(PLATFORM, str(uid))
+        source = sess.name
+
+    result = _session_browser.fork_session(PLATFORM, str(uid), source, new_name)
+    if result.success:
+        # Switch to the forked session
+        new_sess = cc._session_mgr.get_or_create_active(PLATFORM, str(uid))
+        new_sess.name = result.new_session_name
+        await update.message.reply_text(
+            f"Forked `{source}` → `{result.new_session_name}` ({result.messages_copied} messages copied).",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    else:
+        await update.message.reply_text(f"Fork failed: {result.error}")
+
+
+def _format_age(ts: float) -> str:
+    diff = time.time() - ts
+    if diff < 60:
+        return f"{int(diff)}s"
+    if diff < 3600:
+        return f"{int(diff / 60)}m"
+    if diff < 86400:
+        return f"{int(diff / 3600)}h"
+    return f"{int(diff / 86400)}d"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Feature 2: Budget command
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def cmd_budget(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Show or set cost budget."""
+    uid = update.effective_user.id
+    if not _allowed(uid):
+        return
+    args = (update.message.text or "").split()
+
+    if len(args) >= 3:
+        # /budget daily 2.0  or  /budget monthly 30.0
+        period = args[1].lower()
+        try:
+            amount = float(args[2])
+        except ValueError:
+            await update.message.reply_text("Usage: /budget daily 5.0 or /budget monthly 50.0")
+            return
+        if period == "daily":
+            _budget_mgr.set_budget(PLATFORM, str(uid), daily=amount)
+        elif period == "monthly":
+            _budget_mgr.set_budget(PLATFORM, str(uid), monthly=amount)
+        else:
+            await update.message.reply_text("Usage: /budget daily 5.0 or /budget monthly 50.0")
+            return
+        await update.message.reply_text(f"Budget updated: {period} = ${amount:.2f}")
+        return
+
+    report = _budget_mgr.usage_report(PLATFORM, str(uid))
+    daily_bar = _progress_bar(report.daily_pct)
+    monthly_bar = _progress_bar(report.monthly_pct)
+    await update.message.reply_text(
+        f"**Cost Budget**\n\n"
+        f"Today: ${report.daily_cost:.3f} / ${report.daily_limit:.2f} ({report.daily_requests} reqs)\n"
+        f"{daily_bar}\n\n"
+        f"Month: ${report.monthly_cost:.3f} / ${report.monthly_limit:.2f} ({report.monthly_requests} reqs)\n"
+        f"{monthly_bar}\n\n"
+        f"Use `/budget daily 5.0` or `/budget monthly 50.0` to adjust.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+def _progress_bar(pct: float, width: int = 20) -> str:
+    filled = int(pct * width)
+    filled = min(filled, width)
+    bar = "█" * filled + "░" * (width - filled)
+    icon = "🟢" if pct < 0.8 else "🟡" if pct < 1.0 else "🔴"
+    return f"{icon} [{bar}] {pct:.0%}"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Feature 5: Two-Agent command (/plan)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+from .two_agent import TwoAgentExecutor, should_use_two_agent
+_two_agent = TwoAgentExecutor()
+
+
+async def cmd_plan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Decompose a complex task into sub-steps and execute them."""
+    uid = update.effective_user.id
+    if not _allowed(uid):
+        return
+    task_text = (update.message.text or "").split(maxsplit=1)
+    if len(task_text) < 2:
+        await update.message.reply_text("Usage: /plan <complex task description>")
+        return
+
+    task = task_text[1].strip()
+    placeholder = await update.message.reply_text("🧩 Planning task…")
+
+    try:
+        plan = await _two_agent.plan(task)
+        await placeholder.edit_text(_two_agent.format_plan(plan), parse_mode=ParseMode.MARKDOWN)
+
+        # Execute steps with progress updates
+        async def on_step_start(step):
+            try:
+                text = _two_agent.format_plan(plan)
+                await placeholder.edit_text(text, parse_mode=ParseMode.MARKDOWN)
+            except Exception:
+                pass
+
+        async def on_step_done(step):
+            try:
+                text = _two_agent.format_plan(plan)
+                await placeholder.edit_text(text, parse_mode=ParseMode.MARKDOWN)
+            except Exception:
+                pass
+
+        plan = await _two_agent.execute(plan, on_step_start=on_step_start, on_step_done=on_step_done)
+
+        # Send final results
+        result_text = _two_agent.format_result(plan)
+        await _send_paginated(update, uid, task, result_text, placeholder=placeholder)
+
+    except Exception as e:
+        await placeholder.edit_text(f"❌ Planning failed: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Feature 7: Schedule command
+# ═══════════════════════════════════════════════════════════════════════════════
+
+from .auto_scheduler import AutoScheduler
+_auto_sched = AutoScheduler()
+
+
+async def cmd_schedule(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Create, list, or delete scheduled tasks."""
+    uid = update.effective_user.id
+    if not _allowed(uid):
+        return
+    args = (update.message.text or "").split(maxsplit=1)
+
+    if len(args) < 2 or args[1].strip().lower() == "list":
+        tasks = _auto_sched.list_tasks(PLATFORM, str(uid))
+        await update.message.reply_text(
+            _auto_sched.format_task_list(tasks), parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    sub = args[1].strip()
+
+    # /schedule delete 5
+    if sub.lower().startswith("delete "):
+        try:
+            task_id = int(sub.split()[1])
+            if _auto_sched.delete_task(task_id, PLATFORM, str(uid)):
+                await update.message.reply_text(f"Deleted task #{task_id}.")
+            else:
+                await update.message.reply_text(f"Task #{task_id} not found.")
+        except (ValueError, IndexError):
+            await update.message.reply_text("Usage: /schedule delete <id>")
+        return
+
+    # Natural language schedule
+    task = _auto_sched.parse_and_create(PLATFORM, str(uid), sub)
+    if task:
+        from .auto_scheduler import _format_interval
+        await update.message.reply_text(
+            f"Scheduled: **{task.description}**\n"
+            f"Every {_format_interval(task.interval_seconds)}"
+            f"{' (one-time)' if task.max_runs == 1 else ''}\n"
+            f"ID: `#{task.id}`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    else:
+        await update.message.reply_text(
+            "Couldn't parse schedule. Try:\n"
+            "  `/schedule check deploys every 2 hours`\n"
+            "  `/schedule remind me to stretch every 30 minutes`\n"
+            "  `/schedule list`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Feature 9: Knowledge Base commands
+# ═══════════════════════════════════════════════════════════════════════════════
+
+from .knowledge_base import KnowledgeBase
+_kb = KnowledgeBase()
+
+
+async def cmd_kb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Knowledge base management."""
+    uid = update.effective_user.id
+    if not _allowed(uid):
+        return
+    args = (update.message.text or "").split(maxsplit=2)
+    sub = args[1].strip().lower() if len(args) > 1 else "stats"
+
+    if sub == "stats":
+        s = _kb.stats(PLATFORM, str(uid))
+        await update.message.reply_text(
+            f"**Knowledge Base**\nDocuments: {s['documents']}\nChunks: {s['chunks']}",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    elif sub == "list":
+        docs = _kb.list_documents(PLATFORM, str(uid))
+        if not docs:
+            await update.message.reply_text("No documents in knowledge base.")
+            return
+        lines = ["**Knowledge Base Documents:**\n"]
+        for d in docs:
+            lines.append(f"  `{d.id[:8]}` {d.title} ({d.chunk_count} chunks)")
+        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+    elif sub == "add" and len(args) > 2:
+        # /kb add <text to add as knowledge>
+        text = args[2].strip()
+        doc = _kb.ingest_text(PLATFORM, str(uid), f"Note {int(time.time())}", text, tags=["manual"])
+        await update.message.reply_text(
+            f"Added to KB: {doc.chunk_count} chunks from '{doc.title}'.",
+        )
+    elif sub == "search" and len(args) > 2:
+        query = args[2].strip()
+        results = _kb.search(PLATFORM, str(uid), query, limit=3)
+        if not results:
+            await update.message.reply_text("No results found.")
+            return
+        lines = [f"**KB Search:** '{query}'\n"]
+        for r in results:
+            lines.append(f"📄 {r.document.title} (chunk {r.chunk.chunk_index})")
+            lines.append(f"  _{r.chunk.content[:150]}…_\n")
+        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+    elif sub == "delete" and len(args) > 2:
+        doc_id_prefix = args[2].strip()
+        docs = _kb.list_documents(PLATFORM, str(uid))
+        match = next((d for d in docs if d.id.startswith(doc_id_prefix)), None)
+        if match and _kb.delete_document(PLATFORM, str(uid), match.id):
+            await update.message.reply_text(f"Deleted: {match.title}")
+        else:
+            await update.message.reply_text("Document not found.")
+    else:
+        await update.message.reply_text(
+            "Usage:\n"
+            "  `/kb stats` — show KB stats\n"
+            "  `/kb list` — list documents\n"
+            "  `/kb add <text>` — add knowledge\n"
+            "  `/kb search <query>` — search KB\n"
+            "  `/kb delete <id>` — remove document",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Feature 10: Browser command
+# ═══════════════════════════════════════════════════════════════════════════════
+
+from .browser_automation import get_browser_agent, BROWSER_ENABLED
+
+
+async def cmd_browse_web(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Browser automation: screenshot, extract, or interact with web pages."""
+    uid = update.effective_user.id
+    if not _allowed(uid):
+        return
+    if not BROWSER_ENABLED:
+        await update.message.reply_text(
+            "Browser automation is disabled. Set `BROWSER_ENABLED=true` in .env\n"
+            "and install: `pip install playwright && playwright install chromium`"
+        )
+        return
+
+    args = (update.message.text or "").split(maxsplit=2)
+    if len(args) < 3:
+        await update.message.reply_text(
+            "Usage:\n"
+            "  `/web screenshot <url>`\n"
+            "  `/web extract <url>`\n"
+            "  `/web info <url>`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    action = args[1].strip().lower()
+    url = args[2].strip()
+    agent = get_browser_agent()
+
+    placeholder = await update.message.reply_text(f"🌐 {action}ing {url}…")
+
+    try:
+        if action == "screenshot":
+            result = await agent.screenshot(url)
+            if result.success and result.screenshot_path:
+                await update.message.reply_photo(
+                    open(result.screenshot_path, "rb"),
+                    caption=f"{result.title}\n{result.url}\n({result.duration:.1f}s)",
+                )
+                await placeholder.delete()
+            else:
+                await placeholder.edit_text(f"❌ {result.error}")
+
+        elif action == "extract":
+            result = await agent.extract_text(url)
+            if result.success and result.data:
+                page = result.data
+                text = f"**{page.title}**\n\n{page.text_content[:3000]}"
+                await _send_paginated(update, uid, url, text, placeholder=placeholder)
+            else:
+                await placeholder.edit_text(f"❌ {result.error}")
+
+        elif action == "info":
+            result = await agent.get_page_info(url)
+            if result.success and result.data:
+                data = result.data
+                text = (
+                    f"**{data['title']}**\n"
+                    f"URL: {data['url']}\n"
+                    f"Preview: {data['text_preview'][:500]}…"
+                )
+                await placeholder.edit_text(text, parse_mode=ParseMode.MARKDOWN)
+            else:
+                await placeholder.edit_text(f"❌ {result.error}")
+        else:
+            await placeholder.edit_text("Unknown action. Use: screenshot, extract, info")
+
+    except Exception as e:
+        await placeholder.edit_text(f"❌ Browser error: {e}")
+
+
 # ─── Entry point ─────────────────────────────────────────────────────────────────
 
 def build_app() -> Application:
@@ -1920,20 +3265,25 @@ def build_app() -> Application:
     app = Application.builder().token(TOKEN).request(req).build()
 
     app.add_handler(CommandHandler("start",       cmd_start))
+    app.add_handler(CommandHandler("help",        cmd_help))
     app.add_handler(CommandHandler("tasks",       cmd_tasks))
     app.add_handler(CommandHandler("cancel",      cmd_cancel))
     app.add_handler(CommandHandler("sessions",    cmd_sessions))
     app.add_handler(CommandHandler("new",         cmd_new))
     app.add_handler(CommandHandler("switch",      cmd_switch))
+    app.add_handler(CommandHandler("rename",      cmd_rename))
+    app.add_handler(CommandHandler("title",       cmd_title))
+    app.add_handler(CommandHandler("pin",         cmd_pin))
+    app.add_handler(CommandHandler("archive",     cmd_archive))
+    app.add_handler(CommandHandler("searchsess",  cmd_search_sessions))
     app.add_handler(CommandHandler("browse",      cmd_browse))
     app.add_handler(CommandHandler("reset",       cmd_reset))
     app.add_handler(CommandHandler("mode",        cmd_mode))
     app.add_handler(CommandHandler("model",       cmd_model))
     app.add_handler(CommandHandler("engine",      cmd_engine))
     app.add_handler(CommandHandler("verbose",     cmd_verbose))
-    app.add_handler(CommandHandler("project",     cmd_project))
-    app.add_handler(CommandHandler("code",        cmd_code))
     app.add_handler(CommandHandler("permissions", cmd_permissions))
+    app.add_handler(CommandHandler("settings",    cmd_settings))
     app.add_handler(CommandHandler("usage",       cmd_usage))
     app.add_handler(CommandHandler("watchdog",    cmd_watchdog))
     app.add_handler(CommandHandler("id",          cmd_id))
@@ -1941,11 +3291,59 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("recall",      cmd_recall))
     app.add_handler(CommandHandler("memories",    cmd_memories))
     app.add_handler(CommandHandler("forget",      cmd_forget))
+    app.add_handler(CommandHandler("editmem",     cmd_editmem))
+    app.add_handler(CommandHandler("exportmem",   cmd_exportmem))
+    app.add_handler(CommandHandler("importmem",   cmd_importmem))
+    app.add_handler(CommandHandler("extractmem",  cmd_extractmem))
+    app.add_handler(CommandHandler("poll",        cmd_poll))
+    app.add_handler(CommandHandler("tts",         cmd_tts))
+    app.add_handler(CommandHandler("imagine",     cmd_imagine))
+    app.add_handler(CommandHandler("search",      cmd_search))
+    app.add_handler(CommandHandler("project",     cmd_project))
+    app.add_handler(CommandHandler("code",        cmd_code))
+    app.add_handler(CommandHandler("music",       cmd_music))
+    app.add_handler(CommandHandler("video",       cmd_video))
+    app.add_handler(CommandHandler("fetch",       cmd_fetch))
+    # ── New feature commands ──
+    app.add_handler(CommandHandler("resume",      cmd_resume))
+    app.add_handler(CommandHandler("fork",        cmd_fork))
+    app.add_handler(CommandHandler("budget",      cmd_budget))
+    app.add_handler(CommandHandler("plan",        cmd_plan))
+    app.add_handler(CommandHandler("schedule",    cmd_schedule))
+    app.add_handler(CommandHandler("kb",          cmd_kb))
+    app.add_handler(CommandHandler("web",         cmd_browse_web))
     app.add_handler(CallbackQueryHandler(handle_callback, pattern=r"^tg:"))
+    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
     app.add_handler(MessageHandler(filters.PHOTO,              handle_photo))
     app.add_handler(MessageHandler(filters.Document.ALL,       handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     return app
+
+
+BOT_COMMANDS = [
+    BotCommand("settings", "Model, engine, permissions, verbosity"),
+    BotCommand("sessions", "View and switch sessions"),
+    BotCommand("new", "Create a new session"),
+    BotCommand("tasks", "Show running tasks"),
+    BotCommand("cancel", "Cancel a task"),
+    BotCommand("reset", "Clear conversation history"),
+    BotCommand("browse", "Browse project files"),
+    BotCommand("search", "Web search"),
+    BotCommand("imagine", "Generate an image"),
+    BotCommand("tts", "Text to speech"),
+    BotCommand("poll", "Create a poll"),
+    BotCommand("remember", "Save a memory"),
+    BotCommand("recall", "Search memories"),
+    BotCommand("usage", "Token usage stats"),
+    BotCommand("budget", "Cost budget and usage"),
+    BotCommand("plan", "Decompose complex tasks (two-agent)"),
+    BotCommand("resume", "Resume a previous session"),
+    BotCommand("fork", "Fork a session into a new branch"),
+    BotCommand("schedule", "Schedule recurring tasks"),
+    BotCommand("kb", "Knowledge base management"),
+    BotCommand("web", "Browser automation"),
+    BotCommand("help", "Show all commands"),
+]
 
 
 async def run_telegram():
@@ -1954,6 +3352,11 @@ async def run_telegram():
     await app.initialize()
     await app.start()
     await app.updater.start_polling(drop_pending_updates=True)
+    try:
+        await app.bot.set_my_commands(BOT_COMMANDS)
+        log.info("Bot menu commands registered (%d commands).", len(BOT_COMMANDS))
+    except Exception as exc:
+        log.warning("Failed to set bot commands: %s", exc)
     log.info("Telegram bot is running.")
     try:
         while True:

@@ -894,6 +894,43 @@ Docs: https://github.com/telechatai/telechat`);
       process.exit(1);
     }
 
+    // Pre-flight: Python check
+    const python = findPython();
+    if (!python) {
+      console.error("  ✗ Python 3.9+ required. Install from https://python.org/downloads");
+      process.exit(1);
+    }
+    const pyVer = execSync(`${python} --version`, { encoding: "utf8" }).trim();
+    const pyMinor = parseInt(pyVer.match(/3\.(\d+)/)?.[1] || "0", 10);
+    if (pyMinor < 9) {
+      console.error(`  ✗ ${pyVer} found but Python 3.9+ is required.`);
+      process.exit(1);
+    }
+    console.log(`  ✓ ${pyVer}`);
+
+    // Pre-flight: install/upgrade Python backend
+    if (!isPyPkgInstalled(python)) {
+      const s = spin("Installing Python backend...");
+      if (installPyPkg(python)) {
+        s.ok("Python backend installed");
+      } else {
+        s.fail("Could not install Python backend");
+        console.error(`    Fix: ${python} -m pip install ${PYPI_PACKAGE}`);
+        process.exit(1);
+      }
+    } else {
+      try { execSync(`${python} -m pip install --upgrade ${PYPI_PACKAGE}`, { stdio: "ignore" }); } catch {}
+      console.log("  ✓ Python backend up to date");
+    }
+
+    // Pre-flight: stop running bot if any
+    const runningPid = getRunningPid();
+    if (runningPid) {
+      console.log(`  ⚠ telechat is running (PID ${runningPid}) — stopping for reconfiguration...`);
+      stopService();
+      await sleep(500);
+    }
+
     // Data home holds .env/logs/db; ask only for the Claude working directory
     ensureDataHome();
     const claudeWorkdir = await chooseClaudeWorkdir();
@@ -1040,7 +1077,54 @@ FLOW:
    - Ask: "Paste your Slack member ID to restrict access (find it: click your profile pic → 'Profile' → ⋮ → 'Copy member ID'), or press Enter to allow all:"
    - Save SLACK_ALLOWED_USER_IDS.
 
-4. FINALIZE
+4. OPTIONAL FEATURES
+   Print: "── Optional Features ──"
+   Print: "telechat supports several optional features. Each needs an API key."
+   Print: "You can skip all of these and add them later by editing ~/.telechat/.env"
+   Print: ""
+
+   Ask: "Enable any optional features? (Enter = skip all, or pick numbers)"
+   Print:
+     "  1) Voice messages — transcribe voice/audio via OpenAI Whisper
+      2) Text-to-speech — /tts command to generate spoken audio (OpenAI)
+      3) Image generation — /image command via DALL-E 3 (OpenAI)
+      4) Web search — /search command via Brave or Tavily
+      5) Web fetch — /fetch extracts readable content from URLs (Jina)
+      6) Music generation — /music command via Replicate (MusicGen)
+      7) Video generation — /video command via Replicate (Luma/Minimax)
+      Enter numbers (e.g. '1,2,3') or press Enter to skip:"
+
+   Wait for user response. If they press Enter or say skip/none, skip to Finalize.
+
+   If they chose any feature that needs OpenAI (1, 2, or 3):
+   - Check if OPENAI_API_KEY is already set in .env. If so, validate it silently.
+   - If not set, ask: "Paste your OpenAI API key (sk-...):"
+   - Save OPENAI_API_KEY.
+   - For feature 1: set TRANSCRIPTION_ENABLED=true
+   - For feature 2: set TTS_ENABLED=true
+   - For feature 3: set IMAGE_GEN_ENABLED=true
+
+   If they chose web search (4):
+   - Ask: "Which search provider?
+       1) Brave Search (free: 2000 queries/month) — https://api.search.brave.com
+       2) Tavily (free: 1000 queries/month) — https://tavily.com
+       Choose (1/2):"
+   - Ask for the chosen API key.
+   - Set WEB_SEARCH_ENABLED=true and save the key (BRAVE_SEARCH_API_KEY or TAVILY_API_KEY).
+
+   If they chose web fetch (5):
+   - Set WEB_FETCH_ENABLED=true.
+   - Ask: "Jina Reader API key (optional, free 1M tokens/month — https://jina.ai/reader):"
+   - If provided, save JINA_API_KEY.
+
+   If they chose any Replicate feature (6 or 7):
+   - Check if REPLICATE_API_TOKEN is already set. If not:
+   - Ask: "Paste your Replicate API token — https://replicate.com :"
+   - Save REPLICATE_API_TOKEN.
+   - For feature 6: set MUSIC_GEN_ENABLED=true
+   - For feature 7: set VIDEO_GEN_ENABLED=true
+
+5. FINALIZE
    Print: "── Finalize ──"
    - If CLAUDE_MODE is already set in .env, keep it. Otherwise ask:
      "How should telechat connect to Claude?
@@ -1058,6 +1142,12 @@ FLOW:
      CLAUDE_CLI_PERMISSION_MODE=bypassPermissions
      CLAUDE_TIMEOUT=300
    - Write .env file to ${envFile} (the data home, NOT the working directory).
+
+   IMPORTANT: Before printing the summary, read back the .env file you just wrote
+   and verify that at least one platform has valid credentials (TELEGRAM_BOT_TOKEN,
+   GREEN_API_INSTANCE_ID+GREEN_API_TOKEN, or SLACK_BOT_TOKEN+SLACK_APP_TOKEN).
+   If no platform is configured, warn the user and do NOT run telechat start.
+
    - Print a clean summary:
      "
      ── Setup Complete ──
@@ -1066,6 +1156,7 @@ FLOW:
      Slack    : ✓ team-name (or ── skipped)
      Claude   : CLI mode (or API mode)
      BOT_MODE : telegram,whatsapp (whatever was configured)
+     Features : voice, tts, image gen (or ── none)
 
      Starting bot..."
    - Then run bash: telechat start
@@ -1088,10 +1179,58 @@ FLOW:
     });
 
     child.on("exit", async (code) => {
-      if (code !== 0) return process.exit(code || 0);
+      if (code !== 0) {
+        console.log(`\n  ⚠ Claude CLI exited with code ${code || "unknown"}.`);
+        if (!existsSync(envFile)) {
+          console.log("  No .env was created. You can try again:");
+          console.log("    telechat init     (AI-guided — requires Claude CLI)");
+          console.log("    telechat setup    (manual wizard — no Claude needed)\n");
+        } else {
+          console.log("  Your .env file may be partially configured.");
+          console.log("  Options:");
+          console.log("    telechat init     Re-run setup (keeps existing values)");
+          console.log("    telechat setup    Manual wizard");
+          console.log("    telechat env      Review current config\n");
+        }
+        return process.exit(code || 1);
+      }
 
       // Post-init validation: catch anything Claude CLI missed
       await postInitValidation(envFile);
+
+      // Final validation: ensure at least one platform is configured
+      if (existsSync(envFile)) {
+        const finalEnv = fs.readFileSync(envFile, "utf8");
+        const hasTg = /TELEGRAM_BOT_TOKEN=.+/.test(finalEnv)
+          && !/TELEGRAM_BOT_TOKEN=your_/.test(finalEnv);
+        const hasWa = /GREEN_API_INSTANCE_ID=.+/.test(finalEnv)
+          && /GREEN_API_TOKEN=.+/.test(finalEnv);
+        const hasSl = /SLACK_BOT_TOKEN=xoxb-.+/.test(finalEnv)
+          && /SLACK_APP_TOKEN=xapp-.+/.test(finalEnv);
+
+        if (!hasTg && !hasWa && !hasSl) {
+          console.log("\n  ⚠ No platform credentials found in .env.");
+          console.log("  The bot needs at least one of: Telegram, WhatsApp, or Slack.");
+          console.log("  Run 'telechat init' again or edit ~/.telechat/.env manually.\n");
+          process.exit(1);
+        }
+
+        // Warn about missing access control
+        const warnings = [];
+        if (hasTg && !/TELEGRAM_ALLOWED_USER_IDS=\d/.test(finalEnv))
+          warnings.push("Telegram: no user restriction set (anyone can use your bot)");
+        if (hasWa && !/WHATSAPP_ALLOWED_NUMBERS=\d/.test(finalEnv))
+          warnings.push("WhatsApp: no number restriction set (anyone can message your bot)");
+        if (hasSl && !/SLACK_ALLOWED_USER_IDS=\w/.test(finalEnv))
+          warnings.push("Slack: no user restriction set (anyone in workspace can use the bot)");
+
+        if (warnings.length) {
+          console.log("\n  ⚠ Security warnings:");
+          for (const w of warnings) console.log(`    • ${w}`);
+          console.log("    Fix: telechat init → reconfigure, or edit ~/.telechat/.env\n");
+        }
+      }
+
       process.exit(0);
     });
     return;

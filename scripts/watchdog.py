@@ -330,7 +330,7 @@ Fix the error. If you can't confidently fix it, respond with just "SKIP: <reason
         "--model", CLAUDE_MODEL,
         "-p", prompt,
         "--output-format", "json",
-        "--dangerously-skip-permissions",
+        "--permission-mode", "auto",
     ]
 
     try:

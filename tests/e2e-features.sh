@@ -196,7 +196,7 @@ fi
 # ── 4c. Memory store round-trip ──────────────────────────────────────────────
 echo "[4c] Memory store (remember / recall / forget)"
 out="$(DB_PATH="$TMP/mem.db" PYTHONPATH="$REPO_ROOT" "$PY" - <<PY 2>&1
-from memory import MemoryStore
+from telechat_pkg.memory import MemoryStore
 ms = MemoryStore("$TMP/mem.db")
 m = ms.remember("tg", "e2e_u", "prefers dark mode", tags=["pref"], importance=0.8)
 assert m.id and m.content == "prefers dark mode" and m.importance == 0.8

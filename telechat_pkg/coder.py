@@ -15,11 +15,21 @@ Claude CLI plumbing.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import claude_core as cc
+from .error_classifier import (
+    ConvergenceDetector,
+    classify_error,
+    format_classification,
+)
+
+log = logging.getLogger(__name__)
 
 # ─── Per-user project directory store ────────────────────────────────────────
 # Maps "<platform>:<user_id>" → absolute project path. Stored as JSON next to
@@ -131,3 +141,158 @@ def build_task_prompt(task: str, project_dir: str) -> str:
         f"REPORT workflow now. Make the changes directly in the working "
         f"directory and verify them by running the project's tests/build."
     )
+
+
+# ─── Pipeline stage tracking (ported from auto-agent) ────────────────────────
+#
+# The coding agent's tool usage is mapped to high-level pipeline stages so the
+# Telegram progress indicator can show where in the workflow we are, not just
+# what tool is running.
+
+class PipelineStage:
+    """Named stages with emoji, mapped from tool activity."""
+
+    EXPLORING = ("exploring", "🔍 Exploring")
+    PLANNING  = ("planning",  "📋 Planning")
+    CODING    = ("coding",    "⚙️ Implementing")
+    TESTING   = ("testing",   "🧪 Testing")
+    REVIEWING = ("reviewing", "👀 Reviewing")
+    FIXING    = ("fixing",    "🔧 Fixing")
+    DEPLOYING = ("deploying", "🚀 Deploying")
+    DONE      = ("done",      "✅ Done")
+    FAILED    = ("failed",    "❌ Failed")
+
+
+# Map tool names → pipeline stage (heuristic)
+_TOOL_STAGE_MAP = {
+    "Read":       PipelineStage.EXPLORING,
+    "Grep":       PipelineStage.EXPLORING,
+    "ListDir":    PipelineStage.EXPLORING,
+    "WebSearch":  PipelineStage.EXPLORING,
+    "WebFetch":   PipelineStage.EXPLORING,
+    "TodoWrite":  PipelineStage.PLANNING,
+    "TodoRead":   PipelineStage.PLANNING,
+    "Write":      PipelineStage.CODING,
+    "Edit":       PipelineStage.CODING,
+    "Bash":       None,  # ambiguous — inferred from command content
+    "Agent":      PipelineStage.CODING,
+}
+
+# Bash command patterns → stage
+_BASH_STAGE_PATTERNS = [
+    (["test", "pytest", "jest", "vitest", "mocha", "cargo test", "go test",
+      "npm test", "yarn test", "bun test", "make test"],
+     PipelineStage.TESTING),
+    (["lint", "eslint", "ruff", "flake8", "mypy", "tsc", "clippy"],
+     PipelineStage.REVIEWING),
+    (["git commit", "git push", "deploy", "docker build"],
+     PipelineStage.DEPLOYING),
+    (["npm install", "pip install", "yarn add", "cargo add"],
+     PipelineStage.CODING),
+]
+
+
+class PipelineTracker:
+    """Tracks the current pipeline stage based on tool activity.
+
+    Also integrates convergence detection — if the coding agent is stuck
+    in a fix loop, this produces an actionable status message.
+    """
+
+    def __init__(self):
+        self.current_stage = PipelineStage.EXPLORING
+        self.stage_history: list[tuple[str, str, float]] = []  # (stage_id, label, timestamp)
+        self.convergence = ConvergenceDetector()
+        self._fix_count = 0
+        self._test_count = 0
+        self._last_error: str = ""
+
+    def on_tool(self, tool_name: str, detail: str = "") -> tuple[str, str]:
+        """Update stage based on tool use. Returns (stage_id, stage_label)."""
+        stage = _TOOL_STAGE_MAP.get(tool_name)
+
+        # Bash: infer from command content
+        if tool_name == "Bash" and detail:
+            detail_lower = detail.lower()
+            for patterns, bash_stage in _BASH_STAGE_PATTERNS:
+                if any(p in detail_lower for p in patterns):
+                    stage = bash_stage
+                    break
+            if stage is None:
+                # Default: if we've been coding, bash is probably building/running
+                if self.current_stage == PipelineStage.CODING:
+                    stage = PipelineStage.TESTING
+                else:
+                    stage = self.current_stage  # stay in current
+
+        if stage is None:
+            stage = self.current_stage
+
+        # Track fix loop iterations
+        if stage == PipelineStage.TESTING:
+            self._test_count += 1
+        if (self.current_stage == PipelineStage.TESTING
+                and stage == PipelineStage.CODING
+                and self._test_count > 0):
+            self._fix_count += 1
+            stage = PipelineStage.FIXING
+
+        self.current_stage = stage
+        sid, label = stage
+        self.stage_history.append((sid, label, time.time()))
+        return sid, label
+
+    def on_error(self, error_text: str) -> str:
+        """Record an error from stderr/test output. Returns classification summary."""
+        cls = classify_error(error_text)
+        self.convergence.record(cls.fingerprint)
+        self._last_error = format_classification(cls)
+        return self._last_error
+
+    def on_success(self) -> None:
+        """Record a successful iteration (tests passed)."""
+        self.convergence.record("")
+
+    def get_convergence_warning(self) -> str | None:
+        """Check convergence and return a warning if stuck, or None."""
+        result = self.convergence.check()
+        if result.status == "progressing":
+            return None
+        emoji = {
+            "oscillating": "🔄",
+            "stuck": "🚧",
+            "diverging": "📈",
+        }.get(result.status, "⚠️")
+        return f"{emoji} *{result.status.title()}*: {result.reason}\n_Suggestion: {result.action}_"
+
+    def stage_summary(self) -> str:
+        """One-line stage summary for the progress indicator."""
+        _, label = self.current_stage
+        parts = [label]
+        if self._fix_count > 0:
+            parts.append(f"(fix attempt {self._fix_count})")
+        if self._last_error:
+            parts.append(f"\n{self._last_error}")
+        return " ".join(parts)
+
+    def pipeline_bar(self) -> str:
+        """Visual pipeline progress bar showing completed stages."""
+        stages = [
+            PipelineStage.EXPLORING,
+            PipelineStage.PLANNING,
+            PipelineStage.CODING,
+            PipelineStage.TESTING,
+            PipelineStage.REVIEWING,
+        ]
+        visited = {sid for sid, _, _ in self.stage_history}
+        current_sid, _ = self.current_stage
+        parts = []
+        for sid, label in stages:
+            emoji = label.split()[0]
+            if sid == current_sid:
+                parts.append(f"▶{emoji}")
+            elif sid in visited:
+                parts.append(f"✓{emoji}")
+            else:
+                parts.append(f"·{emoji}")
+        return " ".join(parts)

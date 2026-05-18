@@ -8,16 +8,20 @@ Each memory belongs to a platform + user_id, so Telegram/WhatsApp/Slack
 users each have their own memory namespace.
 
 Usage:
-    from memory import MemoryStore
+    from telechat_pkg.memory import MemoryStore
     mem = MemoryStore()              # uses bot.db
     mem.remember("telegram", "123", "User prefers dark mode", tags=["preference"])
     results = mem.recall("telegram", "123", "dark mode")
     mem.forget("telegram", "123", "<uuid>")
+    mem.export_all("telegram", "123")  # → list[dict] for JSON export
+    mem.import_all("telegram", "123", [...])  # bulk import
 """
 
 from __future__ import annotations
 
 import json
+import logging
+import os
 import sqlite3
 import threading
 import time
@@ -25,6 +29,23 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
+
+log = logging.getLogger(__name__)
+
+EXTRACTION_PROMPT = (
+    "You are a memory extraction system for an AI assistant. Given a conversation, "
+    "extract the most important facts worth remembering for future sessions.\n\n"
+    "Rules:\n"
+    "- Extract 3–10 specific, concrete facts — never vague summaries\n"
+    "- Each memory: 1–2 sentences, stands alone without conversation context\n"
+    "- Prioritise: user preferences, technical decisions, project details, personal context\n"
+    "- Skip: small talk, one-off tasks already done, anything obviously temporary\n"
+    "- tags: 2–4 lowercase labels from: preference, project, tooling, deploy, infra, coding, "
+    "editor, personal, workflow\n"
+    "- importance: 0.9–1.0 critical preferences/key decisions | 0.6–0.8 useful context | 0.5 minor facts\n\n"
+    'Return ONLY a valid JSON array, no prose:\n'
+    '[{"content":"...","tags":["tag1","tag2"],"importance":0.8}]'
+)
 
 
 @dataclass
@@ -37,6 +58,7 @@ class Memory:
     importance: float = 0.5
     created_at: float = 0.0
     updated_at: float = 0.0
+    metadata: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -69,7 +91,8 @@ class MemoryStore:
                 tags        TEXT,
                 importance  REAL NOT NULL DEFAULT 0.5,
                 created_at  REAL NOT NULL,
-                updated_at  REAL NOT NULL
+                updated_at  REAL NOT NULL,
+                metadata    TEXT
             );
 
             CREATE INDEX IF NOT EXISTS idx_memories_user
@@ -77,6 +100,12 @@ class MemoryStore:
             CREATE INDEX IF NOT EXISTS idx_memories_updated
                 ON memories(updated_at DESC);
         """)
+
+        # Add metadata column if upgrading from older schema
+        try:
+            conn.execute("SELECT metadata FROM memories LIMIT 0")
+        except sqlite3.OperationalError:
+            conn.execute("ALTER TABLE memories ADD COLUMN metadata TEXT")
 
         # FTS5 with Porter stemming for better recall
         try:
@@ -89,7 +118,7 @@ class MemoryStore:
                     content_rowid = 'rowid'
                 )
             """)
-        except sqlite3.OperationalError:
+        except sqlite3.OperationalError:  # pragma: no cover
             # FTS5 not available — fall back to LIKE search
             pass
 
@@ -112,21 +141,24 @@ class MemoryStore:
         ]:
             try:
                 conn.execute(trigger_sql)
-            except sqlite3.OperationalError:
+            except sqlite3.OperationalError:  # pragma: no cover
                 pass
 
         conn.commit()
 
     def _has_fts(self) -> bool:
-        try:
-            self._conn().execute("SELECT 1 FROM memories_fts LIMIT 0")
-            return True
-        except sqlite3.OperationalError:
-            return False
+        if not hasattr(self, "_fts_available"):
+            try:
+                self._conn().execute("SELECT 1 FROM memories_fts LIMIT 0")
+                self._fts_available = True
+            except sqlite3.OperationalError:
+                self._fts_available = False
+        return self._fts_available
 
     _MEMORY_FIELDS = frozenset(Memory.__dataclass_fields__)
 
     def _parse_row(self, row: sqlite3.Row) -> Memory:
+        meta_raw = row["metadata"] if "metadata" in row.keys() else None
         return Memory(
             id=row["id"],
             platform=row["platform"],
@@ -136,11 +168,14 @@ class MemoryStore:
             importance=row["importance"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
+            metadata=json.loads(meta_raw) if meta_raw else {},
         )
 
     def _row_to_search_result(self, row: sqlite3.Row, score: float) -> SearchResult:
-        d = {k: row[k] for k in self._MEMORY_FIELDS if k != "tags"}
+        d = {k: row[k] for k in self._MEMORY_FIELDS if k not in ("tags", "metadata")}
         d["tags"] = json.loads(row["tags"]) if row["tags"] else []
+        meta_raw = row["metadata"] if "metadata" in row.keys() else None
+        d["metadata"] = json.loads(meta_raw) if meta_raw else {}
         d["score"] = score
         return SearchResult(**d)
 
@@ -154,6 +189,7 @@ class MemoryStore:
         *,
         tags: list[str] | None = None,
         importance: float = 0.5,
+        metadata: dict | None = None,
     ) -> Memory:
         now = time.time()
         mem = Memory(
@@ -165,16 +201,25 @@ class MemoryStore:
             importance=max(0.0, min(1.0, importance)),
             created_at=now,
             updated_at=now,
+            metadata=metadata or {},
         )
         self._conn().execute(
-            """INSERT INTO memories (id, platform, user_id, content, tags, importance, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            """INSERT INTO memories (id, platform, user_id, content, tags, importance, created_at, updated_at, metadata)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (mem.id, mem.platform, mem.user_id, mem.content,
              json.dumps(mem.tags) if mem.tags else None,
-             mem.importance, mem.created_at, mem.updated_at),
+             mem.importance, mem.created_at, mem.updated_at,
+             json.dumps(mem.metadata) if mem.metadata else None),
         )
         self._conn().commit()
         return mem
+
+    def get(self, platform: str, user_id: str, memory_id: str) -> Memory | None:
+        row = self._conn().execute(
+            "SELECT * FROM memories WHERE id = ? AND platform = ? AND user_id = ?",
+            (memory_id, platform, user_id),
+        ).fetchone()
+        return self._parse_row(row) if row else None
 
     def recall(
         self,
@@ -253,6 +298,7 @@ class MemoryStore:
         content: str | None = None,
         tags: list[str] | None = None,
         importance: float | None = None,
+        metadata: dict | None = None,
     ) -> Memory | None:
         existing = self._conn().execute(
             "SELECT * FROM memories WHERE id = ? AND platform = ? AND user_id = ?",
@@ -264,13 +310,16 @@ class MemoryStore:
         new_content = content if content is not None else existing["content"]
         new_tags = tags if tags is not None else (json.loads(existing["tags"]) if existing["tags"] else [])
         new_importance = max(0.0, min(1.0, importance)) if importance is not None else existing["importance"]
+        old_meta = json.loads(existing["metadata"]) if existing["metadata"] else {}
+        new_metadata = metadata if metadata is not None else old_meta
 
         self._conn().execute(
-            """UPDATE memories SET content = ?, tags = ?, importance = ?, updated_at = ?
+            """UPDATE memories SET content = ?, tags = ?, importance = ?, metadata = ?, updated_at = ?
                WHERE id = ?""",
             (new_content,
              json.dumps(new_tags) if new_tags else None,
              new_importance,
+             json.dumps(new_metadata) if new_metadata else None,
              time.time(),
              memory_id),
         )
@@ -314,6 +363,71 @@ class MemoryStore:
         ).fetchone()
         return {"total": row["total"], "oldest": row["oldest"], "newest": row["newest"]}
 
+    # ── Export / Import ───────────────────────────────────────────────────
+
+    def export_all(
+        self,
+        platform: str,
+        user_id: str,
+        *,
+        tags: list[str] | None = None,
+    ) -> list[dict]:
+        tag_clause = ""
+        tag_params: list[str] = []
+        if tags:
+            placeholders = ",".join("?" for _ in tags)
+            tag_clause = f"AND EXISTS (SELECT 1 FROM json_each(tags) WHERE value IN ({placeholders}))"
+            tag_params = list(tags)
+
+        rows = self._conn().execute(
+            f"""SELECT * FROM memories
+                WHERE platform = ? AND user_id = ?
+                {tag_clause}
+                ORDER BY created_at ASC""",
+            [platform, user_id, *tag_params],
+        ).fetchall()
+        return [
+            {
+                "content": r["content"],
+                "tags": json.loads(r["tags"]) if r["tags"] else [],
+                "importance": r["importance"],
+                "metadata": json.loads(r["metadata"]) if r["metadata"] else {},
+                "created_at": r["created_at"],
+            }
+            for r in rows
+        ]
+
+    def import_all(
+        self,
+        platform: str,
+        user_id: str,
+        entries: list[dict],
+    ) -> dict:
+        imported = 0
+        skipped = 0
+        conn = self._conn()
+        for entry in entries:
+            content = (entry.get("content") or "").strip()
+            if not content:
+                skipped += 1
+                continue
+            now = time.time()
+            tags = entry.get("tags") or []
+            importance = max(0.0, min(1.0, entry.get("importance", 0.5)))
+            created_at = entry.get("created_at", now)
+            metadata = entry.get("metadata") or {}
+            conn.execute(
+                """INSERT INTO memories (id, platform, user_id, content, tags, importance, created_at, updated_at, metadata)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (str(uuid.uuid4()), platform, user_id, content,
+                 json.dumps(tags) if tags else None,
+                 importance, created_at, now,
+                 json.dumps(metadata) if metadata else None),
+            )
+            imported += 1
+        conn.commit()
+        return {"imported": imported, "skipped": skipped}
+
     # ── Helpers ────────────────────────────────────────────────────────────
 
     @staticmethod
@@ -322,3 +436,51 @@ class MemoryStore:
         if not tokens:
             return '""'
         return " ".join(f'"{t.replace(chr(34), chr(34)+chr(34))}"' for t in tokens)
+
+
+# ── AI-powered memory extraction ──────────────────────────────────────────
+
+_httpx_client = None
+
+
+def _get_httpx_client():
+    global _httpx_client
+    if _httpx_client is None:
+        import httpx
+        _httpx_client = httpx.AsyncClient(timeout=20)
+    return _httpx_client
+
+
+async def extract_memories(text: str) -> list[dict]:
+    """Extract structured memories from conversation text using Claude API.
+    Falls back to storing raw text as a single memory when no API key is set."""
+    trimmed = text.strip()
+    if not trimmed:
+        return []
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        return [{"content": trimmed[:500], "tags": ["session"], "importance": 0.5}]
+
+    try:
+        client = _get_httpx_client()
+        resp = await client.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-haiku-4-5-20251001",
+                "max_tokens": 1024,
+                "system": EXTRACTION_PROMPT,
+                "messages": [{"role": "user", "content": trimmed}],
+            },
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return json.loads(data["content"][0]["text"])
+    except Exception as e:
+        log.warning("Memory extraction failed, storing raw: %s", e)
+        return [{"content": trimmed[:500], "tags": ["session"], "importance": 0.5}]

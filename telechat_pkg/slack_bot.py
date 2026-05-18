@@ -28,7 +28,8 @@ import time
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
-import claude_core as cc
+from . import claude_core as cc
+from .memory import MemoryStore
 
 log = logging.getLogger(__name__)
 
@@ -56,6 +57,26 @@ ENGINE_MODES = {"cli": "CLI (subprocess)", "api": "API (Anthropic Messages)"}
 
 def _model(uid: str)  -> str: return _user_model.get(uid, _DEFAULT_MODEL)
 def _engine(uid: str) -> str: return _user_engine.get(uid, _DEFAULT_ENGINE)
+
+_memory = MemoryStore()
+
+
+def _parse_remember_args(text: str) -> tuple[str, list[str], float]:
+    tags = []
+    importance = 0.5
+    words = []
+    for word in text.split():
+        if word.startswith("#") and len(word) > 1:
+            tags.append(word[1:].lower())
+        elif word.startswith("!") and len(word) > 1:
+            try:
+                importance = float(word[1:])
+            except ValueError:
+                words.append(word)
+        else:
+            words.append(word)
+    return " ".join(words), tags, importance
+
 
 # ─── Task tracking ────────────────────────────────────────────────────────────
 
@@ -335,6 +356,37 @@ def _handle(client, channel: str, user_id: str, thread_ts: str, text: str) -> No
     if lower in ("cancel", "/cancel", "cancel all", "/cancel all"):
         _cmd_cancel(client, channel, thread_ts, user_id)
         return
+    if lower.startswith("remember ") or lower.startswith("/remember "):
+        arg = re.sub(r"^/?remember\s+", "", text, flags=re.IGNORECASE).strip()
+        _cmd_remember(client, channel, thread_ts, user_id, arg)
+        return
+    if lower.startswith("recall ") or lower.startswith("/recall "):
+        arg = re.sub(r"^/?recall\s+", "", text, flags=re.IGNORECASE).strip()
+        _cmd_recall(client, channel, thread_ts, user_id, arg)
+        return
+    if lower in ("memories", "/memories") or lower.startswith("memories ") or lower.startswith("/memories "):
+        arg = re.sub(r"^/?memories\s*", "", text, flags=re.IGNORECASE).strip()
+        _cmd_memories(client, channel, thread_ts, user_id, arg)
+        return
+    if lower.startswith("forget ") or lower.startswith("/forget "):
+        arg = re.sub(r"^/?forget\s+", "", text, flags=re.IGNORECASE).strip()
+        _cmd_forget(client, channel, thread_ts, user_id, arg)
+        return
+    if lower.startswith("rename ") or lower.startswith("/rename "):
+        arg = re.sub(r"^/?rename\s+", "", text, flags=re.IGNORECASE).strip()
+        _cmd_rename_session(client, channel, thread_ts, user_id, arg)
+        return
+    if lower.startswith("title ") or lower.startswith("/title "):
+        arg = re.sub(r"^/?title\s+", "", text, flags=re.IGNORECASE).strip()
+        _cmd_title_session(client, channel, thread_ts, user_id, arg)
+        return
+    if lower in ("pin", "/pin"):
+        _cmd_pin_session(client, channel, thread_ts, user_id)
+        return
+    if lower in ("archive", "/archive") or lower.startswith("archive ") or lower.startswith("/archive "):
+        arg = re.sub(r"^/?archive\s*", "", text, flags=re.IGNORECASE).strip()
+        _cmd_archive_session(client, channel, thread_ts, user_id, arg)
+        return
 
     # ── Rate limiting ──
     if not cc.check_rate_limit(f"slack:{user_id}"):
@@ -436,17 +488,84 @@ def _cmd_help(client, channel: str, thread_ts: str):
         "• `mode` — show current settings\n"
         "• `reset` — clear conversation history\n\n"
         "*Sessions:*\n"
-        "• `sessions` — list all sessions\n"
+        "• `sessions [all]` — list sessions (all = include archived)\n"
         "• `new <name>` — create a new session\n"
-        "• `switch <name>` — switch to a session\n\n"
+        "• `switch <name>` — switch to a session\n"
+        "• `rename <name>` — rename current session\n"
+        "• `title <text>` — set session description\n"
+        "• `pin` — pin/unpin session\n"
+        "• `archive [name]` — archive a session\n\n"
         "*Tasks:*\n"
         "• `tasks` — show running tasks\n"
         "• `cancel` — cancel all running tasks\n\n"
+        "*Memory:*\n"
+        "• `remember <text> [#tag] [!0.9]` — save a memory\n"
+        "• `recall <query>` — search your memories\n"
+        "• `memories [#tag]` — list recent memories\n"
+        "• `forget <id>` — delete a memory\n\n"
         "*Info:*\n"
         "• `usage` — show token usage stats\n"
         "• `help` — show this message"
     )
     _post_reply(client, channel, thread_ts, text)
+
+
+def _cmd_remember(client, channel: str, thread_ts: str, user_id: str, arg: str):
+    if not arg:
+        _post_reply(client, channel, thread_ts, "Usage: `remember <text> [#tag1 #tag2] [!0.9]`")
+        return
+    content, tags, importance = _parse_remember_args(arg)
+    if not content:
+        _post_reply(client, channel, thread_ts, "Memory content can't be empty.")
+        return
+    mem = _memory.remember(PLATFORM, user_id, content, tags=tags or None, importance=importance)
+    tag_str = f"  Tags: {', '.join(mem.tags)}" if mem.tags else ""
+    _post_reply(client, channel, thread_ts, f":white_check_mark: Remembered! _ID: `{mem.id[:8]}…`_{tag_str}")
+
+
+def _cmd_recall(client, channel: str, thread_ts: str, user_id: str, query: str):
+    if not query:
+        _post_reply(client, channel, thread_ts, "Usage: `recall <search query>`")
+        return
+    results = _memory.recall(PLATFORM, user_id, query, limit=5)
+    if not results:
+        _post_reply(client, channel, thread_ts, ":mag: No memories found.")
+        return
+    lines = [f":mag: *Found {len(results)} memor{'y' if len(results) == 1 else 'ies'}:*\n"]
+    for r in results:
+        tag_str = f" [{', '.join(r.tags)}]" if r.tags else ""
+        lines.append(f"• {r.content}{tag_str}\n  _ID: `{r.id[:8]}…`_")
+    _post_reply(client, channel, thread_ts, "\n".join(lines))
+
+
+def _cmd_memories(client, channel: str, thread_ts: str, user_id: str, arg: str):
+    filter_tags = None
+    if arg:
+        filter_tags = [w.lstrip("#") for w in arg.split() if w.startswith("#")]
+    mems = _memory.list_memories(PLATFORM, user_id, limit=10, tags=filter_tags or None)
+    if not mems:
+        _post_reply(client, channel, thread_ts, ":mailbox_with_no_mail: No memories yet. Use `remember <text>` to save one.")
+        return
+    stats = _memory.stats(PLATFORM, user_id)
+    tag_label = f" (tag: {', '.join(filter_tags)})" if filter_tags else ""
+    lines = [f":brain: *Your memories* ({stats['total']} total){tag_label}:\n"]
+    for m in mems:
+        tag_str = f" [{', '.join(m.tags)}]" if m.tags else ""
+        lines.append(f"• {m.content}{tag_str}\n  _ID: `{m.id[:8]}…`_")
+    _post_reply(client, channel, thread_ts, "\n".join(lines))
+
+
+def _cmd_forget(client, channel: str, thread_ts: str, user_id: str, target_id: str):
+    if not target_id:
+        _post_reply(client, channel, thread_ts, "Usage: `forget <memory-id>` — use `memories` to see IDs")
+        return
+    target_id = target_id.strip().rstrip("…")
+    mems = _memory.list_memories(PLATFORM, user_id, limit=100)
+    match = next((m for m in mems if m.id.startswith(target_id)), None)
+    if match and _memory.forget(PLATFORM, user_id, match.id):
+        _post_reply(client, channel, thread_ts, f":wastebasket: Forgotten: _{match.content[:60]}_")
+    else:
+        _post_reply(client, channel, thread_ts, ":x: Memory not found. Use `memories` to see your memories.")
 
 
 def _cmd_reset(client, channel: str, thread_ts: str, user_id: str):
@@ -527,18 +646,21 @@ def _cmd_sessions(client, channel: str, thread_ts: str, user_id: str):
     if not sessions:
         sessions = [cc._session_mgr.get_or_create_active(PLATFORM, user_id)]
 
+    # Auto-archive idle sessions
+    cc._session_mgr.auto_archive_idle(PLATFORM, user_id)
+
     active_idx = cc._session_mgr.get_active_index(PLATFORM, user_id)
     lines = [":card_index_dividers: *Your Sessions*\n"]
     for i, s in enumerate(sessions):
         marker = "  :point_left: _active_" if i == active_idx else ""
-        lines.append(f"• {s.status_emoji()} `{s.name}` — {s.message_count} msgs, {s.age_str()}{marker}")
+        lines.append(f"• {s.summary_line()}{marker}")
 
     elements = []
     for i, s in enumerate(sessions):
         if i != active_idx:
             elements.append({
                 "type": "button",
-                "text": {"type": "plain_text", "text": f"Switch to: {s.name}"},
+                "text": {"type": "plain_text", "text": f"Switch to: {s.display_name[:30]}"},
                 "action_id": f"switch_session_{i}",
                 "value": str(i),
             })
@@ -564,14 +686,66 @@ def _cmd_new_session(client, channel: str, thread_ts: str, user_id: str, name: s
 
 
 def _cmd_switch(client, channel: str, thread_ts: str, user_id: str, target: str):
-    sessions = cc._session_mgr.get_all(PLATFORM, user_id)
-    for i, s in enumerate(sessions):
-        if s.name == target or str(i) == target:
-            cc._session_mgr.switch_to(PLATFORM, user_id, i)
-            _post_reply(client, channel, thread_ts,
-                        f":white_check_mark: Switched to `{s.name}`")
-            return
-    _post_reply(client, channel, thread_ts, f"Session `{target}` not found.")
+    # Try by name first, then by index
+    s = cc._session_mgr.switch_to_name(PLATFORM, user_id, target)
+    if not s:
+        try:
+            idx = int(target)
+            s = cc._session_mgr.switch_to(PLATFORM, user_id, idx)
+        except ValueError:
+            pass
+    if s:
+        _post_reply(client, channel, thread_ts,
+                    f":white_check_mark: Switched to `{s.display_name}`")
+    else:
+        _post_reply(client, channel, thread_ts, f"Session `{target}` not found.")
+
+
+def _cmd_rename_session(client, channel: str, thread_ts: str, user_id: str, new_name: str):
+    if not new_name:
+        _post_reply(client, channel, thread_ts, "Usage: `rename <new-name>`")
+        return
+    new_name = re.sub(r"[^a-zA-Z0-9_-]", "-", new_name)[:20]
+    sess = cc._session_mgr.get_or_create_active(PLATFORM, user_id)
+    result = cc._session_mgr.rename(PLATFORM, user_id, sess.name, new_name)
+    if result:
+        _post_reply(client, channel, thread_ts, f":white_check_mark: Renamed to `{result.name}`")
+    else:
+        _post_reply(client, channel, thread_ts, ":x: Rename failed — name may already be taken.")
+
+
+def _cmd_title_session(client, channel: str, thread_ts: str, user_id: str, title: str):
+    if not title:
+        _post_reply(client, channel, thread_ts, "Usage: `title <description>`")
+        return
+    sess = cc._session_mgr.get_or_create_active(PLATFORM, user_id)
+    result = cc._session_mgr.set_title(PLATFORM, user_id, sess.name, title)
+    if result:
+        _post_reply(client, channel, thread_ts, f":white_check_mark: Title set: _{result.title}_")
+    else:
+        _post_reply(client, channel, thread_ts, ":x: Failed.")
+
+
+def _cmd_pin_session(client, channel: str, thread_ts: str, user_id: str):
+    sess = cc._session_mgr.get_or_create_active(PLATFORM, user_id)
+    new_state = not sess.pinned
+    result = cc._session_mgr.pin(PLATFORM, user_id, sess.name, new_state)
+    if result:
+        label = ":pushpin: Pinned" if result.pinned else "Unpinned"
+        _post_reply(client, channel, thread_ts, f"{label} session `{result.name}`")
+    else:
+        _post_reply(client, channel, thread_ts, ":x: Failed.")
+
+
+def _cmd_archive_session(client, channel: str, thread_ts: str, user_id: str, name: str):
+    if not name:
+        name = cc._session_mgr.get_or_create_active(PLATFORM, user_id).name
+    result = cc._session_mgr.archive(PLATFORM, user_id, name)
+    if result:
+        _post_reply(client, channel, thread_ts,
+                    f":package: Archived `{result.display_name}`. Use `sessions all` to see archived.")
+    else:
+        _post_reply(client, channel, thread_ts, ":x: Cannot archive.")
 
 
 def _cmd_tasks(client, channel: str, thread_ts: str, user_id: str):

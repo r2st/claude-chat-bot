@@ -125,6 +125,30 @@ assert_no_file "clean removed .env" "$DATA_HOME/.env"
 out="$(run clean)"
 assert_contains "clean with no .env is graceful" "nothing to clean" "$out"
 
+# ── 7b. logs before the bot has ever run ─────────────────────────────────────
+echo "[7b] logs"
+out="$(run logs)"
+assert_contains "logs is graceful with no log file" "No log file found" "$out"
+
+# ── 7c. env clean subcommand with no .env ────────────────────────────────────
+echo "[7c] env clean"
+out="$(run env clean)"
+assert_contains "env clean is graceful with no .env" "nothing to clean" "$out"
+
+# ── 7d. setup wizard prints a read-only environment check ────────────────────
+# `setup` is the interactive init wizard; feeding /dev/null makes it exit at
+# the first prompt. We only assert the read-only preamble: the env-check
+# banner must render and the CLI must not crash with a traceback.
+echo "[7d] setup environment check"
+out="$(run setup </dev/null)"
+assert_contains "setup prints environment-check banner" "checking environment" "$out"
+if printf '%s' "$out" | grep -qE 'Traceback|node:internal'; then
+  bad "setup must not crash with a traceback"
+  printf '%s\n' "$out" | tail -3 | sed 's/^/      /'
+else
+  ok "setup runs the environment check without crashing"
+fi
+
 # ── 8. Python entry point: clean guidance, no traceback ──────────────────────
 echo "[8] Python entry point"
 PY="$(command -v python3 || command -v python)"

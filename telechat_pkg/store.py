@@ -1,0 +1,814 @@
+"""
+Database layer + session management for telechat.
+
+Thread-safe SQLite with WAL mode, async write queue, history caching,
+rate limiting, conversation storage, usage/cost tracking, and multi-session
+management (UserSession / SessionManager).
+"""
+from __future__ import annotations
+
+import logging
+import queue as _queue_mod
+import sqlite3
+import threading
+import time
+from pathlib import Path
+import os
+
+log = logging.getLogger(__name__)
+
+DB_PATH = os.getenv("DB_PATH", str(Path(__file__).parent / "bot.db"))
+
+RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "20"))
+RATE_LIMIT_WINDOW   = int(os.getenv("RATE_LIMIT_WINDOW", "60"))
+
+# ─── Connection pool (thread-local SQLite) ──────────────────────────────────────
+
+_local = threading.local()
+
+
+def _get_conn() -> sqlite3.Connection:
+    """Get a thread-local SQLite connection (reused across calls)."""
+    if not hasattr(_local, "conn") or _local.conn is None:
+        _local.conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        _local.conn.execute("PRAGMA journal_mode=WAL")
+        _local.conn.execute("PRAGMA synchronous=NORMAL")
+        _local.conn.execute("PRAGMA cache_size=-8000")  # 8MB cache
+    return _local.conn
+
+
+# ─── Thread-safe write queue (non-blocking DB writes) ─────────────────────────
+
+_write_queue: _queue_mod.Queue | None = None
+_writer_thread: threading.Thread | None = None
+
+
+def _db_writer():
+    """Background thread that drains the write queue and batches DB writes."""
+    while True:
+        ops = []
+        try:
+            op = _write_queue.get(timeout=1.0)
+            ops.append(op)
+        except _queue_mod.Empty:
+            continue
+        while not _write_queue.empty():
+            try:
+                ops.append(_write_queue.get_nowait())
+            except _queue_mod.Empty:
+                break
+        try:
+            conn = _get_conn()
+            for sql, params in ops:
+                conn.execute(sql, params)
+            conn.commit()
+        except Exception as e:
+            log.error("db_writer batch error: %s", e)
+
+
+def _ensure_writer():
+    """Start the DB writer thread if not already running."""
+    global _write_queue, _writer_thread
+    if _write_queue is None:
+        _write_queue = _queue_mod.Queue(maxsize=1000)
+    if _writer_thread is None or not _writer_thread.is_alive():
+        _writer_thread = threading.Thread(target=_db_writer, daemon=True)
+        _writer_thread.start()
+
+
+def _enqueue_write(sql: str, params: tuple):
+    """Enqueue a non-blocking DB write. Falls back to sync if full."""
+    if _write_queue is not None:
+        try:
+            _write_queue.put_nowait((sql, params))
+            return
+        except _queue_mod.Full:
+            pass
+    conn = _get_conn()
+    conn.execute(sql, params)
+    conn.commit()
+
+
+# ─── History cache (avoid repeated DB reads for same user) ──────────────────────
+
+_history_cache: dict[str, tuple[float, list[dict]]] = {}
+_HISTORY_TTL = 30.0
+_HISTORY_CACHE_MAX = 200
+
+
+def _cache_key(platform: str, user_id: str) -> str:
+    return f"{platform}:{user_id}"
+
+
+def _invalidate_history(platform: str, user_id: str):
+    _history_cache.pop(_cache_key(platform, user_id), None)
+
+
+# ─── Rate limiting ──────────────────────────────────────────────────────────────
+
+_rate_state: dict[str, list[float]] = {}
+_rate_last_cleanup = 0.0
+
+
+def check_rate_limit(key: str) -> bool:
+    """Return True if the request is allowed, False if rate-limited."""
+    global _rate_last_cleanup
+    now = time.time()
+    bucket = _rate_state.setdefault(key, [])
+    _rate_state[key] = [t for t in bucket if now - t < RATE_LIMIT_WINDOW]
+    if len(_rate_state[key]) >= RATE_LIMIT_REQUESTS:
+        return False
+    _rate_state[key].append(now)
+    # Periodic cleanup of stale keys (every 5 minutes)
+    if now - _rate_last_cleanup > 300:
+        _rate_last_cleanup = now
+        stale = [k for k, v in _rate_state.items() if not v or now - v[-1] > RATE_LIMIT_WINDOW]
+        for k in stale:
+            del _rate_state[k]
+    return True
+
+
+# ─── SQLite conversation store ──────────────────────────────────────────────────
+
+def init_db() -> None:
+    _ensure_writer()
+    conn = _get_conn()
+
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(conversations)").fetchall()}
+    if cols and "platform" not in cols:
+        log.info("Migrating database to multi-platform schema…")
+        conn.execute("ALTER TABLE conversations RENAME TO _conv_old")
+        conn.execute("""
+            CREATE TABLE conversations (
+                platform TEXT NOT NULL, user_id TEXT NOT NULL,
+                role TEXT NOT NULL, content TEXT NOT NULL,
+                ts REAL NOT NULL, PRIMARY KEY (platform, user_id, ts))
+        """)
+        conn.execute("""
+            INSERT INTO conversations (platform, user_id, role, content, ts)
+            SELECT 'telegram', CAST(user_id AS TEXT), role, content, timestamp FROM _conv_old
+        """)
+        conn.execute("DROP TABLE _conv_old")
+
+        conn.execute("ALTER TABLE usage RENAME TO _usage_old")
+        conn.execute("""
+            CREATE TABLE usage (
+                platform TEXT NOT NULL, user_id TEXT NOT NULL,
+                message_count INTEGER DEFAULT 0, input_tokens INTEGER DEFAULT 0,
+                output_tokens INTEGER DEFAULT 0, PRIMARY KEY (platform, user_id))
+        """)
+        conn.execute("""
+            INSERT INTO usage (platform, user_id, message_count, input_tokens, output_tokens)
+            SELECT 'telegram', CAST(user_id AS TEXT), message_count, total_input_tokens, total_output_tokens FROM _usage_old
+        """)
+        conn.execute("DROP TABLE _usage_old")
+        conn.commit()
+        log.info("Database migration complete.")
+    else:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS conversations (
+                platform  TEXT NOT NULL, user_id TEXT NOT NULL,
+                role TEXT NOT NULL, content TEXT NOT NULL,
+                ts REAL NOT NULL, PRIMARY KEY (platform, user_id, ts))
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS usage (
+                platform TEXT NOT NULL, user_id TEXT NOT NULL,
+                message_count INTEGER DEFAULT 0, input_tokens INTEGER DEFAULT 0,
+                output_tokens INTEGER DEFAULT 0, PRIMARY KEY (platform, user_id))
+        """)
+        conn.commit()
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS tool_usage (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            platform TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            tool_name TEXT NOT NULL,
+            success INTEGER DEFAULT 1,
+            ts REAL NOT NULL)
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS cost_tracking (
+            platform TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            date TEXT NOT NULL,
+            requests INTEGER DEFAULT 0,
+            input_tokens INTEGER DEFAULT 0,
+            output_tokens INTEGER DEFAULT 0,
+            cost_usd REAL DEFAULT 0,
+            PRIMARY KEY (platform, user_id, date))
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            platform TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            session_id TEXT,
+            engine TEXT DEFAULT 'cli',
+            model TEXT,
+            started_at REAL NOT NULL,
+            ended_at REAL,
+            total_cost_usd REAL DEFAULT 0,
+            num_turns INTEGER DEFAULT 0)
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS feedback (
+            platform TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            rating INTEGER,
+            reaction TEXT,
+            text_feedback TEXT,
+            message_ts REAL,
+            response_preview TEXT,
+            ts REAL NOT NULL)
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS quality_scores (
+            platform TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            evaluator TEXT NOT NULL,
+            score REAL NOT NULL,
+            response_preview TEXT,
+            metadata TEXT,
+            ts REAL NOT NULL)
+    """)
+    conn.commit()
+
+    SessionManager.init_schema(conn)
+
+
+def load_history(platform: str, user_id: str, limit: int = 20, session_name: str = "") -> list[dict]:
+    effective_uid = f"{user_id}:{session_name}" if session_name else user_id
+
+    key = _cache_key(platform, effective_uid)
+    cached = _history_cache.get(key)
+    if cached and (time.time() - cached[0]) < _HISTORY_TTL:
+        return cached[1]
+
+    conn = _get_conn()
+    rows = conn.execute(
+        """SELECT role, content FROM conversations
+           WHERE platform=? AND user_id=?
+           ORDER BY ts DESC LIMIT ?""",
+        (platform, effective_uid, limit),
+    ).fetchall()
+    result = [{"role": r[0], "content": r[1]} for r in reversed(rows)]
+    # Evict stale entries when cache grows too large
+    if len(_history_cache) >= _HISTORY_CACHE_MAX:
+        now = time.time()
+        stale = [k for k, v in _history_cache.items() if now - v[0] > _HISTORY_TTL]
+        for k in stale:
+            del _history_cache[k]
+        if len(_history_cache) >= _HISTORY_CACHE_MAX:
+            _history_cache.clear()
+    _history_cache[key] = (time.time(), result)
+    return result
+
+
+def save_turn(platform: str, user_id: str, user_text: str, reply: str, session_name: str = "") -> None:
+    effective_uid = f"{user_id}:{session_name}" if session_name else user_id
+    now = time.time()
+    _enqueue_write(
+        "INSERT OR IGNORE INTO conversations (platform,user_id,role,content,ts) VALUES (?,?,?,?,?)",
+        (platform, effective_uid, "user", user_text, now),
+    )
+    _enqueue_write(
+        "INSERT OR IGNORE INTO conversations (platform,user_id,role,content,ts) VALUES (?,?,?,?,?)",
+        (platform, effective_uid, "assistant", reply, now + 0.001),
+    )
+    _enqueue_write(
+        """DELETE FROM conversations WHERE platform=? AND user_id=? AND ts < (
+           SELECT ts FROM conversations WHERE platform=? AND user_id=?
+           ORDER BY ts DESC LIMIT 1 OFFSET 20)""",
+        (platform, effective_uid, platform, effective_uid),
+    )
+    key = _cache_key(platform, effective_uid)
+    cached = _history_cache.get(key)
+    if cached:
+        updated = cached[1] + [
+            {"role": "user", "content": user_text},
+            {"role": "assistant", "content": reply},
+        ]
+        _history_cache[key] = (time.time(), updated[-20:])
+
+    _session_mgr.touch_active(platform, user_id)
+
+
+def clear_history(platform: str, user_id: str, session_name: str = "") -> None:
+    effective_uid = f"{user_id}:{session_name}" if session_name else user_id
+    conn = _get_conn()
+    conn.execute(
+        "DELETE FROM conversations WHERE platform=? AND user_id=?",
+        (platform, effective_uid),
+    )
+    conn.commit()
+    _invalidate_history(platform, effective_uid)
+
+
+def track_usage(platform: str, user_id: str, in_tok: int = 0, out_tok: int = 0) -> None:
+    _enqueue_write(
+        """INSERT INTO usage (platform, user_id, message_count, input_tokens, output_tokens)
+           VALUES (?,?,1,?,?)
+           ON CONFLICT(platform,user_id) DO UPDATE SET
+               message_count = message_count + 1,
+               input_tokens  = input_tokens  + excluded.input_tokens,
+               output_tokens = output_tokens + excluded.output_tokens""",
+        (platform, user_id, in_tok, out_tok),
+    )
+
+
+def get_usage(platform: str, user_id: str) -> dict:
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT message_count, input_tokens, output_tokens FROM usage WHERE platform=? AND user_id=?",
+        (platform, user_id),
+    ).fetchone()
+    return {"messages": row[0], "input": row[1], "output": row[2]} if row else {"messages": 0, "input": 0, "output": 0}
+
+
+def track_tool_usage(platform: str, user_id: str, tools: list[str]) -> None:
+    if not tools:
+        return
+    now = time.time()
+    for tool in tools:
+        _enqueue_write(
+            "INSERT INTO tool_usage (platform, user_id, tool_name, ts) VALUES (?,?,?,?)",
+            (platform, user_id, tool, now),
+        )
+
+
+def track_cost(platform: str, user_id: str, in_tok: int, out_tok: int, cost_usd: float) -> None:
+    from datetime import date
+    today = date.today().isoformat()
+    _enqueue_write(
+        """INSERT INTO cost_tracking (platform, user_id, date, requests, input_tokens, output_tokens, cost_usd)
+           VALUES (?,?,?,1,?,?,?)
+           ON CONFLICT(platform, user_id, date) DO UPDATE SET
+               requests = requests + 1,
+               input_tokens = input_tokens + excluded.input_tokens,
+               output_tokens = output_tokens + excluded.output_tokens,
+               cost_usd = cost_usd + excluded.cost_usd""",
+        (platform, user_id, today, in_tok, out_tok, cost_usd),
+    )
+
+
+# ─── Multi-session management ──────────────────────────────────────────────────
+
+_SESSION_TTL = 3600
+_SESSION_IDLE_DAYS = 30
+_MAX_SESSIONS = 20
+
+
+class UserSession:
+    """A named conversation session with its own history and Claude session ID."""
+
+    def __init__(
+        self,
+        name: str,
+        platform: str,
+        user_id: str,
+        *,
+        db_id: int | None = None,
+        title: str = "",
+        pinned: bool = False,
+        archived: bool = False,
+        created_at: float = 0.0,
+        last_active: float = 0.0,
+        message_count: int = 0,
+    ):
+        self.db_id: int | None = db_id
+        self.name = name
+        self.platform = platform
+        self.user_id = user_id
+        self.title = title
+        self.pinned = pinned
+        self.archived = archived
+        self.claude_session_id: str | None = None
+        self.last_active = last_active or time.time()
+        self.created_at = created_at or time.time()
+        self.message_count = message_count
+        self.is_busy = False
+
+    @property
+    def cli_session_valid(self) -> bool:
+        if self.claude_session_id is None:
+            return False
+        if self.is_busy:
+            return True
+        return (time.time() - self.last_active) < _SESSION_TTL
+
+    def touch(self):
+        self.last_active = time.time()
+        self.message_count += 1
+
+    @property
+    def display_name(self) -> str:
+        return self.title or self.name
+
+    def age_str(self) -> str:
+        secs = int(time.time() - self.last_active)
+        if secs < 60:
+            return "just now"
+        if secs < 3600:
+            return f"{secs // 60}m ago"
+        if secs < 86400:
+            return f"{secs // 3600}h ago"
+        return f"{secs // 86400}d ago"
+
+    def status_emoji(self) -> str:
+        if self.is_busy:
+            return "⚙️"
+        if self.archived:
+            return "📦"
+        if self.pinned:
+            return "📌"
+        if self.cli_session_valid:
+            return "🟢"
+        return "💤"
+
+    def summary_line(self) -> str:
+        title = f" — {self.title}" if self.title else ""
+        pin = " 📌" if self.pinned else ""
+        return f"{self.status_emoji()} `{self.name}`{title} ({self.message_count} msgs, {self.age_str()}){pin}"
+
+
+class SessionManager:
+    """Manages multiple named sessions per user, persisted to SQLite."""
+
+    def __init__(self):
+        self._cache: dict[str, list[UserSession]] = {}
+        self._active: dict[str, str] = {}
+
+    def _key(self, platform: str, user_id: str) -> str:
+        return f"{platform}:{user_id}"
+
+    @staticmethod
+    def init_schema(conn: sqlite3.Connection) -> None:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS user_sessions (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                platform    TEXT NOT NULL,
+                user_id     TEXT NOT NULL,
+                name        TEXT NOT NULL,
+                title       TEXT DEFAULT '',
+                pinned      INTEGER DEFAULT 0,
+                archived    INTEGER DEFAULT 0,
+                created_at  REAL NOT NULL,
+                last_active REAL NOT NULL,
+                message_count INTEGER DEFAULT 0,
+                UNIQUE(platform, user_id, name)
+            );
+            CREATE INDEX IF NOT EXISTS idx_usersess_user
+                ON user_sessions(platform, user_id, archived, last_active DESC);
+
+            CREATE TABLE IF NOT EXISTS active_sessions (
+                platform    TEXT NOT NULL,
+                user_id     TEXT NOT NULL,
+                session_name TEXT NOT NULL,
+                PRIMARY KEY (platform, user_id)
+            );
+        """)
+        conn.commit()
+
+    def _save_session(self, sess: UserSession) -> None:
+        conn = _get_conn()
+        if sess.db_id:
+            conn.execute(
+                """UPDATE user_sessions SET title=?, pinned=?, archived=?,
+                   last_active=?, message_count=? WHERE id=?""",
+                (sess.title, int(sess.pinned), int(sess.archived),
+                 sess.last_active, sess.message_count, sess.db_id),
+            )
+        else:
+            cur = conn.execute(
+                """INSERT INTO user_sessions
+                   (platform, user_id, name, title, pinned, archived, created_at, last_active, message_count)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(platform, user_id, name) DO UPDATE SET
+                       title=excluded.title, pinned=excluded.pinned, archived=excluded.archived,
+                       last_active=excluded.last_active, message_count=excluded.message_count""",
+                (sess.platform, sess.user_id, sess.name, sess.title,
+                 int(sess.pinned), int(sess.archived),
+                 sess.created_at, sess.last_active, sess.message_count),
+            )
+            if cur.lastrowid:
+                sess.db_id = cur.lastrowid
+        conn.commit()
+
+    def _save_active(self, platform: str, user_id: str, session_name: str) -> None:
+        conn = _get_conn()
+        conn.execute(
+            """INSERT INTO active_sessions (platform, user_id, session_name)
+               VALUES (?, ?, ?)
+               ON CONFLICT(platform, user_id) DO UPDATE SET session_name=excluded.session_name""",
+            (platform, user_id, session_name),
+        )
+        conn.commit()
+
+    def _load_sessions(self, platform: str, user_id: str) -> list[UserSession]:
+        conn = _get_conn()
+        rows = conn.execute(
+            """SELECT id, name, title, pinned, archived, created_at, last_active, message_count
+               FROM user_sessions WHERE platform=? AND user_id=?
+               ORDER BY pinned DESC, last_active DESC""",
+            (platform, user_id),
+        ).fetchall()
+        sessions = []
+        for r in rows:
+            sessions.append(UserSession(
+                name=r[1], platform=platform, user_id=user_id,
+                db_id=r[0], title=r[2], pinned=bool(r[3]), archived=bool(r[4]),
+                created_at=r[5], last_active=r[6], message_count=r[7],
+            ))
+        return sessions
+
+    def _load_active_name(self, platform: str, user_id: str) -> str:
+        conn = _get_conn()
+        row = conn.execute(
+            "SELECT session_name FROM active_sessions WHERE platform=? AND user_id=?",
+            (platform, user_id),
+        ).fetchone()
+        return row[0] if row else ""
+
+    def _ensure_loaded(self, platform: str, user_id: str) -> list[UserSession]:
+        key = self._key(platform, user_id)
+        if key not in self._cache:
+            self._cache[key] = self._load_sessions(platform, user_id)
+            active_name = self._load_active_name(platform, user_id)
+            if active_name:
+                self._active[key] = active_name
+        return self._cache[key]
+
+    def get_or_create_active(self, platform: str, user_id: str) -> UserSession:
+        sessions = self._ensure_loaded(platform, user_id)
+        key = self._key(platform, user_id)
+        active_name = self._active.get(key, "")
+
+        if sessions and active_name:
+            for s in sessions:
+                if s.name == active_name:
+                    return s
+            if sessions:
+                self._active[key] = sessions[0].name
+                self._save_active(platform, user_id, sessions[0].name)
+                return sessions[0]
+
+        if sessions:
+            self._active[key] = sessions[0].name
+            self._save_active(platform, user_id, sessions[0].name)
+            return sessions[0]
+
+        sess = UserSession("default", platform, user_id)
+        sessions.append(sess)
+        self._save_session(sess)
+        self._active[key] = "default"
+        self._save_active(platform, user_id, "default")
+        return sess
+
+    def get_all(self, platform: str, user_id: str, include_archived: bool = False) -> list[UserSession]:
+        sessions = self._ensure_loaded(platform, user_id)
+        if include_archived:
+            return sessions
+        return [s for s in sessions if not s.archived]
+
+    def get_active_index(self, platform: str, user_id: str) -> int:
+        sessions = self.get_all(platform, user_id)
+        key = self._key(platform, user_id)
+        active_name = self._active.get(key, "")
+        for i, s in enumerate(sessions):
+            if s.name == active_name:
+                return i
+        return 0
+
+    def create(self, platform: str, user_id: str, name: str) -> UserSession:
+        key = self._key(platform, user_id)
+        sessions = self._ensure_loaded(platform, user_id)
+
+        active_sessions = [s for s in sessions if not s.archived]
+        if len(active_sessions) >= _MAX_SESSIONS:
+            evictable = sorted(
+                (s for s in active_sessions if not s.pinned and not s.is_busy),
+                key=lambda s: s.last_active,
+            )
+            if evictable:
+                self._archive_session(evictable[0])
+
+        sess = UserSession(name, platform, user_id)
+        sessions.append(sess)
+        self._save_session(sess)
+        self._active[key] = name
+        self._save_active(platform, user_id, name)
+        return sess
+
+    def switch_to(self, platform: str, user_id: str, index: int) -> UserSession | None:
+        sessions = self.get_all(platform, user_id)
+        if 0 <= index < len(sessions):
+            key = self._key(platform, user_id)
+            self._active[key] = sessions[index].name
+            self._save_active(platform, user_id, sessions[index].name)
+            return sessions[index]
+        return None
+
+    def switch_to_name(self, platform: str, user_id: str, name: str) -> UserSession | None:
+        sessions = self._ensure_loaded(platform, user_id)
+        for s in sessions:
+            if s.name == name:
+                key = self._key(platform, user_id)
+                self._active[key] = name
+                self._save_active(platform, user_id, name)
+                if s.archived:
+                    s.archived = False
+                    self._save_session(s)
+                return s
+        return None
+
+    def rename(self, platform: str, user_id: str, old_name: str, new_name: str) -> UserSession | None:
+        sessions = self._ensure_loaded(platform, user_id)
+        sess = next((s for s in sessions if s.name == old_name), None)
+        if not sess:
+            return None
+        if any(s.name == new_name for s in sessions):
+            return None
+
+        old_uid = f"{user_id}:{old_name}" if old_name else user_id
+        new_uid = f"{user_id}:{new_name}"
+        conn = _get_conn()
+        conn.execute(
+            "UPDATE conversations SET user_id=? WHERE platform=? AND user_id=?",
+            (new_uid, platform, old_uid),
+        )
+        conn.execute(
+            "UPDATE user_sessions SET name=? WHERE id=?",
+            (new_name, sess.db_id),
+        )
+        conn.commit()
+
+        key = self._key(platform, user_id)
+        if self._active.get(key) == old_name:
+            self._active[key] = new_name
+            self._save_active(platform, user_id, new_name)
+
+        sess.name = new_name
+        _invalidate_history(platform, old_uid)
+        return sess
+
+    def set_title(self, platform: str, user_id: str, name: str, title: str) -> UserSession | None:
+        sessions = self._ensure_loaded(platform, user_id)
+        sess = next((s for s in sessions if s.name == name), None)
+        if not sess:
+            return None
+        sess.title = title.strip()[:100]
+        self._save_session(sess)
+        return sess
+
+    def pin(self, platform: str, user_id: str, name: str, pinned: bool = True) -> UserSession | None:
+        sessions = self._ensure_loaded(platform, user_id)
+        sess = next((s for s in sessions if s.name == name), None)
+        if not sess:
+            return None
+        sess.pinned = pinned
+        self._save_session(sess)
+        return sess
+
+    def _archive_session(self, sess: UserSession) -> None:
+        sess.archived = True
+        self._save_session(sess)
+
+    def archive(self, platform: str, user_id: str, name: str) -> UserSession | None:
+        sessions = self._ensure_loaded(platform, user_id)
+        sess = next((s for s in sessions if s.name == name), None)
+        if not sess or sess.is_busy:
+            return None
+        self._archive_session(sess)
+
+        key = self._key(platform, user_id)
+        if self._active.get(key) == name:
+            active_sessions = [s for s in sessions if not s.archived]
+            if active_sessions:
+                self._active[key] = active_sessions[0].name
+                self._save_active(platform, user_id, active_sessions[0].name)
+            else:
+                default = UserSession("default", platform, user_id)
+                sessions.append(default)
+                self._save_session(default)
+                self._active[key] = "default"
+                self._save_active(platform, user_id, "default")
+        return sess
+
+    def unarchive(self, platform: str, user_id: str, name: str) -> UserSession | None:
+        return self.switch_to_name(platform, user_id, name)
+
+    def delete(self, platform: str, user_id: str, index: int) -> bool:
+        sessions = self.get_all(platform, user_id)
+        if not sessions or index < 0 or index >= len(sessions):
+            return False
+        return self.delete_by_name(platform, user_id, sessions[index].name)
+
+    def delete_by_name(self, platform: str, user_id: str, name: str) -> bool:
+        key = self._key(platform, user_id)
+        sessions = self._ensure_loaded(platform, user_id)
+        sess = next((s for s in sessions if s.name == name), None)
+        if not sess or sess.is_busy:
+            return False
+
+        effective_uid = f"{user_id}:{name}" if name else user_id
+        conn = _get_conn()
+        conn.execute(
+            "DELETE FROM conversations WHERE platform=? AND user_id=?",
+            (platform, effective_uid),
+        )
+        if sess.db_id:
+            conn.execute("DELETE FROM user_sessions WHERE id=?", (sess.db_id,))
+        conn.commit()
+        _invalidate_history(platform, effective_uid)
+
+        sessions.remove(sess)
+
+        if self._active.get(key) == name:
+            active_sessions = [s for s in sessions if not s.archived]
+            if active_sessions:
+                self._active[key] = active_sessions[0].name
+                self._save_active(platform, user_id, active_sessions[0].name)
+            else:
+                default = UserSession("default", platform, user_id)
+                sessions.append(default)
+                self._save_session(default)
+                self._active[key] = "default"
+                self._save_active(platform, user_id, "default")
+        return True
+
+    def search(self, platform: str, user_id: str, query: str) -> list[UserSession]:
+        sessions = self._ensure_loaded(platform, user_id)
+        q = query.lower()
+        # First pass: match by name/title (no DB hit)
+        name_matched = set()
+        results = []
+        for s in sessions:
+            if q in s.name.lower() or q in s.title.lower():
+                results.append(s)
+                name_matched.add(s.name)
+
+        # Second pass: single query for content matches across all remaining sessions
+        remaining = [s for s in sessions if s.name not in name_matched]
+        if remaining:
+            uids = [f"{user_id}:{s.name}" if s.name else user_id for s in remaining]
+            placeholders = ",".join("?" for _ in uids)
+            conn = _get_conn()
+            rows = conn.execute(
+                f"SELECT DISTINCT user_id FROM conversations WHERE platform=? AND user_id IN ({placeholders}) AND content LIKE ?",
+                [platform, *uids, f"%{query}%"],
+            ).fetchall()
+            matched_uids = {r[0] for r in rows}
+            uid_to_sess = {(f"{user_id}:{s.name}" if s.name else user_id): s for s in remaining}
+            for uid_val in matched_uids:
+                if uid_val in uid_to_sess:
+                    results.append(uid_to_sess[uid_val])
+        return results
+
+    def auto_archive_idle(self, platform: str, user_id: str) -> list[str]:
+        sessions = self._ensure_loaded(platform, user_id)
+        cutoff = time.time() - (_SESSION_IDLE_DAYS * 86400)
+        archived = []
+        for s in sessions:
+            if not s.archived and not s.pinned and not s.is_busy and s.last_active < cutoff:
+                self._archive_session(s)
+                archived.append(s.name)
+        return archived
+
+    def touch_active(self, platform: str, user_id: str) -> None:
+        sess = self.get_or_create_active(platform, user_id)
+        sess.touch()
+        self._save_session(sess)
+
+    def clear_active(self, platform: str, user_id: str):
+        sess = self.get_or_create_active(platform, user_id)
+        sess.claude_session_id = None
+        sess.message_count = 0
+        self._save_session(sess)
+
+
+_session_mgr = SessionManager()
+
+
+# ─── Legacy convenience wrappers ────────────────────────────────────────────────
+
+def get_session_id(platform: str, user_id: str) -> str | None:
+    sess = _session_mgr.get_or_create_active(platform, user_id)
+    return sess.claude_session_id if sess.cli_session_valid else None
+
+
+def set_session_id(platform: str, user_id: str, session_id: str):
+    sess = _session_mgr.get_or_create_active(platform, user_id)
+    sess.claude_session_id = session_id
+    sess.touch()
+    _session_mgr._save_session(sess)
+
+
+def clear_session(platform: str, user_id: str):
+    _session_mgr.clear_active(platform, user_id)
+    _invalidate_history(platform, user_id)
+
+
+def get_history(platform: str, user_id: str, limit: int = 20, session_name: str = "") -> list[dict]:
+    return load_history(platform, user_id, limit=limit, session_name=session_name)

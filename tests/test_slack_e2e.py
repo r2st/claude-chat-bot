@@ -961,3 +961,321 @@ class TestSlackEdgeCases:
         blocks = client.chat_postMessage.call_args.kwargs.get("blocks", [])
         assert any("Cancel All" in str(b) for b in blocks)
         sb._task_registry.unregister(task.task_id)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 12. Memory commands (remember, recall, memories, forget)
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class TestSlackRemember:
+    @patch.object(sb, "_memory")
+    def test_remember_no_arg(self, mock_mem):
+        client = _mock_client()
+        sb._cmd_remember(client, "C1", "1.1", "U_mem", "")
+        text = client.chat_postMessage.call_args.kwargs["text"]
+        assert "Usage" in text
+
+    @patch.object(sb, "_memory")
+    def test_remember_success(self, mock_mem):
+        mem_obj = MagicMock()
+        mem_obj.id = "abc12345-full-id"
+        mem_obj.tags = ["work"]
+        mock_mem.remember.return_value = mem_obj
+        client = _mock_client()
+        sb._cmd_remember(client, "C1", "1.1", "U_mem", "test note #work")
+        text = client.chat_postMessage.call_args.kwargs["text"]
+        assert "Remembered" in text
+        assert "abc12345" in text
+
+    @patch.object(sb, "_memory")
+    def test_remember_empty_content(self, mock_mem):
+        client = _mock_client()
+        sb._cmd_remember(client, "C1", "1.1", "U_mem", "#tag !0.5")
+        text = client.chat_postMessage.call_args.kwargs["text"]
+        assert "empty" in text.lower() or "Usage" in text
+
+
+class TestSlackRecall:
+    @patch.object(sb, "_memory")
+    def test_recall_no_arg(self, mock_mem):
+        client = _mock_client()
+        sb._cmd_recall(client, "C1", "1.1", "U_mem", "")
+        text = client.chat_postMessage.call_args.kwargs["text"]
+        assert "Usage" in text
+
+    @patch.object(sb, "_memory")
+    def test_recall_found(self, mock_mem):
+        result = MagicMock()
+        result.content = "remember this"
+        result.id = "def45678-full"
+        result.tags = []
+        mock_mem.recall.return_value = [result]
+        client = _mock_client()
+        sb._cmd_recall(client, "C1", "1.1", "U_mem", "this")
+        text = client.chat_postMessage.call_args.kwargs["text"]
+        assert "Found" in text
+
+    @patch.object(sb, "_memory")
+    def test_recall_not_found(self, mock_mem):
+        mock_mem.recall.return_value = []
+        client = _mock_client()
+        sb._cmd_recall(client, "C1", "1.1", "U_mem", "nothing")
+        text = client.chat_postMessage.call_args.kwargs["text"]
+        assert "No memories found" in text
+
+
+class TestSlackMemories:
+    @patch.object(sb, "_memory")
+    def test_memories_empty(self, mock_mem):
+        mock_mem.list_memories.return_value = []
+        client = _mock_client()
+        sb._cmd_memories(client, "C1", "1.1", "U_mem", "")
+        text = client.chat_postMessage.call_args.kwargs["text"]
+        assert "No memories" in text
+
+    @patch.object(sb, "_memory")
+    def test_memories_with_data(self, mock_mem):
+        mem_obj = MagicMock()
+        mem_obj.content = "a memory"
+        mem_obj.id = "aaa11111-full"
+        mem_obj.tags = ["tag1"]
+        mock_mem.list_memories.return_value = [mem_obj]
+        mock_mem.stats.return_value = {"total": 1}
+        client = _mock_client()
+        sb._cmd_memories(client, "C1", "1.1", "U_mem", "")
+        text = client.chat_postMessage.call_args.kwargs["text"]
+        assert "Your memories" in text
+        assert "a memory" in text
+
+    @patch.object(sb, "_memory")
+    def test_memories_filter_by_tag(self, mock_mem):
+        mock_mem.list_memories.return_value = []
+        client = _mock_client()
+        sb._cmd_memories(client, "C1", "1.1", "U_mem", "#work")
+        mock_mem.list_memories.assert_called_once()
+        call_kwargs = mock_mem.list_memories.call_args
+        assert call_kwargs.kwargs.get("tags") == ["work"] or call_kwargs[1].get("tags") == ["work"]
+
+
+class TestSlackForget:
+    @patch.object(sb, "_memory")
+    def test_forget_no_arg(self, mock_mem):
+        client = _mock_client()
+        sb._cmd_forget(client, "C1", "1.1", "U_mem", "")
+        text = client.chat_postMessage.call_args.kwargs["text"]
+        assert "Usage" in text
+
+    @patch.object(sb, "_memory")
+    def test_forget_success(self, mock_mem):
+        mem_obj = MagicMock()
+        mem_obj.id = "abc12345-full-id"
+        mem_obj.content = "old note"
+        mock_mem.list_memories.return_value = [mem_obj]
+        mock_mem.forget.return_value = True
+        client = _mock_client()
+        sb._cmd_forget(client, "C1", "1.1", "U_mem", "abc12345")
+        text = client.chat_postMessage.call_args.kwargs["text"]
+        assert "Forgotten" in text
+
+    @patch.object(sb, "_memory")
+    def test_forget_not_found(self, mock_mem):
+        mock_mem.list_memories.return_value = []
+        client = _mock_client()
+        sb._cmd_forget(client, "C1", "1.1", "U_mem", "zzz99999")
+        text = client.chat_postMessage.call_args.kwargs["text"]
+        assert "not found" in text
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 13. Session management commands (rename, title, pin, archive)
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class TestSlackRename:
+    def test_rename_no_arg(self):
+        client = _mock_client()
+        sb._cmd_rename_session(client, "C1", "1.1", "U_ren", "")
+        text = client.chat_postMessage.call_args.kwargs["text"]
+        assert "Usage" in text
+
+    @patch.object(cc, "_session_mgr")
+    def test_rename_success(self, mock_mgr):
+        sess = MagicMock()
+        sess.name = "new-name"
+        mock_mgr.get_or_create_active.return_value = MagicMock(name="old")
+        mock_mgr.rename.return_value = sess
+        client = _mock_client()
+        sb._cmd_rename_session(client, "C1", "1.1", "U_ren", "new-name")
+        text = client.chat_postMessage.call_args.kwargs["text"]
+        assert "Renamed" in text
+        assert "new-name" in text
+
+    @patch.object(cc, "_session_mgr")
+    def test_rename_failure(self, mock_mgr):
+        mock_mgr.get_or_create_active.return_value = MagicMock(name="old")
+        mock_mgr.rename.return_value = None
+        client = _mock_client()
+        sb._cmd_rename_session(client, "C1", "1.1", "U_ren", "taken")
+        text = client.chat_postMessage.call_args.kwargs["text"]
+        assert "failed" in text.lower() or "taken" in text.lower()
+
+
+class TestSlackTitle:
+    def test_title_no_arg(self):
+        client = _mock_client()
+        sb._cmd_title_session(client, "C1", "1.1", "U_ttl", "")
+        text = client.chat_postMessage.call_args.kwargs["text"]
+        assert "Usage" in text
+
+    @patch.object(cc, "_session_mgr")
+    def test_title_success(self, mock_mgr):
+        sess = MagicMock()
+        sess.title = "My Title"
+        mock_mgr.get_or_create_active.return_value = MagicMock()
+        mock_mgr.set_title.return_value = sess
+        client = _mock_client()
+        sb._cmd_title_session(client, "C1", "1.1", "U_ttl", "My Title")
+        text = client.chat_postMessage.call_args.kwargs["text"]
+        assert "Title set" in text
+
+    @patch.object(cc, "_session_mgr")
+    def test_title_failure(self, mock_mgr):
+        mock_mgr.get_or_create_active.return_value = MagicMock()
+        mock_mgr.set_title.return_value = None
+        client = _mock_client()
+        sb._cmd_title_session(client, "C1", "1.1", "U_ttl", "bad")
+        text = client.chat_postMessage.call_args.kwargs["text"]
+        assert "Failed" in text
+
+
+class TestSlackPin:
+    @patch.object(cc, "_session_mgr")
+    def test_pin_toggle(self, mock_mgr):
+        sess = MagicMock()
+        sess.pinned = False
+        mock_mgr.get_or_create_active.return_value = sess
+        result = MagicMock()
+        result.pinned = True
+        result.name = "sess1"
+        mock_mgr.pin.return_value = result
+        client = _mock_client()
+        sb._cmd_pin_session(client, "C1", "1.1", "U_pin")
+        text = client.chat_postMessage.call_args.kwargs["text"]
+        assert "Pinned" in text
+
+    @patch.object(cc, "_session_mgr")
+    def test_pin_failure(self, mock_mgr):
+        sess = MagicMock()
+        sess.pinned = False
+        mock_mgr.get_or_create_active.return_value = sess
+        mock_mgr.pin.return_value = None
+        client = _mock_client()
+        sb._cmd_pin_session(client, "C1", "1.1", "U_pin")
+        text = client.chat_postMessage.call_args.kwargs["text"]
+        assert "Failed" in text
+
+
+class TestSlackArchive:
+    @patch.object(cc, "_session_mgr")
+    def test_archive_current(self, mock_mgr):
+        active = MagicMock()
+        active.name = "default"
+        active.display_name = "default"
+        mock_mgr.get_or_create_active.return_value = active
+        result = MagicMock()
+        result.display_name = "default"
+        mock_mgr.archive.return_value = result
+        client = _mock_client()
+        sb._cmd_archive_session(client, "C1", "1.1", "U_arc", "")
+        text = client.chat_postMessage.call_args.kwargs["text"]
+        assert "Archived" in text
+
+    @patch.object(cc, "_session_mgr")
+    def test_archive_by_name(self, mock_mgr):
+        result = MagicMock()
+        result.display_name = "old-sess"
+        mock_mgr.archive.return_value = result
+        client = _mock_client()
+        sb._cmd_archive_session(client, "C1", "1.1", "U_arc", "old-sess")
+        text = client.chat_postMessage.call_args.kwargs["text"]
+        assert "Archived" in text
+        mock_mgr.archive.assert_called_with("slack", "U_arc", "old-sess")
+
+    @patch.object(cc, "_session_mgr")
+    def test_archive_failure(self, mock_mgr):
+        mock_mgr.get_or_create_active.return_value = MagicMock(name="x")
+        mock_mgr.archive.return_value = None
+        client = _mock_client()
+        sb._cmd_archive_session(client, "C1", "1.1", "U_arc", "nonexistent")
+        text = client.chat_postMessage.call_args.kwargs["text"]
+        assert "Cannot archive" in text
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 14. _parse_remember_args
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class TestParseRememberArgs:
+    def test_plain_text(self):
+        content, tags, importance = sb._parse_remember_args("hello world")
+        assert content == "hello world"
+        assert tags == []
+        assert importance == 0.5
+
+    def test_with_tags(self):
+        content, tags, _ = sb._parse_remember_args("note #work #urgent")
+        assert content == "note"
+        assert tags == ["work", "urgent"]
+
+    def test_with_importance(self):
+        content, _, importance = sb._parse_remember_args("fact !0.9")
+        assert content == "fact"
+        assert importance == 0.9
+
+    def test_tags_and_importance(self):
+        content, tags, importance = sb._parse_remember_args("idea #dev !0.8")
+        assert content == "idea"
+        assert tags == ["dev"]
+        assert importance == 0.8
+
+    def test_invalid_importance(self):
+        content, _, importance = sb._parse_remember_args("note !abc")
+        assert "!abc" in content
+        assert importance == 0.5
+
+    def test_hash_alone_not_tag(self):
+        _, tags, _ = sb._parse_remember_args("note # alone")
+        assert tags == []
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 15. handle_mention
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class TestHandleMention:
+    def test_mention_dispatches(self):
+        client = _mock_client()
+        event = {"user": "U123", "channel": "C456", "text": "<@BOT> hello", "ts": "1.1"}
+        with patch.object(sb, "_handle") as mock_handle:
+            sb.handle_mention(client, event, say=MagicMock())
+            # _dispatch strips mention, spawns thread calling _handle
+            import time
+            time.sleep(0.1)
+            mock_handle.assert_called_once()
+            args = mock_handle.call_args[0]
+            assert args[2] == "U123"
+            assert "hello" in args[4]
+
+    def test_mention_strips_user_ref(self):
+        client = _mock_client()
+        event = {"user": "U123", "channel": "C456", "text": "<@U999BOT> help", "ts": "2.2"}
+        with patch.object(sb, "_handle") as mock_handle:
+            sb.handle_mention(client, event, say=MagicMock())
+            import time
+            time.sleep(0.1)
+            mock_handle.assert_called_once()
+            text_arg = mock_handle.call_args[0][4]
+            assert "<@" not in text_arg

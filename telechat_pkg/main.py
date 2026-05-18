@@ -178,8 +178,52 @@ def _env_example_path() -> str | None:
 
 # ─── Init command ─────────────────────────────────────────────────────────────
 
+def _validate_telegram_token(token: str) -> str | None:
+    """Validate a Telegram bot token via getMe. Returns bot username or None."""
+    import urllib.request
+    try:
+        url = f"https://api.telegram.org/bot{token}/getMe"
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            data = json.loads(resp.read())
+            if data.get("ok"):
+                return f"@{data['result'].get('username', '???')}"
+    except Exception:
+        pass
+    return None
+
+
+def _validate_green_api(instance_id: str, token: str) -> str | None:
+    """Validate Green API credentials. Returns state string or None."""
+    import urllib.request
+    try:
+        url = f"https://api.green-api.com/waInstance{instance_id}/getStateInstance/{token}"
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            data = json.loads(resp.read())
+            return data.get("stateInstance", "unknown")
+    except Exception:
+        pass
+    return None
+
+
+def _validate_slack_token(token: str) -> str | None:
+    """Validate a Slack bot token via auth.test. Returns team name or None."""
+    import urllib.request
+    try:
+        req = urllib.request.Request(
+            "https://slack.com/api/auth.test",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+            if data.get("ok"):
+                return data.get("team", "???")
+    except Exception:
+        pass
+    return None
+
+
 def _cmd_init() -> None:
-    """Interactive .env setup wizard."""
+    """Interactive .env setup wizard with token validation."""
     import shutil
 
     env_path = _find_env_file()
@@ -225,48 +269,78 @@ def _cmd_init() -> None:
     if "telegram" in platforms:
         print("\n── Telegram ──")
         current = env.get("TELEGRAM_BOT_TOKEN", "")
+        need_new_token = False
         if current and current != "your_telegram_bot_token":
-            print(f"  Token: {current[:10]}...{current[-4:]}")
-            if input("  Change? [y/N]: ").strip().lower() != "y":
-                current = ""
-        if not current or current == "your_telegram_bot_token":
-            token = input("  Bot token (from @BotFather): ").strip()
-            if token:
-                _set_env_var(env_path, "TELEGRAM_BOT_TOKEN", token)
-                print("  → saved")
+            # Validate existing token
+            print(f"  Token: {current[:10]}...{current[-4:]}", end="")
+            bot_name = _validate_telegram_token(current)
+            if bot_name:
+                print(f"  ✓ {bot_name}")
+                if input("  Change? [y/N]: ").strip().lower() == "y":
+                    need_new_token = True
+                # else: keep existing, skip new token prompt
+            else:
+                print("  ✗ invalid")
+                need_new_token = True
+        else:
+            need_new_token = True
+        if need_new_token:
+            print("  Get a token: open Telegram → @BotFather → /newbot")
+            while True:
+                token = input("  Bot token: ").strip()
+                if not token:
+                    print("  ⚠ Skipped — set TELEGRAM_BOT_TOKEN in .env later")
+                    break
+                bot_name = _validate_telegram_token(token)
+                if bot_name:
+                    _set_env_var(env_path, "TELEGRAM_BOT_TOKEN", token)
+                    print(f"  ✓ Bot verified: {bot_name}")
+                    break
+                print("  ✗ Invalid token. Check and try again (Enter to skip).")
 
-        current_ids = env.get("ALLOWED_USER_IDS", "")
+        current_ids = env.get("TELEGRAM_ALLOWED_USER_IDS", "")
         print(f"  Allowed user IDs: {current_ids or '(everyone)'}")
+        print("  Find your ID: message @userinfobot on Telegram")
         ids = input("  Telegram user IDs (comma-sep, enter to keep, 'none' for all): ").strip()
         if ids.lower() == "none":
-            _set_env_var(env_path, "ALLOWED_USER_IDS", "")
+            _set_env_var(env_path, "TELEGRAM_ALLOWED_USER_IDS", "")
         elif ids:
-            _set_env_var(env_path, "ALLOWED_USER_IDS", ids)
+            _set_env_var(env_path, "TELEGRAM_ALLOWED_USER_IDS", ids)
 
     # ── WhatsApp setup ────────────────────────────────────────────────────
     if "whatsapp" in platforms:
         print("\n── WhatsApp (Green API) ──")
         print("  Sign up free: https://console.green-api.com")
 
-        current = env.get("GREEN_API_INSTANCE_ID", "")
-        if current:
-            print(f"  Instance ID: {current}")
-            if input("  Change? [y/N]: ").strip().lower() == "y":
-                current = ""
-        if not current:
-            val = input("  Instance ID: ").strip()
-            if val:
-                _set_env_var(env_path, "GREEN_API_INSTANCE_ID", val)
+        current_id = env.get("GREEN_API_INSTANCE_ID", "")
+        current_tk = env.get("GREEN_API_TOKEN", "")
+        if current_id and current_tk:
+            print(f"  Instance: {current_id}", end="")
+            state = _validate_green_api(current_id, current_tk)
+            if state:
+                print(f"  ✓ {state}")
+            else:
+                print("  ✗ invalid")
+                current_id = ""
+            if current_id and input("  Change? [y/N]: ").strip().lower() == "y":
+                current_id = ""
 
-        current = env.get("GREEN_API_TOKEN", "")
-        if current:
-            print(f"  API Token: {current[:8]}...{current[-4:]}")
-            if input("  Change? [y/N]: ").strip().lower() == "y":
-                current = ""
-        if not current:
-            val = input("  API Token: ").strip()
-            if val:
-                _set_env_var(env_path, "GREEN_API_TOKEN", val)
+        if not current_id:
+            while True:
+                val_id = input("  Instance ID (idInstance): ").strip()
+                val_tk = input("  API Token (apiTokenInstance): ").strip()
+                if not val_id or not val_tk:
+                    print("  ⚠ Skipped — set GREEN_API_INSTANCE_ID and GREEN_API_TOKEN later")
+                    break
+                state = _validate_green_api(val_id, val_tk)
+                if state:
+                    _set_env_var(env_path, "GREEN_API_INSTANCE_ID", val_id)
+                    _set_env_var(env_path, "GREEN_API_TOKEN", val_tk)
+                    print(f"  ✓ Connected (status: {state})")
+                    if state == "notAuthorized":
+                        print("  ⚠ Scan QR code in Green API console to link WhatsApp")
+                    break
+                print("  ✗ Invalid credentials. Try again (Enter to skip).")
 
         # ── WhatsApp allowed numbers ──────────────────────────────────
         current_nums = env.get("WHATSAPP_ALLOWED_NUMBERS", "")
@@ -289,31 +363,53 @@ def _cmd_init() -> None:
         print("  Create app: https://api.slack.com/apps")
 
         current = env.get("SLACK_BOT_TOKEN", "")
-        if current and not current.startswith("xoxb-"):
-            current = ""
-        if current:
-            print(f"  Bot Token: {current[:10]}...{current[-4:]}")
-            if input("  Change? [y/N]: ").strip().lower() == "y":
+        if current and current.startswith("xoxb-"):
+            print(f"  Bot Token: {current[:10]}...{current[-4:]}", end="")
+            team = _validate_slack_token(current)
+            if team:
+                print(f"  ✓ team: {team}")
+            else:
+                print("  ✗ invalid")
                 current = ""
+            if current and input("  Change? [y/N]: ").strip().lower() == "y":
+                current = ""
+        else:
+            current = ""
+
         if not current:
-            val = input("  Bot Token (xoxb-...): ").strip()
-            if val:
-                _set_env_var(env_path, "SLACK_BOT_TOKEN", val)
+            while True:
+                val = input("  Bot Token (xoxb-...): ").strip()
+                if not val:
+                    print("  ⚠ Skipped — set SLACK_BOT_TOKEN later")
+                    break
+                if not val.startswith("xoxb-"):
+                    print("  ✗ Must start with xoxb-. You may have the User OAuth Token (xoxp-) instead.")
+                    print("    Go to OAuth & Permissions → copy 'Bot User OAuth Token'.")
+                    continue
+                team = _validate_slack_token(val)
+                if team:
+                    _set_env_var(env_path, "SLACK_BOT_TOKEN", val)
+                    print(f"  ✓ Slack verified: team {team}")
+                    break
+                print("  ✗ Invalid token. Try again (Enter to skip).")
 
         current = env.get("SLACK_APP_TOKEN", "")
-        if current and not current.startswith("xapp-"):
-            current = ""
-        if current:
+        if current and current.startswith("xapp-"):
             print(f"  App Token: {current[:10]}...{current[-4:]}")
             if input("  Change? [y/N]: ").strip().lower() == "y":
                 current = ""
+        else:
+            current = ""
         if not current:
             val = input("  App Token (xapp-...): ").strip()
             if val:
+                if not val.startswith("xapp-"):
+                    print("  ⚠ App tokens typically start with xapp-. Saving anyway.")
                 _set_env_var(env_path, "SLACK_APP_TOKEN", val)
 
         current_ids = env.get("SLACK_ALLOWED_USER_IDS", "")
         print(f"  Allowed Slack user IDs: {current_ids or '(everyone)'}")
+        print("  Find yours: click profile pic → Profile → ⋮ → Copy member ID")
         ids = input("  Slack member IDs (comma-sep, enter to keep, 'none' for all): ").strip()
         if ids.lower() == "none":
             _set_env_var(env_path, "SLACK_ALLOWED_USER_IDS", "")
@@ -338,11 +434,109 @@ def _cmd_init() -> None:
             if key:
                 _set_env_var(env_path, "ANTHROPIC_API_KEY", key)
 
+    # ── Optional features ─────────────────────────────────────────────────
+    print("\n── Optional Features ──")
+    print("  These are optional — you can enable them later in .env")
+    print("  1) Voice transcription (OpenAI Whisper)")
+    print("  2) Text-to-speech (OpenAI TTS)")
+    print("  3) Image generation (DALL-E 3)")
+    print("  4) Web search (Brave / Tavily)")
+    print("  5) Web fetch (extract readable URL content)")
+    print("  6) Music generation (Replicate)")
+    print("  7) Video generation (Replicate)")
+    feat_choice = input("  Enable features (e.g. '1,2,3', Enter = skip all): ").strip()
+    features = {int(x.strip()) for x in feat_choice.split(",") if x.strip().isdigit()} if feat_choice else set()
+
+    if features & {1, 2, 3}:
+        current_oai = env.get("OPENAI_API_KEY", "")
+        if not current_oai:
+            oai_key = input("  OpenAI API key (sk-...): ").strip()
+            if oai_key:
+                _set_env_var(env_path, "OPENAI_API_KEY", oai_key)
+        if 1 in features:
+            _set_env_var(env_path, "TRANSCRIPTION_ENABLED", "true")
+            print("  ✓ Voice transcription enabled")
+        if 2 in features:
+            _set_env_var(env_path, "TTS_ENABLED", "true")
+            print("  ✓ Text-to-speech enabled")
+        if 3 in features:
+            _set_env_var(env_path, "IMAGE_GEN_ENABLED", "true")
+            print("  ✓ Image generation enabled")
+
+    if 4 in features:
+        _set_env_var(env_path, "WEB_SEARCH_ENABLED", "true")
+        print("  Search provider:")
+        print("    1) Brave Search — https://api.search.brave.com (free: 2000/month)")
+        print("    2) Tavily — https://tavily.com (free: 1000/month)")
+        sp = input("  Choose (1/2): ").strip()
+        if sp == "1":
+            key = input("  Brave Search API key: ").strip()
+            if key:
+                _set_env_var(env_path, "BRAVE_SEARCH_API_KEY", key)
+        elif sp == "2":
+            key = input("  Tavily API key: ").strip()
+            if key:
+                _set_env_var(env_path, "TAVILY_API_KEY", key)
+        print("  ✓ Web search enabled")
+
+    if 5 in features:
+        _set_env_var(env_path, "WEB_FETCH_ENABLED", "true")
+        jina = input("  Jina Reader API key (optional, Enter to skip): ").strip()
+        if jina:
+            _set_env_var(env_path, "JINA_API_KEY", jina)
+        print("  ✓ Web fetch enabled")
+
+    if features & {6, 7}:
+        current_rep = env.get("REPLICATE_API_TOKEN", "")
+        if not current_rep:
+            rep_key = input("  Replicate API token — https://replicate.com : ").strip()
+            if rep_key:
+                _set_env_var(env_path, "REPLICATE_API_TOKEN", rep_key)
+        if 6 in features:
+            _set_env_var(env_path, "MUSIC_GEN_ENABLED", "true")
+            print("  ✓ Music generation enabled")
+        if 7 in features:
+            _set_env_var(env_path, "VIDEO_GEN_ENABLED", "true")
+            print("  ✓ Video generation enabled")
+
     # Persist the directory containing .env as the workdir (shared with npm CLI)
     _save_workdir(os.path.dirname(os.path.abspath(env_path)))
 
-    print(f"\nDone! Config saved to {env_path}")
-    print("Run 'telechat' or 'telechat start' to launch the bot.")
+    # ── Summary ───────────────────────────────────────────────────────────
+    final_env = _read_env(env_path)
+    print(f"\n── Setup Complete ──")
+
+    tg_token = final_env.get("TELEGRAM_BOT_TOKEN", "")
+    has_tg = bool(tg_token and tg_token != "your_telegram_bot_token")
+    wa_id = final_env.get("GREEN_API_INSTANCE_ID", "")
+    has_wa = bool(wa_id and final_env.get("GREEN_API_TOKEN"))
+    sl_token = final_env.get("SLACK_BOT_TOKEN", "")
+    has_sl = bool(sl_token and sl_token.startswith("xoxb-"))
+
+    print(f"  Telegram : {'✓ configured' if has_tg else '── skipped'}")
+    print(f"  WhatsApp : {'✓ configured' if has_wa else '── skipped'}")
+    print(f"  Slack    : {'✓ configured' if has_sl else '── skipped'}")
+    print(f"  Claude   : {final_env.get('CLAUDE_MODE', 'cli')} mode")
+    print(f"  Config   : {env_path}")
+
+    if not has_tg and not has_wa and not has_sl:
+        print("\n  ⚠ No platform configured. The bot won't start without credentials.")
+        print("  Run 'telechat init' again or edit .env manually.")
+    else:
+        # Security warnings
+        warnings = []
+        if has_tg and not final_env.get("TELEGRAM_ALLOWED_USER_IDS"):
+            warnings.append("Telegram: no user restriction (anyone can message the bot)")
+        if has_wa and not final_env.get("WHATSAPP_ALLOWED_NUMBERS"):
+            warnings.append("WhatsApp: no number restriction (anyone can message the bot)")
+        if has_sl and not final_env.get("SLACK_ALLOWED_USER_IDS"):
+            warnings.append("Slack: no user restriction (anyone in workspace can use the bot)")
+        if warnings:
+            print("\n  ⚠ Security:")
+            for w in warnings:
+                print(f"    • {w}")
+
+        print("\n  Run 'telechat' or 'telechat start' to launch the bot.")
 
 
 def _parse_platforms(mode: str) -> set[str]:
@@ -463,6 +657,9 @@ def _cmd_start() -> None:
     # ── Async main ────────────────────────────────────────────────────────
     async def _main() -> None:
         await asyncio.sleep(1)
+
+        from . import health
+        health.start_health_server()
 
         platforms = ", ".join(sorted(PLATFORMS))
         print(f"telechat — {platforms}")

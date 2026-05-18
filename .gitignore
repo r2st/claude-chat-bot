@@ -4,8 +4,26 @@ __pycache__/
 venv/
 *.log
 *.db
+*.db-shm
+*.db-wal
 .claude/
 
-# coding-agent runtime state
+# Build artifacts
+dist/
+*.egg-info/
+build/
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Runtime state
+*.pid
+*.err
+.watchdog_state.json
 telechat_pkg/coder_projects.json
 coder_projects.json
+
+# OS
+.DS_Store
