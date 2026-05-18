@@ -30,6 +30,7 @@ import requests
 from dotenv import load_dotenv
 
 import claude_core as cc
+from memory import MemoryStore
 
 load_dotenv()
 
@@ -61,6 +62,8 @@ _browse_items: dict[str, list[Path]] = {}  # user → last listed items (for !cd
 
 BROWSE_ROOT = Path(cc.CLAUDE_WORK_DIR)
 BROWSE_PAGE_SIZE = 15
+
+_memory = MemoryStore()
 
 TOOL_ICONS = {
     "Read": "📖", "Edit": "✏️", "Write": "📝", "Bash": "💻",
@@ -139,6 +142,12 @@ HELP_TEXT = """*Claude Bot Commands*
 !sessions — List your sessions
 !new <name> — Create new session
 !switch <n> — Switch to session #n
+
+*Memory:*
+!remember <text> — Save a memory
+!recall <query> — Search your memories
+!memories — List recent memories
+!forget <id> — Delete a memory
 
 *Stats:*
 !usage — Usage statistics
@@ -378,6 +387,53 @@ def _handle_command(chat_id: str, sender: str, text: str) -> bool:
         # This goes through Claude, so return False to let _handle process it
         # But we need to inject the prompt. Use a thread directly.
         threading.Thread(target=_handle, args=(chat_id, sender, prompt), daemon=True).start()
+
+    elif cmd == "!remember":
+        if not arg:
+            send_message(chat_id, "Usage: !remember <something to remember>")
+        else:
+            raw_arg = text.split(None, 1)[1] if len(text.split(None, 1)) > 1 else ""
+            mem = _memory.remember(PLATFORM, sender, raw_arg)
+            send_message(chat_id, f"✅ Remembered!\n_ID: {mem.id[:8]}…_")
+
+    elif cmd == "!recall":
+        if not arg:
+            send_message(chat_id, "Usage: !recall <search query>")
+        else:
+            raw_arg = text.split(None, 1)[1] if len(text.split(None, 1)) > 1 else ""
+            results = _memory.recall(PLATFORM, sender, raw_arg, limit=5)
+            if not results:
+                send_message(chat_id, "🔍 No memories found.")
+            else:
+                lines = [f"🔍 *Found {len(results)} memor{'y' if len(results) == 1 else 'ies'}:*\n"]
+                for r in results:
+                    short_id = r.id[:8]
+                    lines.append(f"• {r.content}\n  _ID: {short_id}…_")
+                send_message(chat_id, "\n".join(lines))
+
+    elif cmd == "!memories":
+        mems = _memory.list_memories(PLATFORM, sender, limit=10)
+        if not mems:
+            send_message(chat_id, "📭 No memories yet. Use !remember <text> to save one.")
+        else:
+            stats = _memory.stats(PLATFORM, sender)
+            lines = [f"🧠 *Your memories* ({stats['total']} total):\n"]
+            for m in mems:
+                short_id = m.id[:8]
+                lines.append(f"• {m.content}\n  _ID: {short_id}…_")
+            send_message(chat_id, "\n".join(lines))
+
+    elif cmd == "!forget":
+        if not arg:
+            send_message(chat_id, "Usage: !forget <memory-id>\n_Use !memories to see IDs_")
+        else:
+            target_id = arg.strip().rstrip("…")
+            mems = _memory.list_memories(PLATFORM, sender, limit=100)
+            match = next((m for m in mems if m.id.startswith(target_id)), None)
+            if match and _memory.forget(PLATFORM, sender, match.id):
+                send_message(chat_id, f"🗑️ Forgotten: _{match.content[:60]}_")
+            else:
+                send_message(chat_id, "❌ Memory not found. Use !memories to see your memories.")
 
     else:
         send_message(chat_id, f"Unknown command: {cmd}\nType !help for available commands.")

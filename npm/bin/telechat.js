@@ -679,6 +679,81 @@ function printTips() {
 `);
 }
 
+// ─── Post-init validation ───────────────────────────────────────────────────
+
+async function postInitValidation(envFile) {
+  if (!existsSync(envFile)) return;
+
+  const content = fs.readFileSync(envFile, "utf8");
+  const vars = {};
+  for (const line of content.split("\n")) {
+    if (!line.trim() || line.startsWith("#")) continue;
+    const eq = line.indexOf("=");
+    if (eq > 0) vars[line.slice(0, eq).trim()] = line.slice(eq + 1).trim();
+  }
+
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  let changed = false;
+
+  // WhatsApp: ensure WHATSAPP_ALLOWED_NUMBERS is set
+  if (vars.GREEN_API_INSTANCE_ID && vars.GREEN_API_TOKEN && !vars.WHATSAPP_ALLOWED_NUMBERS) {
+    console.log("\n── WhatsApp access control ──\n");
+
+    // Try auto-detect phone from Green API
+    let autoNumber = null;
+    try {
+      const settings = await getGreenApiSettings(vars.GREEN_API_INSTANCE_ID, vars.GREEN_API_TOKEN);
+      if (settings?.wid) autoNumber = settings.wid.split("@")[0];
+    } catch {}
+
+    let nums = "";
+    if (autoNumber) {
+      nums = await ask(rl, `  Your WhatsApp number: +${autoNumber}\n  Restrict bot to this number? (Y/n): `, "y");
+      if (nums.toLowerCase() === "y" || nums === "") nums = autoNumber;
+      else if (nums.toLowerCase() === "n") nums = "";
+    } else {
+      nums = await ask(rl, "  WhatsApp number(s) to allow (without +, comma-sep, Enter=allow all): ");
+    }
+
+    if (nums) {
+      const clean = nums.replace(/[\s+\-()]/g, "");
+      setEnvVar(envFile, "WHATSAPP_ALLOWED_NUMBERS", clean);
+      console.log(`  ✓ WHATSAPP_ALLOWED_NUMBERS=${clean}`);
+      changed = true;
+    } else {
+      console.log("  → Allowing all numbers.");
+    }
+  }
+
+  // Telegram: ensure TELEGRAM_ALLOWED_USER_IDS is set
+  if (vars.TELEGRAM_BOT_TOKEN && !vars.TELEGRAM_ALLOWED_USER_IDS) {
+    console.log("\n── Telegram access control ──\n");
+    console.log("  ⚠ No user restriction set — anyone can message your bot.");
+    const uid = await ask(rl, "  Your Telegram user ID (Enter=allow all, or send /id to the bot to find it): ");
+    if (uid) {
+      setEnvVar(envFile, "TELEGRAM_ALLOWED_USER_IDS", uid.trim());
+      console.log(`  ✓ TELEGRAM_ALLOWED_USER_IDS=${uid.trim()}`);
+      changed = true;
+    }
+  }
+
+  // Slack: ensure SLACK_ALLOWED_USER_IDS is set
+  if (vars.SLACK_BOT_TOKEN && !vars.SLACK_ALLOWED_USER_IDS) {
+    console.log("\n── Slack access control ──\n");
+    console.log("  ⚠ No user restriction set — anyone in the workspace can use the bot.");
+    const sid = await ask(rl, "  Your Slack member ID (Enter=allow all): ");
+    if (sid) {
+      setEnvVar(envFile, "SLACK_ALLOWED_USER_IDS", sid.trim());
+      console.log(`  ✓ SLACK_ALLOWED_USER_IDS=${sid.trim()}`);
+      changed = true;
+    }
+  }
+
+  rl.close();
+  if (changed) console.log("");
+}
+
+
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 async function main() {
@@ -1012,7 +1087,13 @@ FLOW:
       cwd: process.cwd(),
     });
 
-    child.on("exit", (code) => process.exit(code || 0));
+    child.on("exit", async (code) => {
+      if (code !== 0) return process.exit(code || 0);
+
+      // Post-init validation: catch anything Claude CLI missed
+      await postInitValidation(envFile);
+      process.exit(0);
+    });
     return;
   }
 
@@ -1203,38 +1284,15 @@ FLOW:
       process.exit(1);
     }
 
-    // ── WhatsApp: prompt for allowed numbers if not set ──
-    if (hasWhatsApp && !envVars.WHATSAPP_ALLOWED_NUMBERS) {
-      console.log(`\n  ⚠ WhatsApp access control not configured.`);
-      console.log(`    Without WHATSAPP_ALLOWED_NUMBERS, anyone can message your bot.\n`);
+    // ── Prompt for missing access control on any platform ──
+    await postInitValidation(envFile);
 
-      // Try auto-detect from Green API
-      let autoNumber = null;
-      try {
-        const settings = await getGreenApiSettings(envVars.GREEN_API_INSTANCE_ID, envVars.GREEN_API_TOKEN);
-        if (settings?.wid) autoNumber = settings.wid.split("@")[0];
-      } catch {}
-
-      const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-      let nums = "";
-      if (autoNumber) {
-        nums = await ask(rl, `  Your WhatsApp number: ${autoNumber}\n  Restrict access to this number? (Y/n/other number): `, "y");
-        if (nums.toLowerCase() === "y" || nums === "") nums = autoNumber;
-        else if (nums.toLowerCase() === "n") nums = "";
-      } else {
-        console.log(`  Tip: send !id to the bot to discover your WhatsApp number.\n`);
-        nums = await ask(rl, `  WhatsApp number(s) to allow (without +, comma-sep, enter=allow all): `);
-      }
-      rl.close();
-
-      if (nums) {
-        const clean = nums.replace(/[\s+\-()]/g, "");
-        setEnvVar(envFile, "WHATSAPP_ALLOWED_NUMBERS", clean);
-        envVars.WHATSAPP_ALLOWED_NUMBERS = clean;
-        console.log(`  ✓ WHATSAPP_ALLOWED_NUMBERS=${clean}\n`);
-      } else {
-        console.log(`  → Allowing all numbers (you can change later: telechat init)\n`);
-      }
+    // Re-read env vars after validation may have updated the file
+    const updatedContent = fs.readFileSync(envFile, "utf8");
+    for (const line of updatedContent.split("\n")) {
+      if (!line.trim() || line.startsWith("#")) continue;
+      const eq = line.indexOf("=");
+      if (eq > 0) envVars[line.slice(0, eq).trim()] = line.slice(eq + 1).trim();
     }
 
     // Check if already running

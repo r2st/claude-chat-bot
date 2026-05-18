@@ -2,7 +2,6 @@
 Telegram adapter — wraps claude_core for the Telegram Bot API.
 Run via main.py with BOT_MODE=telegram or BOT_MODE=both.
 """
-from __future__ import annotations
 
 import asyncio
 import itertools
@@ -25,8 +24,7 @@ from telegram.ext import (
 )
 
 from . import claude_core as cc
-from . import feedback as fb
-from . import health
+from .memory import MemoryStore
 
 log = logging.getLogger(__name__)
 
@@ -34,7 +32,7 @@ PLATFORM = "telegram"
 
 # ─── Telegram-specific config ───────────────────────────────────────────────────
 
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 
 ALLOWED_USER_IDS: set[int] = set()
 _raw = os.getenv("TELEGRAM_ALLOWED_USER_IDS", "")
@@ -61,6 +59,8 @@ VERBOSE_LEVELS = {0: "Quiet", 1: "Normal", 2: "Detailed"}
 
 _DEFAULT_MODEL = os.getenv("CLAUDE_CLI_MODEL", cc.CLAUDE_MODEL)
 _DEFAULT_PERM  = os.getenv("CLAUDE_CLI_PERMISSION_MODE", cc.CLAUDE_PERM_MODE)
+
+_memory = MemoryStore()
 
 
 # ─── Per-user getters ───────────────────────────────────────────────────────────
@@ -574,9 +574,6 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/switch — switch to another session\n"
         "/browse — browse project folders interactively\n"
         "/reset — clear conversation history\n"
-        "/rate — rate last response (1-5)\n"
-        "/feedback — submit text feedback\n"
-        "/quality — view quality metrics\n"
         "/model — switch Claude model\n"
         "/engine — switch engine (cli/sdk/api)\n"
         "/permissions — change CLI permission mode\n"
@@ -584,7 +581,12 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/usage — show usage stats\n"
         "/watchdog — self-healing status\n"
         "/mode — show current settings\n"
-        "/id — show your Telegram user ID"
+        "/id — show your Telegram user ID\n\n"
+        "Memory:\n"
+        "/remember <text> — save a memory\n"
+        "/recall <query> — search your memories\n"
+        "/memories — list recent memories\n"
+        "/forget <id> — delete a memory"
     )
 
 
@@ -1019,6 +1021,59 @@ async def _handle_browse_callback(q, uid: int):
             _task_registry.unregister(task.task_id)
 
 
+async def cmd_remember(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = str(update.effective_user.id)
+    text = " ".join(ctx.args) if ctx.args else ""
+    if not text:
+        await update.message.reply_text("Usage: /remember <something to remember>")
+        return
+    mem = _memory.remember(PLATFORM, uid, text)
+    await update.message.reply_text(f"✅ Remembered!\n_ID: `{mem.id[:8]}…`_", parse_mode="Markdown")
+
+
+async def cmd_recall(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = str(update.effective_user.id)
+    query = " ".join(ctx.args) if ctx.args else ""
+    if not query:
+        await update.message.reply_text("Usage: /recall <search query>")
+        return
+    results = _memory.recall(PLATFORM, uid, query, limit=5)
+    if not results:
+        await update.message.reply_text("🔍 No memories found.")
+        return
+    lines = [f"🔍 *Found {len(results)} memor{'y' if len(results) == 1 else 'ies'}:*\n"]
+    for r in results:
+        lines.append(f"• {r.content}\n  _ID: `{r.id[:8]}…`_")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def cmd_memories(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = str(update.effective_user.id)
+    mems = _memory.list_memories(PLATFORM, uid, limit=10)
+    if not mems:
+        await update.message.reply_text("📭 No memories yet. Use /remember <text> to save one.")
+        return
+    stats = _memory.stats(PLATFORM, uid)
+    lines = [f"🧠 *Your memories* ({stats['total']} total):\n"]
+    for m in mems:
+        lines.append(f"• {m.content}\n  _ID: `{m.id[:8]}…`_")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def cmd_forget(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = str(update.effective_user.id)
+    target_id = ctx.args[0].rstrip("…") if ctx.args else ""
+    if not target_id:
+        await update.message.reply_text("Usage: /forget <memory-id>\n_Use /memories to see IDs_")
+        return
+    mems = _memory.list_memories(PLATFORM, uid, limit=100)
+    match = next((m for m in mems if m.id.startswith(target_id)), None)
+    if match and _memory.forget(PLATFORM, uid, match.id):
+        await update.message.reply_text(f"🗑️ Forgotten: _{match.content[:60]}_", parse_mode="Markdown")
+    else:
+        await update.message.reply_text("❌ Memory not found. Use /memories to see your memories.")
+
+
 async def cmd_usage(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     u = cc.get_usage(PLATFORM, str(uid))
@@ -1077,112 +1132,6 @@ async def cmd_watchdog(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             lines.append(f"  {status} `{f['fingerprint'][:8]}` — {ago}")
             if desc:
                 lines.append(f"     _{desc}_")
-
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-
-async def cmd_rate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Rate the last response. Usage: /rate 1-5"""
-    uid = update.effective_user.id
-    if not ctx.args:
-        await update.message.reply_text(
-            "Rate the last response:\n"
-            "`/rate 5` — Excellent\n"
-            "`/rate 4` — Good\n"
-            "`/rate 3` — OK\n"
-            "`/rate 2` — Poor\n"
-            "`/rate 1` — Bad\n\n"
-            "Or use `/feedback <text>` for detailed feedback.",
-            parse_mode="Markdown",
-        )
-        return
-
-    try:
-        rating = int(ctx.args[0])
-        if not 1 <= rating <= 5:
-            raise ValueError
-    except ValueError:
-        await update.message.reply_text("Rating must be 1-5.")
-        return
-
-    # Get last response for context
-    history = cc.load_history(PLATFORM, str(uid))
-    last_response = ""
-    if history:
-        for msg in reversed(history):
-            if msg["role"] == "assistant":
-                last_response = msg["content"]
-                break
-
-    fb.save_feedback(
-        platform=PLATFORM,
-        user_id=str(uid),
-        rating=rating,
-        response_preview=last_response[:500],
-    )
-
-    # Run quality evaluation on the last exchange
-    if last_response and rating >= 4:
-        fb.append_learning(
-            f"User rated response {rating}/5. Response style was well-received.",
-            source="user_rating",
-            category="quality",
-        )
-
-    emoji = ["", "😟", "😐", "🙂", "👍", "🌟"][rating]
-    stats = fb.get_feedback_stats(PLATFORM, str(uid))
-    await update.message.reply_text(
-        f"{emoji} Rated {rating}/5 — thanks!\n"
-        f"_Your avg: {stats['avg_rating']}/5 across {stats['total_ratings']} ratings_",
-        parse_mode="Markdown",
-    )
-
-
-async def cmd_feedback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Submit text feedback. Usage: /feedback <your feedback>"""
-    uid = update.effective_user.id
-    text = " ".join(ctx.args).strip() if ctx.args else ""
-    if not text:
-        await update.message.reply_text("Usage: `/feedback <your feedback text>`", parse_mode="Markdown")
-        return
-
-    fb.save_feedback(
-        platform=PLATFORM,
-        user_id=str(uid),
-        text_feedback=text,
-    )
-    await update.message.reply_text("📝 Feedback recorded — thank you!")
-
-
-async def cmd_quality(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Show quality metrics and feedback stats."""
-    uid = update.effective_user.id
-    stats = fb.get_feedback_stats(PLATFORM, str(uid))
-    trend = fb.get_quality_trend(PLATFORM, str(uid))
-
-    lines = ["*📊 Quality Metrics*\n"]
-    lines.append(f"Ratings: `{stats['total_ratings']}`")
-    lines.append(f"Average: `{stats['avg_rating']}/5`")
-    lines.append(f"Satisfaction: `{stats['satisfaction_pct']}%`")
-
-    if trend:
-        recent_avg = sum(trend[-10:]) / len(trend[-10:]) if trend else 0
-        lines.append(f"\nRecent quality score: `{recent_avg:.0%}`")
-        # Simple trend indicator
-        if len(trend) >= 5:
-            early = sum(trend[:len(trend)//2]) / (len(trend)//2)
-            late = sum(trend[len(trend)//2:]) / (len(trend) - len(trend)//2)
-            if late > early + 0.05:
-                lines.append("Trend: 📈 Improving")
-            elif late < early - 0.05:
-                lines.append("Trend: 📉 Declining")
-            else:
-                lines.append("Trend: ➡️ Stable")
-
-    # Health status
-    h = health.get_health()
-    lines.append(f"\n*🏥 System Health:* `{h['status']}`")
-    lines.append(f"Uptime: `{h['uptime_seconds'] // 3600}h {(h['uptime_seconds'] % 3600) // 60}m`")
 
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
@@ -1563,18 +1512,6 @@ async def _run_task(update: Update, ctx: ContextTypes.DEFAULT_TYPE, uid: int, us
         cc.track_tool_usage(PLATFORM, str(uid), stats.get("tools_used", []))
         cc.track_cost(PLATFORM, str(uid), stats.get("input_tokens", 0), stats.get("output_tokens", 0), stats.get("cost_usd", 0))
 
-        # Auto quality evaluation (non-blocking)
-        try:
-            scores = fb.evaluate_response(user_text, reply, stats)
-            fb.save_quality_score(PLATFORM, str(uid), "composite", scores["composite"], reply[:200])
-            # Report health based on quality
-            if scores["composite"] >= 0.6:
-                health.report_healthy("claude_quality")
-            else:
-                health.report_unhealthy("claude_quality", f"Low quality score: {scores['composite']}")
-        except Exception:
-            pass
-
         # Build header with completion stats
         v = _verbose(uid)
         if is_timeout:
@@ -1712,30 +1649,8 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ─── Upload directory for persistent file storage ─────────────────────────────
 
-def _resolve_upload_dir() -> Path:
-    """Upload dir under CLAUDE_WORK_DIR, falling back to the data home.
-
-    Handles unconfigured/placeholder paths (e.g. /Users/you) gracefully
-    instead of crashing at import time.
-    """
-    candidates = [
-        Path(cc.CLAUDE_WORK_DIR) / "telegram_uploads",
-        Path(os.path.expanduser("~")) / ".telechat" / "telegram_uploads",
-    ]
-    for d in candidates:
-        try:
-            d.mkdir(parents=True, exist_ok=True)
-            return d
-        except OSError:
-            continue
-    # Last resort: temp dir
-    import tempfile
-    d = Path(tempfile.gettempdir()) / "telechat_uploads"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-
-UPLOAD_DIR = _resolve_upload_dir()
+UPLOAD_DIR = Path(cc.CLAUDE_WORK_DIR) / "telegram_uploads"
+UPLOAD_DIR.mkdir(exist_ok=True)
 
 
 def _upload_path(uid: int, suffix: str, prefix: str = "") -> Path:
@@ -1852,18 +1767,7 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ─── Entry point ─────────────────────────────────────────────────────────────────
 
 def build_app() -> Application:
-    if not TOKEN:
-        raise RuntimeError(
-            "TELEGRAM_BOT_TOKEN is not set. "
-            "Run `telechat` to launch the setup wizard, or set it in your .env file."
-        )
     cc.init_db()
-
-    # Initialize health monitoring
-    health.register_component("telegram")
-    health.register_component("claude_quality")
-    health.register_component("database", check_fn=lambda: cc._get_conn().execute("SELECT 1").fetchone() is not None)
-    health.start_health_server()
 
     import ssl
     from telegram.request import HTTPXRequest
@@ -1889,10 +1793,11 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("permissions", cmd_permissions))
     app.add_handler(CommandHandler("usage",       cmd_usage))
     app.add_handler(CommandHandler("watchdog",    cmd_watchdog))
-    app.add_handler(CommandHandler("rate",        cmd_rate))
-    app.add_handler(CommandHandler("feedback",    cmd_feedback))
-    app.add_handler(CommandHandler("quality",     cmd_quality))
     app.add_handler(CommandHandler("id",          cmd_id))
+    app.add_handler(CommandHandler("remember",    cmd_remember))
+    app.add_handler(CommandHandler("recall",      cmd_recall))
+    app.add_handler(CommandHandler("memories",    cmd_memories))
+    app.add_handler(CommandHandler("forget",      cmd_forget))
     app.add_handler(CallbackQueryHandler(handle_callback, pattern=r"^tg:"))
     app.add_handler(MessageHandler(filters.PHOTO,              handle_photo))
     app.add_handler(MessageHandler(filters.Document.ALL,       handle_document))
@@ -1906,8 +1811,6 @@ async def run_telegram():
     await app.initialize()
     await app.start()
     await app.updater.start_polling(drop_pending_updates=True)
-    health.report_healthy("telegram")
-    health.watchdog.start()
     log.info("Telegram bot is running.")
     try:
         while True:

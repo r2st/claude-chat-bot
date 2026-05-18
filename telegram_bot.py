@@ -24,6 +24,7 @@ from telegram.ext import (
 )
 
 import claude_core as cc
+from memory import MemoryStore
 
 log = logging.getLogger(__name__)
 
@@ -58,6 +59,8 @@ VERBOSE_LEVELS = {0: "Quiet", 1: "Normal", 2: "Detailed"}
 
 _DEFAULT_MODEL = os.getenv("CLAUDE_CLI_MODEL", cc.CLAUDE_MODEL)
 _DEFAULT_PERM  = os.getenv("CLAUDE_CLI_PERMISSION_MODE", cc.CLAUDE_PERM_MODE)
+
+_memory = MemoryStore()
 
 
 # ─── Per-user getters ───────────────────────────────────────────────────────────
@@ -578,7 +581,12 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/usage — show usage stats\n"
         "/watchdog — self-healing status\n"
         "/mode — show current settings\n"
-        "/id — show your Telegram user ID"
+        "/id — show your Telegram user ID\n\n"
+        "Memory:\n"
+        "/remember <text> — save a memory\n"
+        "/recall <query> — search your memories\n"
+        "/memories — list recent memories\n"
+        "/forget <id> — delete a memory"
     )
 
 
@@ -1011,6 +1019,59 @@ async def _handle_browse_callback(q, uid: int):
         finally:
             await task.stop()
             _task_registry.unregister(task.task_id)
+
+
+async def cmd_remember(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = str(update.effective_user.id)
+    text = " ".join(ctx.args) if ctx.args else ""
+    if not text:
+        await update.message.reply_text("Usage: /remember <something to remember>")
+        return
+    mem = _memory.remember(PLATFORM, uid, text)
+    await update.message.reply_text(f"✅ Remembered!\n_ID: `{mem.id[:8]}…`_", parse_mode="Markdown")
+
+
+async def cmd_recall(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = str(update.effective_user.id)
+    query = " ".join(ctx.args) if ctx.args else ""
+    if not query:
+        await update.message.reply_text("Usage: /recall <search query>")
+        return
+    results = _memory.recall(PLATFORM, uid, query, limit=5)
+    if not results:
+        await update.message.reply_text("🔍 No memories found.")
+        return
+    lines = [f"🔍 *Found {len(results)} memor{'y' if len(results) == 1 else 'ies'}:*\n"]
+    for r in results:
+        lines.append(f"• {r.content}\n  _ID: `{r.id[:8]}…`_")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def cmd_memories(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = str(update.effective_user.id)
+    mems = _memory.list_memories(PLATFORM, uid, limit=10)
+    if not mems:
+        await update.message.reply_text("📭 No memories yet. Use /remember <text> to save one.")
+        return
+    stats = _memory.stats(PLATFORM, uid)
+    lines = [f"🧠 *Your memories* ({stats['total']} total):\n"]
+    for m in mems:
+        lines.append(f"• {m.content}\n  _ID: `{m.id[:8]}…`_")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def cmd_forget(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = str(update.effective_user.id)
+    target_id = ctx.args[0].rstrip("…") if ctx.args else ""
+    if not target_id:
+        await update.message.reply_text("Usage: /forget <memory-id>\n_Use /memories to see IDs_")
+        return
+    mems = _memory.list_memories(PLATFORM, uid, limit=100)
+    match = next((m for m in mems if m.id.startswith(target_id)), None)
+    if match and _memory.forget(PLATFORM, uid, match.id):
+        await update.message.reply_text(f"🗑️ Forgotten: _{match.content[:60]}_", parse_mode="Markdown")
+    else:
+        await update.message.reply_text("❌ Memory not found. Use /memories to see your memories.")
 
 
 async def cmd_usage(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1733,6 +1794,10 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("usage",       cmd_usage))
     app.add_handler(CommandHandler("watchdog",    cmd_watchdog))
     app.add_handler(CommandHandler("id",          cmd_id))
+    app.add_handler(CommandHandler("remember",    cmd_remember))
+    app.add_handler(CommandHandler("recall",      cmd_recall))
+    app.add_handler(CommandHandler("memories",    cmd_memories))
+    app.add_handler(CommandHandler("forget",      cmd_forget))
     app.add_handler(CallbackQueryHandler(handle_callback, pattern=r"^tg:"))
     app.add_handler(MessageHandler(filters.PHOTO,              handle_photo))
     app.add_handler(MessageHandler(filters.Document.ALL,       handle_document))
