@@ -23,10 +23,28 @@ import os
 import tempfile
 import time
 from dataclasses import dataclass, field
+from ipaddress import ip_address
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 log = logging.getLogger(__name__)
+
+_BLOCKED_HOSTS = {"localhost", "0.0.0.0"}
+
+
+def _is_blocked_url(url: str) -> bool:
+    try:
+        parsed = urlparse(url)
+        hostname = parsed.hostname or ""
+        if parsed.scheme not in ("http", "https"):
+            return True
+        if hostname in _BLOCKED_HOSTS:
+            return True
+        addr = ip_address(hostname)
+        return addr.is_private or addr.is_loopback or addr.is_reserved
+    except ValueError:
+        return False
 
 BROWSER_ENABLED = os.getenv("BROWSER_ENABLED", "false").lower() in ("1", "true", "yes")
 BROWSER_HEADLESS = os.getenv("BROWSER_HEADLESS", "true").lower() in ("1", "true", "yes")
@@ -101,6 +119,8 @@ class BrowserAgent:
 
     async def screenshot(self, url: str, *, full_page: bool = False) -> BrowserResult:
         """Navigate to URL and take a screenshot."""
+        if _is_blocked_url(url):
+            return BrowserResult(success=False, error="Blocked: private/internal address", url=url)
         await self._ensure_started()
         start = time.time()
         try:
@@ -127,6 +147,8 @@ class BrowserAgent:
 
     async def extract_text(self, url: str, *, selector: str = "body") -> BrowserResult:
         """Navigate to URL and extract text content."""
+        if _is_blocked_url(url):
+            return BrowserResult(success=False, error="Blocked: private/internal address", url=url)
         await self._ensure_started()
         start = time.time()
         try:
@@ -161,6 +183,8 @@ class BrowserAgent:
 
     async def fill_form(self, url: str, fields: dict[str, str], *, submit: bool = False) -> BrowserResult:
         """Navigate to URL and fill form fields."""
+        if _is_blocked_url(url):
+            return BrowserResult(success=False, error="Blocked: private/internal address", url=url)
         await self._ensure_started()
         start = time.time()
         try:

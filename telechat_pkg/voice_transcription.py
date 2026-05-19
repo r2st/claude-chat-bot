@@ -56,30 +56,31 @@ async def transcribe(
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
 
     try:
-        data = FormData()
-        data.add_field("file", open(audio_path, "rb"),
-                       filename=os.path.basename(audio_path),
-                       content_type="audio/ogg")
-        data.add_field("model", WHISPER_MODEL)
-        data.add_field("response_format", "verbose_json")
-        if language:
-            data.add_field("language", language)
+        with open(audio_path, "rb") as audio_file:
+            data = FormData()
+            data.add_field("file", audio_file,
+                           filename=os.path.basename(audio_path),
+                           content_type="audio/ogg")
+            data.add_field("model", WHISPER_MODEL)
+            data.add_field("response_format", "verbose_json")
+            if language:
+                data.add_field("language", language)
 
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, headers=headers, data=data,
-                                    timeout=aiohttp.ClientTimeout(total=60)) as resp:
-                if resp.status != 200:
-                    body = await resp.text()
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, headers=headers, data=data,
+                                        timeout=aiohttp.ClientTimeout(total=60)) as resp:
+                    if resp.status != 200:
+                        body = await resp.text()
+                        return TranscriptionResult(
+                            text="", language="", duration_seconds=0,
+                            error=f"Whisper API error {resp.status}: {body[:200]}",
+                        )
+                    result = await resp.json()
                     return TranscriptionResult(
-                        text="", language="", duration_seconds=0,
-                        error=f"Whisper API error {resp.status}: {body[:200]}",
+                        text=result.get("text", ""),
+                        language=result.get("language", ""),
+                        duration_seconds=result.get("duration", 0),
                     )
-                result = await resp.json()
-                return TranscriptionResult(
-                    text=result.get("text", ""),
-                    language=result.get("language", ""),
-                    duration_seconds=result.get("duration", 0),
-                )
     except asyncio.TimeoutError:
         return TranscriptionResult(text="", language="", duration_seconds=0,
                                    error="Transcription timed out")

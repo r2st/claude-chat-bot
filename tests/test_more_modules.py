@@ -821,7 +821,7 @@ class TestResourceLimiter:
     async def test_execute_error(self):
         rl = ResourceLimiter()
         rl._is_linux = False
-        with patch("asyncio.create_subprocess_shell", side_effect=RuntimeError("bad")):
+        with patch("asyncio.create_subprocess_exec", side_effect=RuntimeError("bad")):
             rc, stdout, stderr, usage = await rl.execute("echo hi")
         assert rc == 1
         assert "bad" in stderr

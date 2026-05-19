@@ -215,7 +215,7 @@ class TestResourceLimiterLinux:
 
         mock_usage = ResourceUsage(wall_time_seconds=1.0)
 
-        with patch("asyncio.create_subprocess_shell", return_value=mock_proc), \
+        with patch("asyncio.create_subprocess_exec", return_value=mock_proc), \
              patch.object(limiter, "_monitor_linux", new_callable=AsyncMock, return_value=mock_usage), \
              patch.object(limiter, "_get_preexec_fn", return_value=None):
             rc, stdout, stderr, usage = await limiter.execute("echo hello")
@@ -240,7 +240,7 @@ class TestResourceLimiterLinux:
 
         mock_usage = ResourceUsage()
 
-        with patch("asyncio.create_subprocess_shell", return_value=mock_proc), \
+        with patch("asyncio.create_subprocess_exec", return_value=mock_proc), \
              patch.object(limiter, "_monitor_linux", new_callable=AsyncMock, return_value=mock_usage), \
              patch.object(limiter, "_get_preexec_fn", return_value=None):
             rc, stdout, stderr, usage = await limiter.execute("sleep 999")
@@ -261,7 +261,7 @@ class TestResourceLimiterLinux:
         mock_proc.wait = AsyncMock()
         mock_proc.returncode = -9
 
-        with patch("asyncio.create_subprocess_shell", return_value=mock_proc), \
+        with patch("asyncio.create_subprocess_exec", return_value=mock_proc), \
              patch.object(limiter, "_get_preexec_fn", return_value=None):
             rc, stdout, stderr, usage = await limiter.execute("sleep 999")
 
@@ -285,7 +285,7 @@ class TestResourceLimiterLinux:
 
         mock_usage = ResourceUsage()
 
-        with patch("asyncio.create_subprocess_shell", return_value=mock_proc), \
+        with patch("asyncio.create_subprocess_exec", return_value=mock_proc), \
              patch.object(limiter, "_monitor_linux", new_callable=AsyncMock, return_value=mock_usage), \
              patch.object(limiter, "_get_preexec_fn", return_value=None):
             rc, stdout, stderr, usage = await limiter.execute("bad cmd")
@@ -309,7 +309,7 @@ class TestResourceLimiterLinux:
         async def slow_monitor(*a, **kw):
             await asyncio.sleep(999)
 
-        with patch("asyncio.create_subprocess_shell", return_value=mock_proc), \
+        with patch("asyncio.create_subprocess_exec", return_value=mock_proc), \
              patch.object(limiter, "_monitor_linux", side_effect=slow_monitor), \
              patch.object(limiter, "_get_preexec_fn", return_value=None), \
              patch("asyncio.wait_for") as mock_wait_for:
@@ -345,7 +345,7 @@ class TestResourceLimiterLinux:
         mock_proc.wait = AsyncMock(side_effect=asyncio.TimeoutError())
         mock_proc.returncode = None
 
-        with patch("asyncio.create_subprocess_shell", return_value=mock_proc), \
+        with patch("asyncio.create_subprocess_exec", return_value=mock_proc), \
              patch.object(limiter, "_get_preexec_fn", return_value=None):
             rc, stdout, stderr, usage = await limiter.execute("sleep 999")
 

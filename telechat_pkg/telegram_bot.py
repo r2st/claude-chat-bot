@@ -1398,11 +1398,12 @@ async def cmd_exportmem(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         json.dump({"memories": data, "platform": PLATFORM, "user_id": uid}, f, indent=2)
         tmp_path = f.name
     try:
-        await update.message.reply_document(
-            document=open(tmp_path, "rb"),
-            filename=f"memories_{uid}.json",
-            caption=f"📦 Exported {len(data)} memories.",
-        )
+        with open(tmp_path, "rb") as doc_file:
+            await update.message.reply_document(
+                document=doc_file,
+                filename=f"memories_{uid}.json",
+                caption=f"📦 Exported {len(data)} memories.",
+            )
     finally:
         Path(tmp_path).unlink(missing_ok=True)
 
