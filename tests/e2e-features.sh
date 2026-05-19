@@ -294,6 +294,79 @@ else
   fi
 fi
 
+# ── 7. New productivity features (commitments, compaction, export, extract, doctor)
+echo ""
+echo "[7] Commitments / Reminders"
+"$PY" -c "
+import sys; sys.path.insert(0, '$REPO_ROOT')
+from telechat_pkg import commitments, store
+store.init_db()
+commitments.init_db()
+r = commitments.add_commitment('e2e', 'test_user', 'reminder', 'e2e test', 9999999999)
+assert r.id
+import time; time.sleep(0.5)
+pending = commitments.get_pending('e2e', 'test_user')
+assert any(p.id == r.id for p in pending)
+text = commitments.format_pending(pending)
+assert 'e2e test' in text
+commitments.dismiss(r.id)
+" && ok "commitments lifecycle works" || bad "commitments lifecycle"
+
+echo "[8] Context Compaction"
+"$PY" -c "
+import sys; sys.path.insert(0, '$REPO_ROOT')
+from telechat_pkg.context_compaction import compact_history_sync, estimate_tokens
+small = [{'role': 'user', 'content': 'hi'}] * 5
+r = compact_history_sync(small)
+assert r.messages_compacted == 0
+assert estimate_tokens('hello world') >= 1
+" && ok "context compaction works" || bad "context compaction"
+
+echo "[9] Conversation Export"
+"$PY" -c "
+import sys, json; sys.path.insert(0, '$REPO_ROOT')
+from telechat_pkg.conversation_export import export_conversation
+msgs = [{'role': 'user', 'content': 'Hello!', 'timestamp': 1700000000},
+        {'role': 'assistant', 'content': 'Hi!', 'timestamp': 1700000010}]
+for fmt in ('text', 'markdown', 'html', 'json'):
+    r = export_conversation(msgs, fmt)
+    assert r.message_count == 2
+    assert len(r.content) > 0
+jr = export_conversation(msgs, 'json')
+data = json.loads(jr.content)
+assert data['message_count'] == 2
+hr = export_conversation([{'role': 'user', 'content': '<script>alert(1)</script>'}], 'html')
+assert '<script>' not in hr.content
+" && ok "conversation export all formats" || bad "conversation export"
+
+echo "[10] Document Extraction"
+"$PY" -c "
+import sys, tempfile, os; sys.path.insert(0, '$REPO_ROOT')
+from telechat_pkg.document_extract import extract, available_formats
+fmts = available_formats()
+assert 'txt' in fmts and 'csv' in fmts
+with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+    f.write('Hello e2e test')
+    tmp = f.name
+r = extract(tmp)
+os.unlink(tmp)
+assert 'Hello e2e test' in r.text
+assert r.error is None
+r2 = extract('/nonexistent')
+assert r2.error is not None
+" && ok "document extraction works" || bad "document extraction"
+
+echo "[11] Doctor Diagnostics"
+"$PY" -c "
+import sys; sys.path.insert(0, '$REPO_ROOT')
+from telechat_pkg.doctor import run_doctor_sync
+report = run_doctor_sync()
+assert len(report.checks) >= 5
+text = report.format()
+assert 'Python version' in text
+assert 'Passed:' in text
+" && ok "doctor diagnostics ($(python3 -c "import sys;sys.path.insert(0,'$REPO_ROOT');from telechat_pkg.doctor import run_doctor_sync;print(len(run_doctor_sync().checks))" 2>/dev/null || echo '?') checks)" || bad "doctor diagnostics"
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 echo
 echo "──────────────────────────────────────────────"

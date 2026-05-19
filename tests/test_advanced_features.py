@@ -1,4 +1,4 @@
-"""Tests for openclaw-inspired feature modules: commitments, context_compaction,
+"""Tests for advanced features: commitments, context_compaction,
 doctor, conversation_export, document_extract."""
 import os
 import tempfile

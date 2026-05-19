@@ -408,8 +408,9 @@ class TestParsePlatforms:
     def test_both_returns_telegram_and_whatsapp(self):
         assert _parse_platforms("both") == {"telegram", "whatsapp"}
 
-    def test_all_returns_all_three(self):
-        assert _parse_platforms("all") == {"telegram", "whatsapp", "slack"}
+    def test_all_returns_all_platforms(self):
+        result = _parse_platforms("all")
+        assert {"telegram", "whatsapp", "slack"}.issubset(result)
 
     def test_telegram_only(self):
         assert _parse_platforms("telegram") == {"telegram"}
@@ -433,7 +434,8 @@ class TestParsePlatforms:
         assert _parse_platforms("BOTH") == {"telegram", "whatsapp"}
 
     def test_all_uppercase(self):
-        assert _parse_platforms("ALL") == {"telegram", "whatsapp", "slack"}
+        result = _parse_platforms("ALL")
+        assert {"telegram", "whatsapp", "slack"}.issubset(result)
 
     def test_slack_only(self):
         assert _parse_platforms("slack") == {"slack"}
@@ -782,33 +784,31 @@ class TestCmdInitPlatformSelection:
         calls = [str(c) for c in mock_set.call_args_list]
         assert any("BOT_MODE" in c and "slack" in c for c in calls)
 
-    def test_choice_4_sets_telegram_whatsapp(self, tmp_path):
-        """Choice '4' sets BOT_MODE=telegram,whatsapp."""
+    def test_choice_5_sets_telegram_whatsapp(self, tmp_path):
+        """Choice '5' sets BOT_MODE=telegram,whatsapp."""
         env_path = tmp_path / ".env"
-        # inputs: platform=4, tg_token(skip), user_ids, instance, api_token, wa_nums, claude_mode, features(skip)
         mock_set = self._run_init_with_inputs(
-            env_path, ["4", "", "", "inst", "tok", "", "", ""]
+            env_path, ["5", "", "", "inst", "tok", "", "", ""]
         )
         calls = [str(c) for c in mock_set.call_args_list]
         assert any("BOT_MODE" in c and "telegram,whatsapp" in c for c in calls)
 
-    def test_choice_5_sets_telegram_slack(self, tmp_path):
-        """Choice '5' sets BOT_MODE=telegram,slack."""
+    def test_choice_6_sets_telegram_slack(self, tmp_path):
+        """Choice '6' sets BOT_MODE=telegram,slack."""
         env_path = tmp_path / ".env"
-        # inputs: platform=5, tg_token(skip), user_ids, bot_token, app_token, slack_ids, claude_mode, features(skip)
         mock_set = self._run_init_with_inputs(
-            env_path, ["5", "", "", "xoxb-bot", "xapp-app", "", "", ""]
+            env_path, ["6", "", "", "xoxb-bot", "xapp-app", "", "", ""]
         )
         calls = [str(c) for c in mock_set.call_args_list]
         assert any("BOT_MODE" in c and "telegram,slack" in c for c in calls)
 
-    def test_choice_6_sets_all(self, tmp_path):
-        """Choice '6' sets BOT_MODE=all."""
+    def test_choice_8_sets_all(self, tmp_path):
+        """Choice '8' sets BOT_MODE=all."""
         env_path = tmp_path / ".env"
-        # inputs: platform=6, tg_token(skip), user_ids, inst, tok, wa_nums,
-        #         bot_token, app_token, slack_ids, claude_mode, features(skip)
+        # inputs: platform=8, tg_token(skip), user_ids, inst, tok, wa_nums,
+        #         bot_token, app_token, slack_ids, web_port, web_token, claude_mode, features(skip)
         mock_set = self._run_init_with_inputs(
-            env_path, ["6", "", "", "inst", "tok", "", "xoxb-b", "xapp-a", "", "", ""]
+            env_path, ["8", "", "", "inst", "tok", "", "xoxb-b", "xapp-a", "", "", "", "", ""]
         )
         calls = [str(c) for c in mock_set.call_args_list]
         assert any("BOT_MODE" in c and "all" in c for c in calls)

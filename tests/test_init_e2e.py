@@ -360,9 +360,9 @@ class TestE2EMultiPlatformInit:
     """Full init with multiple platforms configured together."""
 
     def test_telegram_whatsapp_init(self, tmp_path):
-        """Choice 4: Telegram + WhatsApp."""
+        """Choice 5: Telegram + WhatsApp."""
         inputs = [
-            "4",                    # telegram,whatsapp
+            "5",                    # telegram,whatsapp
             "tg-token-1234567",     # Telegram token
             "123456789",            # Telegram user ID
             "inst-42",              # WhatsApp instance
@@ -380,9 +380,9 @@ class TestE2EMultiPlatformInit:
         assert calls["GREEN_API_INSTANCE_ID"] == "inst-42"
 
     def test_all_platforms_init(self, tmp_path, capsys):
-        """Choice 6: All platforms (Telegram + WhatsApp + Slack)."""
+        """Choice 8: All platforms (Telegram + WhatsApp + Slack + Web)."""
         inputs = [
-            "6",                        # all
+            "8",                        # all
             "tg-tok-1234567890",        # Telegram token
             "111222333",                # Telegram user IDs
             "inst-99",                  # WhatsApp instance
@@ -391,6 +391,8 @@ class TestE2EMultiPlatformInit:
             "xoxb-slack-bot-token",     # Slack bot token
             "xapp-slack-app-token",     # Slack app token
             "U999888",                  # Slack member ID
+            "",                         # Web chat port (keep default)
+            "",                         # Web chat token (skip)
             "cli",                      # Claude mode
             "",                         # features
         ]
@@ -407,9 +409,9 @@ class TestE2EMultiPlatformInit:
         assert "Setup Complete" in out
 
     def test_telegram_slack_init(self, tmp_path):
-        """Choice 5: Telegram + Slack."""
+        """Choice 6: Telegram + Slack."""
         inputs = [
-            "5",                        # telegram,slack
+            "6",                        # telegram,slack
             "tg-tok-9999999",           # Telegram token
             "42",                       # Telegram user ID
             "xoxb-bot-slack",           # Slack bot token
@@ -1078,11 +1080,11 @@ class TestParsePlatforms:
 
     def test_aliases(self):
         assert _parse_platforms("both") == {"telegram", "whatsapp"}
-        assert _parse_platforms("all") == {"telegram", "whatsapp", "slack"}
+        assert {"telegram", "whatsapp", "slack"}.issubset(_parse_platforms("all"))
 
     def test_case_insensitive(self):
         assert _parse_platforms("TELEGRAM") == {"telegram"}
-        assert _parse_platforms("ALL") == {"telegram", "whatsapp", "slack"}
+        assert {"telegram", "whatsapp", "slack"}.issubset(_parse_platforms("ALL"))
 
     def test_whitespace_handling(self):
         assert _parse_platforms("  telegram , whatsapp  ") == {"telegram", "whatsapp"}
