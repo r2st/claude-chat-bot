@@ -481,97 +481,299 @@ class TestTelegramSendPaginated(unittest.TestCase):
 
 
 class TestTelegramBrowseCallbacks(unittest.TestCase):
-    def test_browse_page_callback(self):
-        """Lines 1166-1168: browse page callback."""
+    def test_browse_dir_not_found(self):
+        """Line 1162: dir no longer exists."""
         from telechat_pkg.telegram_bot import _handle_browse_callback
         q = MagicMock()
         q.data = "tg:br:somepid:0"
-        q.from_user.id = 12345
         q.answer = AsyncMock()
         q.edit_message_text = AsyncMock()
 
         async def run():
             with patch("telechat_pkg.telegram_bot._resolve_pid", return_value=None):
                 await _handle_browse_callback(q, 12345)
+            q.edit_message_text.assert_called_with("Directory no longer exists.")
 
         _run(run())
 
-    def test_browse_file_callback(self):
-        """Lines 1207-1209: browse file callback."""
+    def test_browse_dir_access_denied(self):
+        """Lines 1166-1168: dir outside BROWSE_ROOT."""
+        from telechat_pkg.telegram_bot import _handle_browse_callback
+        q = MagicMock()
+        q.data = "tg:br:pid1:0"
+        q.answer = AsyncMock()
+        q.edit_message_text = AsyncMock()
+
+        async def run():
+            mock_path = MagicMock(spec=Path)
+            mock_path.is_dir.return_value = True
+            mock_path.resolve.return_value.relative_to.side_effect = ValueError("outside root")
+            with patch("telechat_pkg.telegram_bot._resolve_pid", return_value=mock_path):
+                await _handle_browse_callback(q, 12345)
+            q.edit_message_text.assert_called_with("⛔ Access denied.")
+
+        _run(run())
+
+    def test_browse_dir_success(self):
+        """Lines 1170-1171: successful dir browse."""
+        from telechat_pkg.telegram_bot import _handle_browse_callback, _pid, BROWSE_ROOT
+        q = MagicMock()
+        q.answer = AsyncMock()
+        q.edit_message_text = AsyncMock()
+
+        async def run():
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tmppath = Path(tmpdir)
+                pid = _pid(tmppath)
+                q.data = f"tg:br:{pid}:0"
+                with patch("telechat_pkg.telegram_bot.BROWSE_ROOT", tmppath.parent):
+                    await _handle_browse_callback(q, 12345)
+                q.edit_message_text.assert_called()
+
+        _run(run())
+
+    def test_browse_file_not_found(self):
+        """Line 1178: file no longer exists."""
         from telechat_pkg.telegram_bot import _handle_browse_callback
         q = MagicMock()
         q.data = "tg:bf:somepid"
-        q.from_user.id = 12345
         q.answer = AsyncMock()
         q.edit_message_text = AsyncMock()
 
         async def run():
             with patch("telechat_pkg.telegram_bot._resolve_pid", return_value=None):
                 await _handle_browse_callback(q, 12345)
+            q.edit_message_text.assert_called_with("File no longer exists.")
 
         _run(run())
 
-    def test_browse_ask_callback(self):
-        """Lines 1237-1239: browse ask callback."""
+    def test_browse_file_access_denied(self):
+        """Lines 1207-1209: file outside BROWSE_ROOT."""
+        from telechat_pkg.telegram_bot import _handle_browse_callback
+        q = MagicMock()
+        q.data = "tg:bv:pid1"
+        q.answer = AsyncMock()
+        q.edit_message_text = AsyncMock()
+
+        async def run():
+            mock_path = MagicMock(spec=Path)
+            mock_path.is_file.return_value = True
+            mock_path.is_dir.return_value = False
+            mock_path.exists.return_value = True
+            mock_path.resolve.return_value.relative_to.side_effect = ValueError("outside")
+            with patch("telechat_pkg.telegram_bot._resolve_pid", return_value=mock_path):
+                await _handle_browse_callback(q, 12345)
+            q.edit_message_text.assert_called_with("⛔ Access denied.")
+
+        _run(run())
+
+    def test_browse_view_file(self):
+        """Lines 1211-1226: view file content."""
+        from telechat_pkg.telegram_bot import _handle_browse_callback, _pid, BROWSE_ROOT
+
+        async def run():
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tmppath = Path(tmpdir)
+                testfile = tmppath / "test.txt"
+                testfile.write_text("line 1\nline 2\nline 3\n")
+                pid = _pid(testfile)
+                q = MagicMock()
+                q.data = f"tg:bv:{pid}"
+                q.answer = AsyncMock()
+                q.edit_message_text = AsyncMock()
+                with patch("telechat_pkg.telegram_bot.BROWSE_ROOT", tmppath):
+                    await _handle_browse_callback(q, 12345)
+                q.edit_message_text.assert_called()
+
+        _run(run())
+
+    def test_browse_file_info(self):
+        """Lines 1186-1196: file info display."""
+        from telechat_pkg.telegram_bot import _handle_browse_callback, _pid
+
+        async def run():
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tmppath = Path(tmpdir)
+                testfile = tmppath / "info.txt"
+                testfile.write_text("content here")
+                pid = _pid(testfile)
+                q = MagicMock()
+                q.data = f"tg:bf:{pid}"
+                q.answer = AsyncMock()
+                q.edit_message_text = AsyncMock()
+                with patch("telechat_pkg.telegram_bot.BROWSE_ROOT", tmppath):
+                    await _handle_browse_callback(q, 12345)
+                q.edit_message_text.assert_called()
+
+        _run(run())
+
+    def test_browse_ask_not_found(self):
+        """Lines 1237-1239: ask about non-existent path."""
         from telechat_pkg.telegram_bot import _handle_browse_callback
         q = MagicMock()
         q.data = "tg:ba:somepid"
-        q.from_user.id = 12345
         q.answer = AsyncMock()
         q.edit_message_text = AsyncMock()
-        q.message = MagicMock()
-        q.message.edit_text = AsyncMock()
 
         async def run():
             with patch("telechat_pkg.telegram_bot._resolve_pid", return_value=None):
                 await _handle_browse_callback(q, 12345)
+            q.edit_message_text.assert_called_with("Path no longer exists.")
+
+        _run(run())
+
+    def test_browse_ask_access_denied(self):
+        """Lines 1237-1239: ask about path outside root."""
+        from telechat_pkg.telegram_bot import _handle_browse_callback
+        q = MagicMock()
+        q.data = "tg:ba:pid1"
+        q.answer = AsyncMock()
+        q.edit_message_text = AsyncMock()
+
+        async def run():
+            mock_path = MagicMock(spec=Path)
+            mock_path.exists.return_value = True
+            mock_path.resolve.return_value.relative_to.side_effect = ValueError("outside")
+            with patch("telechat_pkg.telegram_bot._resolve_pid", return_value=mock_path):
+                await _handle_browse_callback(q, 12345)
+            q.edit_message_text.assert_called_with("⛔ Access denied.")
 
         _run(run())
 
 
 class TestTelegramSessionCallbacks(unittest.TestCase):
-    def test_session_switch_via_handle_callback(self):
-        """Lines 1635-1641: session switch callback."""
-        from telechat_pkg.telegram_bot import handle_callback
+    def _make_callback_update(self, data):
         u = MagicMock()
         q = MagicMock()
-        q.data = "tg:sess:sw:0"
+        q.data = data
         q.from_user.id = 12345
         q.answer = AsyncMock()
         q.edit_message_text = AsyncMock()
+        q.message = MagicMock()
+        q.message.edit_text = AsyncMock()
         u.callback_query = q
+        return u, q
 
+    def test_session_switch(self):
+        """Lines 1635-1641."""
+        from telechat_pkg.telegram_bot import handle_callback
+        u, q = self._make_callback_update("tg:sess:sw:0")
         async def run():
             with patch("telechat_pkg.telegram_bot._allowed", return_value=True):
                 with patch("telechat_pkg.telegram_bot.cc") as mock_cc:
-                    mock_sess = MagicMock()
-                    mock_sess.display_name = "default"
-                    mock_cc._session_mgr.switch_to.return_value = mock_sess
-                    ctx = _tg_ctx()
-                    await handle_callback(u, ctx)
-
+                    mock_cc._session_mgr.switch_to.return_value = MagicMock(display_name="default")
+                    await handle_callback(u, _tg_ctx())
         _run(run())
 
-    def test_session_new_via_handle_callback(self):
-        """Lines 1642-1649: session new callback."""
+    def test_session_new(self):
+        """Lines 1642-1649."""
         from telechat_pkg.telegram_bot import handle_callback
-        u = MagicMock()
-        q = MagicMock()
-        q.data = "tg:sess:new:_"
-        q.from_user.id = 12345
-        q.answer = AsyncMock()
-        q.edit_message_text = AsyncMock()
-        u.callback_query = q
-
+        u, q = self._make_callback_update("tg:sess:new:_")
         async def run():
             with patch("telechat_pkg.telegram_bot._allowed", return_value=True):
                 with patch("telechat_pkg.telegram_bot.cc") as mock_cc:
-                    mock_sess = MagicMock()
-                    mock_sess.name = "session-1234"
-                    mock_cc._session_mgr.create.return_value = mock_sess
-                    ctx = _tg_ctx()
-                    await handle_callback(u, ctx)
+                    mock_cc._session_mgr.create.return_value = MagicMock(name="session-1234")
+                    await handle_callback(u, _tg_ctx())
+        _run(run())
 
+    def test_session_delmenu(self):
+        """Lines 1650-1665."""
+        from telechat_pkg.telegram_bot import handle_callback
+        u, q = self._make_callback_update("tg:sess:delmenu:_")
+        async def run():
+            with patch("telechat_pkg.telegram_bot._allowed", return_value=True):
+                with patch("telechat_pkg.telegram_bot.cc") as mock_cc:
+                    s = MagicMock(display_name="default", is_busy=False)
+                    mock_cc._session_mgr.get_all.return_value = [s]
+                    mock_cc._session_mgr.get_active_index.return_value = 0
+                    await handle_callback(u, _tg_ctx())
+        _run(run())
+
+    def test_session_delete(self):
+        """Lines 1666-1673."""
+        from telechat_pkg.telegram_bot import handle_callback
+        u, q = self._make_callback_update("tg:sess:del:0")
+        async def run():
+            with patch("telechat_pkg.telegram_bot._allowed", return_value=True):
+                with patch("telechat_pkg.telegram_bot.cc") as mock_cc:
+                    mock_cc._session_mgr.get_all.return_value = [MagicMock(name="default")]
+                    mock_cc._session_mgr.delete.return_value = True
+                    await handle_callback(u, _tg_ctx())
+        _run(run())
+
+    def test_session_arcmenu(self):
+        """Lines 1674-1688 incl 1679."""
+        from telechat_pkg.telegram_bot import handle_callback
+        u, q = self._make_callback_update("tg:sess:arcmenu:_")
+        async def run():
+            with patch("telechat_pkg.telegram_bot._allowed", return_value=True):
+                with patch("telechat_pkg.telegram_bot.cc") as mock_cc:
+                    s1 = MagicMock(display_name="s1", is_busy=True, archived=False)
+                    s2 = MagicMock(display_name="s2", is_busy=False, archived=False, name="s2")
+                    mock_cc._session_mgr.get_all.return_value = [s1, s2]
+                    await handle_callback(u, _tg_ctx())
+        _run(run())
+
+    def test_session_archive_fail(self):
+        """Line 1694."""
+        from telechat_pkg.telegram_bot import handle_callback
+        u, q = self._make_callback_update("tg:sess:arc:default")
+        async def run():
+            with patch("telechat_pkg.telegram_bot._allowed", return_value=True):
+                with patch("telechat_pkg.telegram_bot.cc") as mock_cc:
+                    mock_cc._session_mgr.archive.return_value = None
+                    await handle_callback(u, _tg_ctx())
+            q.edit_message_text.assert_called_with("Cannot archive.")
+        _run(run())
+
+    def test_session_unarchive_fail(self):
+        """Line 1700."""
+        from telechat_pkg.telegram_bot import handle_callback
+        u, q = self._make_callback_update("tg:sess:unarc:old")
+        async def run():
+            with patch("telechat_pkg.telegram_bot._allowed", return_value=True):
+                with patch("telechat_pkg.telegram_bot.cc") as mock_cc:
+                    mock_cc._session_mgr.unarchive.return_value = None
+                    await handle_callback(u, _tg_ctx())
+            q.edit_message_text.assert_called_with("Session not found.")
+        _run(run())
+
+    def test_session_back(self):
+        """Line 1702."""
+        from telechat_pkg.telegram_bot import handle_callback
+        u, q = self._make_callback_update("tg:sess:back:_")
+        async def run():
+            with patch("telechat_pkg.telegram_bot._allowed", return_value=True):
+                await handle_callback(u, _tg_ctx())
+            q.edit_message_text.assert_called_with("Cancelled.")
+        _run(run())
+
+    def test_callback_browse_delegation(self):
+        """Lines 1707-1708: browse callbacks delegated."""
+        from telechat_pkg.telegram_bot import handle_callback
+        u, q = self._make_callback_update("tg:br:pid1:0")
+        async def run():
+            with patch("telechat_pkg.telegram_bot._allowed", return_value=True):
+                with patch("telechat_pkg.telegram_bot._handle_browse_callback", new_callable=AsyncMock):
+                    await handle_callback(u, _tg_ctx())
+        _run(run())
+
+    def test_callback_noop(self):
+        """Line 1712: noop callback."""
+        from telechat_pkg.telegram_bot import handle_callback
+        u, q = self._make_callback_update("tg:noop:_")
+        async def run():
+            with patch("telechat_pkg.telegram_bot._allowed", return_value=True):
+                await handle_callback(u, _tg_ctx())
+        _run(run())
+
+    def test_callback_pg_bad_format(self):
+        """Line 1719: pg callback with bad format."""
+        from telechat_pkg.telegram_bot import handle_callback
+        u, q = self._make_callback_update("tg:pg:baddata")
+        async def run():
+            with patch("telechat_pkg.telegram_bot._allowed", return_value=True):
+                await handle_callback(u, _tg_ctx())
         _run(run())
 
 
