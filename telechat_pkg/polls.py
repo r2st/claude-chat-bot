@@ -1,7 +1,6 @@
 """
 Polls — create Telegram polls from bot commands or Claude-generated content.
 
-Ported from openclaw's src/polls.ts.
 """
 from __future__ import annotations
 

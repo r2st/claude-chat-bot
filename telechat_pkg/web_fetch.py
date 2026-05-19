@@ -1,7 +1,6 @@
 """
 Web fetch — extract readable content from URLs using Jina Reader or raw HTML stripping.
 
-Ported from openclaw's src/web-fetch module.
 Provides cleaner content extraction than the basic link_understanding module,
 using Jina Reader API for best results or falling back to HTML stripping.
 """

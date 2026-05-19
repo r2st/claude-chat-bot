@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "telechatai"
-version = "1.1.4"
+version = "1.1.5"
 description = "Claude AI on your phone/desktop — personal, self-hosted messenger bot for Telegram, WhatsApp, and Slack"
 readme = "README.md"
 license = "MIT"
@@ -43,4 +43,4 @@ telechat = "telechat_pkg.main:cli_entry"
 include = ["telechat_pkg*"]
 
 [tool.setuptools.package-data]
-telechat_pkg = ["scripts/*"]
+telechat_pkg = ["scripts/*", "*.html"]

@@ -2,7 +2,6 @@
 Web search — search the web and return results for Claude to use as context.
 
 Supports Brave Search API and Tavily API (configurable via env vars).
-Ported from openclaw's src/web-search module.
 """
 from __future__ import annotations
 

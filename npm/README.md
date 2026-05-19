@@ -5,6 +5,14 @@
 ## Quick Start
 
 ```bash
+npm install -g telechat && telechat init
+```
+
+This installs telechat globally and launches the AI-guided setup wizard. After setup, start the bot with `telechat start`.
+
+You can also run without installing:
+
+```bash
 npx telechat
 ```
 

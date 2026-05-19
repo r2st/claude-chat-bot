@@ -1,7 +1,6 @@
 """
 Music generation — generate music/audio using Replicate API (MusicGen model).
 
-Ported from openclaw's src/music-generation module.
 Supports Meta's MusicGen via Replicate, or any compatible API.
 """
 from __future__ import annotations

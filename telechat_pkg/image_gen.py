@@ -1,7 +1,6 @@
 """
 Image generation — create images using OpenAI's DALL-E API.
 
-Ported from openclaw's src/image-generation module.
 """
 from __future__ import annotations
 

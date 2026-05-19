@@ -2,7 +2,6 @@
 Link understanding — detect URLs in user messages, fetch their content,
 and inject page context into the prompt for Claude.
 
-Ported from openclaw's src/link-understanding module.
 """
 from __future__ import annotations
 

@@ -1,7 +1,6 @@
 """
 Video generation — generate short videos from text prompts via Replicate API.
 
-Ported from openclaw's src/video-generation module.
 Supports various video models via Replicate (e.g., Luma, Minimax, Kling).
 """
 from __future__ import annotations

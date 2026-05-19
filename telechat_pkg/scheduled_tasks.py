@@ -1,7 +1,6 @@
 """
 Scheduled tasks — run recurring tasks via a simple cron-like scheduler.
 
-Ported from openclaw's src/cron module. Provides a lightweight in-process
 scheduler that can run periodic tasks like:
   - Sending daily summaries
   - Running health checks

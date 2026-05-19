@@ -1,7 +1,6 @@
 """
 Text-to-speech — generate voice audio from text using OpenAI's TTS API.
 
-Ported from openclaw's src/tts module.
 """
 from __future__ import annotations
 

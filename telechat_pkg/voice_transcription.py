@@ -1,7 +1,6 @@
 """
 Voice transcription — convert audio messages to text using OpenAI Whisper API.
 
-Ported from openclaw's src/realtime-transcription + media-understanding modules.
 """
 from __future__ import annotations
 

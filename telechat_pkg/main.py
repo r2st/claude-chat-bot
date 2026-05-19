@@ -11,10 +11,12 @@ Set BOT_MODE in your .env to one or more platforms (comma-separated):
   BOT_MODE=telegram              — Telegram only  (default)
   BOT_MODE=whatsapp              — WhatsApp only
   BOT_MODE=slack                 — Slack only
+  BOT_MODE=web                   — Web chat only (browser)
   BOT_MODE=telegram,whatsapp     — Telegram + WhatsApp
   BOT_MODE=telegram,slack        — Telegram + Slack
+  BOT_MODE=telegram,web          — Telegram + Web
   BOT_MODE=whatsapp,slack        — WhatsApp + Slack
-  BOT_MODE=all                   — all three platforms
+  BOT_MODE=all                   — all platforms
 
 Legacy alias: BOT_MODE=both → telegram,whatsapp
 """
@@ -101,10 +103,12 @@ def _find_env_file() -> str:
 
 def _has_any_platform(env: dict[str, str]) -> bool:
     """True if at least one platform has credentials configured."""
+    platforms = _parse_platforms(env.get("BOT_MODE", "telegram"))
     return bool(
         env.get("TELEGRAM_BOT_TOKEN")
         or (env.get("GREEN_API_INSTANCE_ID") and env.get("GREEN_API_TOKEN"))
         or (env.get("SLACK_BOT_TOKEN") and env.get("SLACK_APP_TOKEN"))
+        or "web" in platforms
     )
 
 
@@ -248,12 +252,15 @@ def _cmd_init() -> None:
     print("  1) telegram")
     print("  2) whatsapp")
     print("  3) slack")
-    print("  4) telegram,whatsapp")
-    print("  5) telegram,slack")
-    print("  6) all (telegram + whatsapp + slack)")
+    print("  4) web (browser chat)")
+    print("  5) telegram,whatsapp")
+    print("  6) telegram,slack")
+    print("  7) telegram,web")
+    print("  8) all (telegram + whatsapp + slack + web)")
     choice = input(f"\nChoose platforms [enter to keep '{current_mode}']: ").strip()
-    mode_map = {"1": "telegram", "2": "whatsapp", "3": "slack",
-                "4": "telegram,whatsapp", "5": "telegram,slack", "6": "all"}
+    mode_map = {"1": "telegram", "2": "whatsapp", "3": "slack", "4": "web",
+                "5": "telegram,whatsapp", "6": "telegram,slack",
+                "7": "telegram,web", "8": "all"}
     if choice in mode_map:
         current_mode = mode_map[choice]
         _set_env_var(env_path, "BOT_MODE", current_mode)
@@ -416,6 +423,30 @@ def _cmd_init() -> None:
         elif ids:
             _set_env_var(env_path, "SLACK_ALLOWED_USER_IDS", ids)
 
+    # ── Web chat setup ───────────────────────────────────────────────────
+    if "web" in platforms:
+        print("\n── Web Chat ──")
+        current_port = env.get("WEB_CHAT_PORT", "8585")
+        port = input(f"  Port [enter to keep {current_port}]: ").strip()
+        if port and port.isdigit():
+            _set_env_var(env_path, "WEB_CHAT_PORT", port)
+            print(f"  → WEB_CHAT_PORT={port}")
+
+        current_token = env.get("WEB_CHAT_TOKEN", "")
+        if current_token:
+            print(f"  Access token: {current_token[:4]}...{current_token[-4:]}")
+            if input("  Change? [y/N]: ").strip().lower() == "y":
+                current_token = ""
+        if not current_token:
+            print("  Set a token to restrict access (recommended).")
+            print("  Leave empty to allow anyone with the URL.")
+            token = input("  Access token (Enter to skip): ").strip()
+            if token:
+                _set_env_var(env_path, "WEB_CHAT_TOKEN", token)
+                print(f"  ✓ Token set")
+            else:
+                print("  ⚠ No token — web chat is open to anyone with the URL")
+
     # ── Claude settings ───────────────────────────────────────────────────
     print("\n── Claude ──")
     current_cmode = env.get("CLAUDE_MODE", "cli")
@@ -512,14 +543,17 @@ def _cmd_init() -> None:
     has_wa = bool(wa_id and final_env.get("GREEN_API_TOKEN"))
     sl_token = final_env.get("SLACK_BOT_TOKEN", "")
     has_sl = bool(sl_token and sl_token.startswith("xoxb-"))
+    has_web = "web" in _parse_platforms(final_env.get("BOT_MODE", "telegram"))
 
     print(f"  Telegram : {'✓ configured' if has_tg else '── skipped'}")
     print(f"  WhatsApp : {'✓ configured' if has_wa else '── skipped'}")
     print(f"  Slack    : {'✓ configured' if has_sl else '── skipped'}")
+    web_port = final_env.get("WEB_CHAT_PORT", "8585")
+    print(f"  Web      : {'✓ http://localhost:' + web_port if has_web else '── skipped'}")
     print(f"  Claude   : {final_env.get('CLAUDE_MODE', 'cli')} mode")
     print(f"  Config   : {env_path}")
 
-    if not has_tg and not has_wa and not has_sl:
+    if not has_tg and not has_wa and not has_sl and not has_web:
         print("\n  ⚠ No platform configured. The bot won't start without credentials.")
         print("  Run 'telechat init' again or edit .env manually.")
     else:
@@ -531,6 +565,8 @@ def _cmd_init() -> None:
             warnings.append("WhatsApp: no number restriction (anyone can message the bot)")
         if has_sl and not final_env.get("SLACK_ALLOWED_USER_IDS"):
             warnings.append("Slack: no user restriction (anyone in workspace can use the bot)")
+        if has_web and not final_env.get("WEB_CHAT_TOKEN"):
+            warnings.append("Web: no access token (anyone with the URL can chat)")
         if warnings:
             print("\n  ⚠ Security:")
             for w in warnings:
@@ -540,7 +576,7 @@ def _cmd_init() -> None:
 
 
 def _parse_platforms(mode: str) -> set[str]:
-    aliases = {"both": {"telegram", "whatsapp"}, "all": {"telegram", "whatsapp", "slack"}}
+    aliases = {"both": {"telegram", "whatsapp"}, "all": {"telegram", "whatsapp", "slack", "web"}}
     mode = mode.lower().strip()
     if mode in aliases:
         return aliases[mode]
@@ -593,7 +629,7 @@ def _cmd_start() -> None:
     else:
         PLATFORMS = {p.strip() for p in _raw_mode.split(",") if p.strip()}
 
-    _VALID = {"telegram", "whatsapp", "slack"}
+    _VALID = {"telegram", "whatsapp", "slack", "web"}
     _unknown = PLATFORMS - _VALID
     if _unknown:
         print(f"ERROR: Unknown platform(s) in BOT_MODE: {_unknown}")
@@ -672,9 +708,16 @@ def _cmd_start() -> None:
         if "slack" in PLATFORMS:
             threading.Thread(target=_run_slack, daemon=True, name="slack").start()
 
+        web_task = None
+        if "web" in PLATFORMS:
+            from .web_chat import run_web_chat
+            web_task = asyncio.create_task(run_web_chat())
+
         if "telegram" in PLATFORMS:
             from .telegram_bot import run_telegram
             await run_telegram()
+        elif web_task:
+            await web_task
         else:
             log.info("Running without Telegram. Press Ctrl-C to stop.")
             try:

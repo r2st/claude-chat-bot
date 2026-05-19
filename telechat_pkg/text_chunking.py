@@ -2,7 +2,6 @@
 Smart text chunking — split long responses into platform-sized chunks
 without breaking code blocks, sentences, or markdown structure.
 
-Ported from openclaw's src/auto-reply/chunk.ts and src/shared/text-chunking.
 """
 from __future__ import annotations
 
