@@ -295,6 +295,24 @@ def save_turn(platform: str, user_id: str, user_text: str, reply: str, session_n
     _session_mgr.touch_active(platform, user_id)
 
 
+def replace_history(platform: str, user_id: str, messages: list[dict], session_name: str = "") -> None:
+    """Replace entire conversation history with compacted messages."""
+    effective_uid = f"{user_id}:{session_name}" if session_name else user_id
+    conn = _get_conn()
+    conn.execute(
+        "DELETE FROM conversations WHERE platform=? AND user_id=?",
+        (platform, effective_uid),
+    )
+    now = time.time()
+    for i, m in enumerate(messages):
+        conn.execute(
+            "INSERT INTO conversations (platform, user_id, role, content, ts) VALUES (?, ?, ?, ?, ?)",
+            (platform, effective_uid, m.get("role", "user"), m.get("content", ""), now + i * 0.001),
+        )
+    conn.commit()
+    _invalidate_history(platform, effective_uid)
+
+
 def clear_history(platform: str, user_id: str, session_name: str = "") -> None:
     effective_uid = f"{user_id}:{session_name}" if session_name else user_id
     conn = _get_conn()

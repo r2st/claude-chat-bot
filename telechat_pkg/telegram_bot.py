@@ -2027,6 +2027,13 @@ HELP_TEXT = """*Available commands:*
 /usage — Token usage stats
 /watchdog — Watchdog status
 
+*Productivity*
+/remind `text` — Set a reminder
+/commitments — View pending reminders
+/doctor — Run diagnostic checks
+/export `format` — Export chat (text/md/html/json)
+/compact — Compact conversation history
+
 *Tips:*
 - Send photos/documents for analysis
 - Send voice messages for transcription + Claude
@@ -3251,6 +3258,145 @@ async def cmd_browse_web(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await placeholder.edit_text(f"❌ Browser error: {e}")
 
 
+# ─── Productivity commands: remind, commitments, doctor, export, compact ──────
+
+async def cmd_remind(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Set a reminder: /remind <text with time expression>."""
+    uid = update.effective_user.id
+    if not _allowed(uid):
+        return
+    from . import commitments
+    commitments.init_db()
+    text = (update.message.text or "").split(None, 1)
+    if len(text) < 2:
+        await update.message.reply_text(
+            "Usage: `/remind buy groceries tomorrow`\n"
+            "Time expressions: in 30min, in 2 hours, tomorrow, next week, monday, etc.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    arg = text[1]
+    records = commitments.auto_extract_and_store(
+        platform=PLATFORM, user_id=str(uid),
+        user_text=arg,
+    )
+    if records:
+        lines = [f"Set {len(records)} reminder(s):"]
+        for r in records:
+            from datetime import datetime as _dt
+            due = _dt.fromtimestamp(r.due_at).strftime("%Y-%m-%d %H:%M")
+            lines.append(f"  {r.reason} — due {due}")
+        await update.message.reply_text("\n".join(lines))
+    else:
+        # If no pattern matched, store as a simple 24h reminder
+        from datetime import datetime as _dt, timedelta as _td
+        due = (_dt.now() + _td(hours=24)).timestamp()
+        r = commitments.add_commitment(
+            platform=PLATFORM, user_id=str(uid),
+            kind="reminder", reason=arg, due_at=due,
+        )
+        due_str = _dt.fromtimestamp(r.due_at).strftime("%Y-%m-%d %H:%M")
+        await update.message.reply_text(f"Reminder set: {arg}\nDue: {due_str}")
+
+
+async def cmd_commitments(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """View pending reminders and commitments."""
+    uid = update.effective_user.id
+    if not _allowed(uid):
+        return
+    from . import commitments
+    commitments.init_db()
+    pending = commitments.get_pending(PLATFORM, str(uid))
+    text = commitments.format_pending(pending)
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
+
+async def cmd_doctor(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Run diagnostic checks."""
+    uid = update.effective_user.id
+    if not _allowed(uid):
+        return
+    from . import doctor
+    placeholder = await update.message.reply_text("🩺 Running diagnostics...")
+    try:
+        report = await doctor.run_doctor()
+        await placeholder.edit_text(report.format())
+    except Exception as e:
+        await placeholder.edit_text(f"❌ Doctor error: {e}")
+
+
+async def cmd_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Export conversation: /export [text|md|html|json]."""
+    uid = update.effective_user.id
+    if not _allowed(uid):
+        return
+    from . import conversation_export
+    from . import store as _st
+    text = (update.message.text or "").split(None, 1)
+    fmt = text[1].strip().lower() if len(text) > 1 else "text"
+
+    sess = _active_session(uid)
+    history = _st.load_history(PLATFORM, str(uid), session_name=sess.name)
+    if not history:
+        await update.message.reply_text("No conversation to export.")
+        return
+
+    try:
+        result = conversation_export.export_conversation(history, fmt, title=f"Session: {sess}")
+    except ValueError as e:
+        await update.message.reply_text(str(e))
+        return
+
+    import tempfile
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=f".{result.filename.rsplit('.', 1)[-1]}",
+        delete=False, prefix="telechat_export_",
+    ) as f:
+        f.write(result.content)
+        tmp_path = f.name
+
+    try:
+        with open(tmp_path, "rb") as f:
+            await update.message.reply_document(
+                f, filename=result.filename,
+                caption=f"Exported {result.message_count} messages as {result.format}",
+            )
+    finally:
+        import os as _os
+        _os.unlink(tmp_path)
+
+
+async def cmd_compact(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Compact conversation history to save tokens."""
+    uid = update.effective_user.id
+    if not _allowed(uid):
+        return
+    from . import context_compaction
+    from . import store as _st
+    sess = _active_session(uid)
+    history = _st.load_history(PLATFORM, str(uid), session_name=sess.name)
+    if not history:
+        await update.message.reply_text("No conversation to compact.")
+        return
+
+    result = context_compaction.compact_history_sync(history)
+    if result.messages_compacted == 0:
+        await update.message.reply_text(
+            f"No compaction needed ({result.messages_before} messages, "
+            f"~{result.tokens_before:,} tokens)."
+        )
+        return
+
+    # Save compacted history
+    _st.replace_history(PLATFORM, str(uid), result.history, session_name=sess.name)
+    await update.message.reply_text(
+        f"Compacted conversation:\n"
+        f"  Messages: {result.messages_before} → {result.messages_after}\n"
+        f"  Tokens: ~{result.tokens_before:,} → ~{result.tokens_after:,}\n"
+        f"  Summarized {result.messages_compacted} older messages."
+    )
+
+
 # ─── Entry point ─────────────────────────────────────────────────────────────────
 
 def build_app() -> Application:
@@ -3313,6 +3459,12 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("schedule",    cmd_schedule))
     app.add_handler(CommandHandler("kb",          cmd_kb))
     app.add_handler(CommandHandler("web",         cmd_browse_web))
+    # ── Productivity commands ──
+    app.add_handler(CommandHandler("remind",      cmd_remind))
+    app.add_handler(CommandHandler("commitments", cmd_commitments))
+    app.add_handler(CommandHandler("doctor",      cmd_doctor))
+    app.add_handler(CommandHandler("export",      cmd_export))
+    app.add_handler(CommandHandler("compact",     cmd_compact))
     app.add_handler(CallbackQueryHandler(handle_callback, pattern=r"^tg:"))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
     app.add_handler(MessageHandler(filters.PHOTO,              handle_photo))
@@ -3343,6 +3495,11 @@ BOT_COMMANDS = [
     BotCommand("schedule", "Schedule recurring tasks"),
     BotCommand("kb", "Knowledge base management"),
     BotCommand("web", "Browser automation"),
+    BotCommand("remind", "Set a reminder"),
+    BotCommand("commitments", "View pending reminders"),
+    BotCommand("doctor", "Run diagnostic checks"),
+    BotCommand("export", "Export conversation"),
+    BotCommand("compact", "Compact conversation history"),
     BotCommand("help", "Show all commands"),
 ]
 
